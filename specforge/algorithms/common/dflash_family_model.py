@@ -920,6 +920,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         ce_loss_den = flat_weights.sum()
         ce_loss = (loss_per_token * flat_weights).sum() / (ce_loss_den + 1e-6)
+        loss_per_position = loss_per_token.reshape_as(target_ids)
+
+        position_metrics = {}
+        for position in range(self.block_size):
+            position_weights = loss_weight_mask[..., position]
+            position_loss = (
+                loss_per_position[..., position] * position_weights
+            ).sum() / (position_weights.sum() + 1e-6)
+            position_metrics[f"mtp_{position + 1}_loss"] = position_loss.detach()
 
         l1_loss = ce_loss.new_zeros(())
         accept_rate_3d = None
@@ -972,6 +981,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "l1_loss": l1_loss.detach(),
             "confidence_loss": confidence_loss.detach(),
             "confidence_abs_error": confidence_abs_error.detach(),
+            **position_metrics,
         }
         return loss, metrics
 

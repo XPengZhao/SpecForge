@@ -316,7 +316,8 @@ class DeepseekV4DSparkAttention(nn.Module):
         kv = apply_rotary_pos_emb(kv, kv_cos, kv_sin)
 
         output = self._attention(q, kv, attention_mask)
-        output = apply_rotary_pos_emb(output.transpose(1, 2), q_cos, -q_sin)
+        output = apply_rotary_pos_emb(output, q_cos, -q_sin)
+        output = output.transpose(1, 2).contiguous()
         grouped = output.reshape(batch_size, query_length, self.config.o_groups, -1)
         return self.wo_b(self.wo_a(grouped).flatten(2))
 
@@ -544,7 +545,7 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
     """DeepSeek-V4 DSpark module matching the checkpoint's ``mtp.*`` tree."""
 
     config_class = DeepseekV4DSparkConfig
-    _no_split_modules = ["DeepseekV4DSparkStage"]
+    _no_split_modules = ["DeepseekV4DSparkMoE"]
     _supports_flex_attn = True
 
     @torch.no_grad()

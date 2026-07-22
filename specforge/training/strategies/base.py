@@ -496,6 +496,13 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         ):
             if name in model_metrics:
                 metrics[name] = model_metrics[name]
+        metrics.update(
+            {
+                name: value
+                for name, value in model_metrics.items()
+                if name.startswith("mtp_") and name.endswith("_loss")
+            }
+        )
         return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

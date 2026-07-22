@@ -160,12 +160,20 @@ def _finish_registered_draft(
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
+    from transformers import initialization as hf_init
 
     draft_config._attn_implementation = cfg.training.attention_backend
-    draft_model = AutoDraftModel.from_config(
-        draft_config,
-        torch_dtype=_torch_dtype(cfg),
-    )
+    if cfg.model.draft_checkpoint_path:
+        with hf_init.no_init_weights():
+            draft_model = AutoDraftModel.from_config(
+                draft_config,
+                torch_dtype=_torch_dtype(cfg),
+            )
+    else:
+        draft_model = AutoDraftModel.from_config(
+            draft_config,
+            torch_dtype=_torch_dtype(cfg),
+        )
     return _finish_registered_draft(cfg, draft_config, draft_model)
 
 
