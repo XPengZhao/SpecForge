@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -35,6 +36,15 @@ class OfflineEagle3SGLangCapture:
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "OfflineEagle3SGLangCapture":
+        # FlashInfer's CuTe RMSNorm fails to compile with this pinned stack.
+        # Select its supported CUDA implementation before importing SGLang.
+        os.environ["FLASHINFER_USE_CUDA_NORM"] = "1"
+
+        # FlashInfer may already be imported by SGLang's initialization path,
+        # in which case its module-level backend flag has already been cached.
+        import flashinfer.norm as flashinfer_norm
+
+        flashinfer_norm._USE_CUDA_NORM = True
         from .sglang_backend import OfflineSGLangCaptureBackend
 
         backend = OfflineSGLangCaptureBackend.build(

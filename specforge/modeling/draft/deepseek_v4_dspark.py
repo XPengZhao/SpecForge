@@ -545,6 +545,7 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
 
     config_class = DeepseekV4DSparkConfig
     _no_split_modules = ["DeepseekV4DSparkStage"]
+    _supports_flex_attn = True
 
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:

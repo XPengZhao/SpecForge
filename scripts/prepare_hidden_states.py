@@ -52,7 +52,7 @@ import torch
 import torch.distributed as dist
 from datasets import Dataset
 from tqdm import tqdm
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from specforge.data.preprocessing import (
     build_eagle3_dataset,
@@ -319,7 +319,27 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "ep_size": args.sglang_ep_size,
         "max_running_requests": args.batch_size,
         "max_total_tokens": args.batch_size * args.max_length,
+        # SGLang 0.5.14's CUDA DeepSeek-V4 pool requires its packed uint8
+        # layout: FP8 NoPE KV, BF16 RoPE KV, and embedded block scales.
+        "kv_cache_dtype": "fp8_e4m3",
+        # Offline prefill needs one SWA slot per input token. DeepSeek-V4's
+        # serving default keeps only 10% of max_total_tokens for the SWA pool.
+        "swa_full_tokens_ratio": 1.0,
     }
+
+
+def _raw_target_config(args: argparse.Namespace) -> Dict[str, object]:
+    """Load config.json without dropping model-specific fields."""
+
+    config_path = Path(args.target_model_path).expanduser() / "config.json"
+    if config_path.is_file():
+        with config_path.open(encoding="utf-8") as stream:
+            return json.load(stream)
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        args.target_model_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    return config_dict
 
 
 def _resolve_capture_layers(
@@ -382,6 +402,20 @@ def build_target_model(
         strategy=getattr(args, "strategy", "eagle3"),
         draft_model_config=getattr(args, "draft_model_config", ""),
     )
+    sglang_kwargs = _sglang_kwargs(args)
+    text_config = getattr(model_config, "text_config", model_config)
+    expert_dtype = getattr(text_config, "expert_dtype", None)
+    if expert_dtype is None:
+        expert_dtype = _raw_target_config(args).get("expert_dtype")
+    if expert_dtype == "fp4":
+        sglang_kwargs["moe_runner_backend"] = "flashinfer_mxfp4"
+    print_with_rank(
+        "Offline SGLang target: "
+        f"expert_dtype={expert_dtype!r}, "
+        f"moe_runner_backend={sglang_kwargs.get('moe_runner_backend', 'auto')!r}, "
+        f"kv_cache_dtype={sglang_kwargs['kv_cache_dtype']!r}"
+    )
+
     target_model = load_offline_eagle3_capture(
         args.target_model_path,
         torch_dtype=(
@@ -390,7 +424,7 @@ def build_target_model(
             else model_config.torch_dtype
         ),
         trust_remote_code=args.trust_remote_code,
-        **_sglang_kwargs(args),
+        **sglang_kwargs,
     )
     target_model.set_capture_layers(capture_layers)
     return target_model

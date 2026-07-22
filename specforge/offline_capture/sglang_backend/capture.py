@@ -10,12 +10,15 @@
 
 from __future__ import annotations
 
+import logging
 from array import array
+from types import MethodType
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.moe.utils import initialize_moe_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -30,6 +33,8 @@ from specforge.distributed import get_tp_group
 
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
+
+logger = logging.getLogger(__name__)
 
 
 class OfflineSGLangCaptureBackend:
@@ -54,7 +59,7 @@ class OfflineSGLangCaptureBackend:
             dtype=torch_dtype if torch_dtype is not None else "auto",
             enable_return_hidden_states=True,
             disable_cuda_graph=True,
-            chunked_prefill_size=-1,
+            chunked_prefill_size=kwargs.get("max_total_tokens", -1),
             tp_size=tp_size,
             pp_size=1,
             **kwargs,
@@ -63,6 +68,23 @@ class OfflineSGLangCaptureBackend:
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
         model_config = ModelConfig.from_server_args(server_args)
+        if getattr(model_config, "is_fp4_experts", False):
+            if server_args.moe_runner_backend == "auto":
+                server_args.moe_runner_backend = "flashinfer_mxfp4"
+            if server_args.moe_runner_backend != "flashinfer_mxfp4":
+                raise ValueError(
+                    "DeepSeek-V4 FP4 experts require "
+                    "moe_runner_backend='flashinfer_mxfp4' for offline capture; "
+                    f"got {server_args.moe_runner_backend!r}"
+                )
+        initialize_moe_config(server_args)
+        logger.info(
+            "Offline SGLang capture uses moe_runner_backend=%s, "
+            "kv_cache_dtype=%s, is_fp4_experts=%s",
+            server_args.moe_runner_backend,
+            server_args.kv_cache_dtype,
+            getattr(model_config, "is_fp4_experts", False),
+        )
         model_runner = SGLangRunner(
             model_config=model_config,
             mem_fraction_static=server_args.mem_fraction_static,
@@ -84,7 +106,77 @@ class OfflineSGLangCaptureBackend:
         return cls(model_runner)
 
     def set_eagle3_capture_layers(self, layer_ids: Optional[List[int]] = None) -> None:
-        self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
+        model = self.model_runner.model
+        if hasattr(model, "set_eagle3_layers_to_capture"):
+            model.set_eagle3_layers_to_capture(layer_ids)
+            return
+        if model.__class__.__name__ == "DeepseekV4ForCausalLM":
+            self._set_deepseek_v4_capture_layers(model, layer_ids)
+            return
+        raise AttributeError(
+            f"{model.__class__.__name__} does not support auxiliary hidden-state "
+            "capture"
+        )
+
+    @staticmethod
+    def _set_deepseek_v4_capture_layers(model, layer_ids: Optional[List[int]]) -> None:
+        """Capture collapsed mHC outputs from selected DeepSeek-V4 layers."""
+
+        if not layer_ids:
+            raise ValueError("DeepSeek-V4 capture requires explicit layer ids")
+
+        decoder = model.model
+        selected = [int(layer_id) for layer_id in layer_ids]
+        if any(
+            layer_id < decoder.start_layer or layer_id >= decoder.end_layer
+            for layer_id in selected
+        ):
+            raise ValueError(
+                "DeepSeek-V4 capture layers must belong to the local pipeline "
+                f"stage [{decoder.start_layer}, {decoder.end_layer}), got {selected}"
+            )
+
+        # Fused mHC defers one layer's hc_post into the next layer, so a normal
+        # forward hook would observe an incomplete layer output. Offline capture
+        # uses the unfused path to expose the same post-layer streams consumed by
+        # mega-dflash before reducing the hc_mult axis.
+        decoder.use_fused_mhc_post_pre = False
+        for layer in decoder.layers:
+            if hasattr(layer, "use_fused_mhc_post_pre"):
+                layer.use_fused_mhc_post_pre = False
+
+        captured = {}
+
+        def capture_layer(layer_id):
+            def hook(_module, _inputs, output):
+                hidden_states = output[0] if isinstance(output, tuple) else output
+                if hidden_states.ndim != 3:
+                    raise RuntimeError(
+                        "DeepSeek-V4 layer capture expected [tokens, hc_mult, hidden], "
+                        f"got {tuple(hidden_states.shape)} at layer {layer_id}"
+                    )
+                captured[layer_id] = hidden_states.mean(dim=1)
+
+            return hook
+
+        for layer_id in selected:
+            decoder.layers[layer_id].register_forward_hook(capture_layer(layer_id))
+
+        original_forward = decoder.forward
+
+        def forward_with_aux(_decoder, *args, **kwargs):
+            captured.clear()
+            output = original_forward(*args, **kwargs)
+            missing = [layer_id for layer_id in selected if layer_id not in captured]
+            if missing:
+                raise RuntimeError(
+                    f"DeepSeek-V4 did not execute requested capture layers: {missing}"
+                )
+            aux_hidden_states = [captured[layer_id] for layer_id in selected]
+            return output, aux_hidden_states
+
+        decoder.forward = MethodType(forward_with_aux, decoder)
+        model.capture_aux_hidden_states = True
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):

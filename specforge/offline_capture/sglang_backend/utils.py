@@ -72,16 +72,23 @@ def replaced_logits_processor_forward_for_offline_eagle3(
         aux_hidden_states,
         logits_metadata,
     )
-    states_to_store = logits_processor._get_hidden_states_to_store(
-        hidden_states,
-        hidden_states_before_norm,
-        aux_hidden_states,
-        pruned_states,
-        pruned_states_before_norm,
-        aux_pruned_states,
-        sample_indices,
-        logits_metadata,
-    )
+    if aux_hidden_states is not None:
+        assert aux_pruned_states is not None
+        # SGLang prefers hidden_states_before_norm over auxiliary states. For
+        # DeepSeek-V4 that tensor is the flattened mHC stream [tokens, 4H], not
+        # the configured target-layer captures needed by offline training.
+        states_to_store = torch.cat(aux_pruned_states, dim=-1)
+    else:
+        states_to_store = logits_processor._get_hidden_states_to_store(
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
     if logits_metadata.extend_return_logprob:
         raise RuntimeError("Offline EAGLE3 capture does not support log probabilities")
     return OfflineEagle3LogitsOutput(
