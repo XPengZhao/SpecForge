@@ -6,11 +6,17 @@ from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
 )
-from specforge.algorithms.common.dflash_family_data import build_dspark_collator
+from specforge.algorithms.common.dflash_family_data import (
+    DSPARK_NORMALIZER_ID,
+    build_dspark_collator,
+    build_offline_dspark_normalizer,
+    build_offline_dspark_reader,
+)
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
     ModelProvider,
+    OfflineDataProvider,
     ServerCaptureLayout,
     ServerStreamingProvider,
     StepProvider,
@@ -22,10 +28,20 @@ from specforge.algorithms.contracts import (
     DraftRequirement,
     FeatureContract,
     FeatureMode,
+    OfflineStorageContract,
 )
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
+DEEPSEEK_V4_DRAFT_ARCHITECTURE = "DeepseekV4DSparkDraftModel"
+
+
+class DSparkDraftConfigProvider(DraftConfigProvider):
+    """DSpark accepts both the Qwen and DeepSeek-V4 draft implementations."""
+
+    @property
+    def compatible_architectures(self):
+        return frozenset({DRAFT_ARCHITECTURE, DEEPSEEK_V4_DRAFT_ARCHITECTURE})
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -38,8 +54,14 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
+    draft_layers = getattr(draft_model, "mtp", None)
+    num_draft_layers = (
+        len(draft_layers)
+        if draft_layers is not None
+        else int(draft_model.config.num_hidden_layers)
+    )
     return {
-        "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
+        "dspark_draft_num_hidden_layers": num_draft_layers,
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
         ),
@@ -93,22 +115,43 @@ def needs_input_tools(config, draft_model):
 
 
 def algorithm_spec() -> AlgorithmSpec:
+    required = {
+        "input_ids",
+        "loss_mask",
+        "hidden_states",
+        "target_last_hidden_states",
+    }
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
-            compatible_architectures={DRAFT_ARCHITECTURE},
+            compatible_architectures={
+                DRAFT_ARCHITECTURE,
+                DEEPSEEK_V4_DRAFT_ARCHITECTURE,
+            },
             default_architecture=DRAFT_ARCHITECTURE,
         ),
         feature_contracts=(
             FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="text",
+                required_tensors=required,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_v1",
+                    required_tensors={
+                        "input_ids",
+                        "loss_mask",
+                        "aux_hidden_state",
+                        "hidden_state",
+                    },
+                    normalizer=DSPARK_NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="text",
-                required_tensors={
-                    "input_ids",
-                    "loss_mask",
-                    "hidden_states",
-                    "target_last_hidden_states",
-                },
+                required_tensors=required,
                 allowed_target_representations={"hidden_state"},
                 default_target_representation="hidden_state",
             ),
@@ -130,7 +173,7 @@ def algorithm_providers() -> AlgorithmProviders:
             uses_external_target_head=False,
         ),
         model=ModelProvider(
-            draft_config=DraftConfigProvider(
+            draft_config=DSparkDraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 expected_auto_map_model="dspark.DSparkDraftModel",
             ),
@@ -140,6 +183,15 @@ def algorithm_providers() -> AlgorithmProviders:
             minimum_loss_tokens=minimum_loss_tokens,
             needs_input_tools=needs_input_tools,
             default_dataloader_num_workers=8,
+        ),
+        offline=(
+            OfflineDataProvider(
+                modality="text",
+                normalizer_id=DSPARK_NORMALIZER_ID,
+                build_reader=build_offline_dspark_reader,
+                build_normalizer=build_offline_dspark_normalizer,
+                build_collator=build_dspark_collator,
+            ),
         ),
         server_streaming=(
             ServerStreamingProvider(

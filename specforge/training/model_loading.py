@@ -284,10 +284,11 @@ def resolve_draft_config(
 
     expected = provider.architecture
     architectures = list(getattr(draft_config, "architectures", None) or [])
-    if architectures != [expected]:
+    compatible = getattr(provider, "compatible_architectures", {expected})
+    if len(architectures) != 1 or architectures[0] not in compatible:
         raise ValueError(
             f"training.strategy={cfg.training.strategy!r} requires draft "
-            f"architecture {expected}, got {architectures!r}"
+            f"architecture in {sorted(compatible)!r}, got {architectures!r}"
         )
     _apply_draft_overrides(cfg, draft_config, provider)
     return draft_config
@@ -403,6 +404,36 @@ def warm_start_draft_model(
     """Load only draft weights, never optimizer/counters/RNG training state."""
 
     runtime_state = _runtime_state_file(source)
+    architectures = list(getattr(draft_config, "architectures", None) or [])
+    if runtime_state is None and architectures == ["DeepseekV4DSparkDraftModel"]:
+        from specforge.modeling.draft.deepseek_v4_dspark import (
+            load_deepseek_v4_dspark_hf_weights,
+        )
+
+        loaded_keys, missing_keys = load_deepseek_v4_dspark_hf_weights(
+            model,
+            source,
+            cache_dir=cache_dir,
+        )
+        if missing_keys:
+            raise ValueError(
+                f"warm-start checkpoint {source!r} is missing DeepSeek-V4 "
+                f"DSpark weights: {list(missing_keys)}"
+            )
+        report = WarmStartReport(
+            source=str(source),
+            checkpoint_format="pretrained",
+            loaded_keys=loaded_keys,
+            missing_keys=(),
+            loaded_embedding=False,
+        )
+        logger.info(
+            "Warm-started %d DeepSeek-V4 DSpark tensors from %s",
+            loaded_keys,
+            source,
+        )
+        return report
+
     if runtime_state is not None:
         checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
         state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)

@@ -116,7 +116,7 @@ def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
     provider = algorithm.providers.model
     draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
     draft_model = provider.build_draft(cfg, draft_config)
-    architecture = provider.draft_config.architecture
+    architecture = draft_config.architectures[0]
     expected_type = resolve_draft(architecture)
     if not isinstance(draft_model, expected_type):
         raise ValueError(

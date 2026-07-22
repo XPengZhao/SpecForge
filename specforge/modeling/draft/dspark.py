@@ -24,9 +24,9 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 class AcceptRatePredictor(nn.Module):
     """Predict target/draft distribution acceptance probability per draft step."""
 
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, *, bias: bool = True):
         super().__init__()
-        self.proj = nn.Linear(int(input_dim), 1)
+        self.proj = nn.Linear(int(input_dim), 1, bias=bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.proj(features).squeeze(-1)

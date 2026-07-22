@@ -1,4 +1,5 @@
 from .base import Eagle3DraftModel
+from .deepseek_v4_dspark import DeepseekV4DSparkConfig, DeepseekV4DSparkDraftModel
 from .dflash import (
     DFlashDraftModel,
     build_target_layer_ids,
@@ -14,6 +15,8 @@ from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_
 __all__ = [
     "Eagle3DraftModel",
     "DFlashDraftModel",
+    "DeepseekV4DSparkDraftModel",
+    "DeepseekV4DSparkConfig",
     "DominoDraftModel",
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",

@@ -54,3 +54,4 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
 
    examples/llama3-eagle3-online.md
    examples/llama3-eagle3-offline.md
+   examples/deepseek-v4-dspark-offline.md

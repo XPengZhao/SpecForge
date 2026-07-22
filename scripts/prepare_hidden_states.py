@@ -1,4 +1,4 @@
-"""Generate offline EAGLE3 features with a dedicated local SGLang capture.
+"""Generate offline EAGLE3 or DSpark features with local SGLang capture.
 
 The local target exists only for this preprocessing command. Online training
 consumes features from an external server and never loads a target model in the
@@ -11,6 +11,7 @@ Usage:
 torchrun --nproc_per_node=8 \
     scripts/prepare_hidden_states.py \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --strategy eagle3 \
     --draft-model-config configs/llama3.1-8b-eagle3.json \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
     --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
@@ -93,6 +94,12 @@ def parse_args():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
+        "--strategy",
+        choices=("eagle3", "dspark"),
+        default="eagle3",
+        help="Offline feature consumer that will read the generated captures.",
+    )
+    model_group.add_argument(
         "--draft-model-config",
         type=str,
         required=True,
@@ -110,7 +117,11 @@ def parse_args():
         "--capture-layers",
         type=str,
         default=None,
-        help="Three comma-separated layer ids (default: 1, middle-1, final-4)",
+        help=(
+            "Comma-separated target layer ids. DSpark defaults to "
+            "dflash_config.target_layer_ids from --draft-model-config; "
+            "EAGLE3 defaults to 1,middle-1,final-4."
+        ),
     )
 
     data_group = parser.add_argument_group("data")
@@ -188,9 +199,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def _resolve_draft_vocab_size(source: str) -> int:
-    """Load ``draft_vocab_size`` from one existing local JSON file."""
-
+def _load_draft_config(source: str) -> dict:
     expanded = Path(source).expanduser()
     if not expanded.is_file():
         raise FileNotFoundError(
@@ -208,6 +217,13 @@ def _resolve_draft_vocab_size(source: str) -> int:
         raise ValueError(f"invalid draft config JSON {expanded}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"draft config JSON {expanded} must contain an object")
+    return payload
+
+
+def _resolve_draft_vocab_size(source: str) -> int:
+    """Load ``draft_vocab_size`` from one existing local JSON file."""
+
+    payload = _load_draft_config(source)
     value = payload.get("draft_vocab_size", payload.get("vocab_size"))
 
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -307,30 +323,65 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def _resolve_capture_layers(
-    model_config: AutoConfig, value: Optional[str]
+    model_config: AutoConfig,
+    value: Optional[str],
+    *,
+    strategy: str = "eagle3",
+    draft_model_config: str = "",
 ) -> List[int]:
     if value is None:
-        num_layers = model_config.num_hidden_layers
-        layers = [1, num_layers // 2 - 1, num_layers - 4]
+        if strategy == "dspark":
+            payload = _load_draft_config(draft_model_config)
+            method_config = payload.get("dflash_config") or {}
+            layers = method_config.get("target_layer_ids")
+            if not isinstance(layers, list) or not layers:
+                raise ValueError(
+                    "DSpark offline capture requires dflash_config.target_layer_ids "
+                    "in --draft-model-config or an explicit --capture-layers value"
+                )
+        else:
+            num_layers = model_config.num_hidden_layers
+            layers = [1, num_layers // 2 - 1, num_layers - 4]
     else:
         try:
             layers = [int(layer.strip()) for layer in value.split(",")]
         except (AttributeError, ValueError) as exc:
             raise ValueError(
-                "--capture-layers must be three comma-separated integers"
+                "--capture-layers must be comma-separated integers"
             ) from exc
-    if len(layers) != 3 or len(set(layers)) != 3 or any(layer < 0 for layer in layers):
+    if strategy == "eagle3" and len(layers) != 3:
         raise ValueError(
             "offline EAGLE3 capture requires three distinct non-negative layers"
         )
-    return layers
+    num_layers = int(model_config.num_hidden_layers)
+    if (
+        not layers
+        or len(set(layers)) != len(layers)
+        or any(
+            isinstance(layer, bool)
+            or not isinstance(layer, int)
+            or layer < 0
+            or layer >= num_layers
+            for layer in layers
+        )
+    ):
+        raise ValueError(
+            "offline capture layers must be distinct integers in "
+            f"[0, {num_layers}), got {layers!r}"
+        )
+    return [int(layer) for layer in layers]
 
 
 def build_target_model(
     args: argparse.Namespace, model_config: AutoConfig
 ) -> OfflineEagle3SGLangCapture:
     """Build the local target used only by this preprocessing command."""
-    capture_layers = _resolve_capture_layers(model_config, args.capture_layers)
+    capture_layers = _resolve_capture_layers(
+        model_config,
+        args.capture_layers,
+        strategy=getattr(args, "strategy", "eagle3"),
+        draft_model_config=getattr(args, "draft_model_config", ""),
+    )
     target_model = load_offline_eagle3_capture(
         args.target_model_path,
         torch_dtype=(
@@ -791,14 +842,15 @@ def main():
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 
-    vocab_mapping_path = _generate_shared_vocab_mapping(
-        eagle3_dataset,
-        output_path=args.output_path,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-    )
-    if dist.get_rank() == 0:
-        print(f"Vocabulary mapping ready at {vocab_mapping_path}")
+    if args.strategy == "eagle3":
+        vocab_mapping_path = _generate_shared_vocab_mapping(
+            eagle3_dataset,
+            output_path=args.output_path,
+            target_vocab_size=target_vocab_size,
+            draft_vocab_size=draft_vocab_size,
+        )
+        if dist.get_rank() == 0:
+            print(f"Vocabulary mapping ready at {vocab_mapping_path}")
 
     # Create DP-sharded dataloader
     data_loader = prepare_dp_dataloaders(
