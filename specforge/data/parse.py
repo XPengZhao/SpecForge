@@ -245,47 +245,99 @@ class GeneralParser(Parser):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
-        # get input_ids
-        encoding = self.tokenizer(
-            conversation,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        input_ids = encoding.input_ids[0]
-        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
-
         matches = list(re.finditer(self.assistant_pattern, conversation, re.DOTALL))
         if train_only_last_turn and matches:
             matches = [matches[-1]]  # Only keep the last match
 
+        # Last-turn training must retain the response at the end of a long
+        # conversation. Standard right truncation can otherwise remove the
+        # entire supervised span.
+        preserve_last_turn = train_only_last_turn and bool(matches)
+        token_offsets = None
+        if preserve_last_turn:
+            try:
+                encoding = self.tokenizer(
+                    conversation,
+                    return_offsets_mapping=True,
+                    add_special_tokens=False,
+                )
+                all_input_ids = encoding.input_ids
+                all_offsets = encoding.offset_mapping
+                sequence_start = max(0, len(all_input_ids) - max_length)
+                input_ids = torch.tensor(
+                    all_input_ids[sequence_start:],
+                    dtype=torch.long,
+                )
+                token_offsets = all_offsets[sequence_start:]
+            except NotImplementedError:
+                all_input_ids = self.tokenizer.encode(
+                    conversation,
+                    add_special_tokens=False,
+                )
+                sequence_start = max(0, len(all_input_ids) - max_length)
+                input_ids = torch.tensor(
+                    all_input_ids[sequence_start:],
+                    dtype=torch.long,
+                )
+        else:
+            try:
+                encoding = self.tokenizer(
+                    conversation,
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                    add_special_tokens=False,
+                )
+                input_ids = encoding.input_ids[0]
+                token_offsets = encoding.offset_mapping[0].tolist()
+            except NotImplementedError:
+                encoding = self.tokenizer(
+                    conversation,
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                )
+                input_ids = encoding.input_ids[0]
+            sequence_start = 0
+        loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
+
         for match in matches:
             content_start_char = match.start(1)
             content_end_char = match.end(1)
+
+            if token_offsets is not None:
+                for token_idx, (token_start, token_end) in enumerate(token_offsets):
+                    if token_end <= content_start_char:
+                        continue
+                    if token_start >= content_end_char:
+                        continue
+                    loss_mask[token_idx] = 1
+                continue
 
             # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
             # Encode the text "assistant start", the length of which is the position of the starting token.
             prefix_ids = self.tokenizer.encode(
                 conversation[:content_start_char],
                 add_special_tokens=False,
-                truncation=True,
-                max_length=max_length,
+                truncation=not preserve_last_turn,
+                max_length=max_length if not preserve_last_turn else None,
             )
             # Encodes the text "assistant end", the length of which is the position of the end token.
             full_ids = self.tokenizer.encode(
                 conversation[:content_end_char],
                 add_special_tokens=False,
-                truncation=True,
-                max_length=max_length,
+                truncation=not preserve_last_turn,
+                max_length=max_length if not preserve_last_turn else None,
             )
 
-            start_token_idx = len(prefix_ids)
-            end_token_idx = len(full_ids)
+            start_token_idx = len(prefix_ids) - sequence_start
+            end_token_idx = len(full_ids) - sequence_start
 
             # Handling out-of-bounds errors caused by truncation
-            actual_start = min(start_token_idx, len(input_ids))
-            actual_end = min(end_token_idx, len(input_ids))
+            actual_start = min(max(0, start_token_idx), len(input_ids))
+            actual_end = min(max(0, end_token_idx), len(input_ids))
 
             if actual_start < actual_end:
                 loss_mask[actual_start:actual_end] = 1
@@ -302,21 +354,39 @@ class GeneralParser(Parser):
                     ignore_start_char = idx
                     ignore_end_char = idx + len(token_str)
 
+                    if token_offsets is not None:
+                        for token_idx, (token_start, token_end) in enumerate(
+                            token_offsets
+                        ):
+                            if token_end <= ignore_start_char:
+                                continue
+                            if token_start >= ignore_end_char:
+                                continue
+                            loss_mask[token_idx] = 0
+                        start = ignore_end_char
+                        continue
+
                     prefix_ids = self.tokenizer.encode(
                         conversation[:ignore_start_char],
                         add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_length,
+                        truncation=not preserve_last_turn,
+                        max_length=max_length if not preserve_last_turn else None,
                     )
                     full_ids = self.tokenizer.encode(
                         conversation[:ignore_end_char],
                         add_special_tokens=False,
-                        truncation=True,
-                        max_length=max_length,
+                        truncation=not preserve_last_turn,
+                        max_length=max_length if not preserve_last_turn else None,
                     )
 
-                    start_token_idx = min(len(prefix_ids), len(input_ids))
-                    end_token_idx = min(len(full_ids), len(input_ids))
+                    start_token_idx = min(
+                        max(0, len(prefix_ids) - sequence_start),
+                        len(input_ids),
+                    )
+                    end_token_idx = min(
+                        max(0, len(full_ids) - sequence_start),
+                        len(input_ids),
+                    )
 
                     if start_token_idx < end_token_idx:
                         loss_mask[start_token_idx:end_token_idx] = 0

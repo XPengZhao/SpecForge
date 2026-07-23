@@ -1,0 +1,45 @@
+model:
+  target_model_path: "/path/to/DeepSeek-V4-Flash-DSpark"
+  draft_model_config: "configs/deepseek-v4-flash-dspark.json"
+  draft_checkpoint_path: "/path/to/DeepSeek-V4-Flash-DSpark"
+  target_backend: "sglang"
+  embedding_key: "embed.weight"
+  lm_head_key: "head.weight"
+  torch_dtype: "bfloat16"
+  trust_remote_code: true
+
+data:
+  hidden_states_path: "./cache/hidden_states/dsv4-dspark-response-4gpu"
+  max_length: 4096
+  cache_dir: "./cache"
+  dataloader_num_workers: 0
+
+training:
+  strategy: "dspark"
+  num_epochs: 1
+  max_steps: 1
+  batch_size: 1
+  accumulation_steps: 1
+  fsdp_sharding: "FULL_SHARD"
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.0
+  max_grad_norm: 0.5
+  attention_backend: "flex_attention"
+  tp_size: 1
+  num_anchors: 32
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 0
+  log_interval: 1
+  dist_timeout: 120
+  seed: 42
+
+run_id: "dsv4-dspark-response-offline-smoke"
+output_dir: "./outputs/dsv4-dspark-response-offline-smoke"
+
+deployment:
+  mode: "local_colocated"
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

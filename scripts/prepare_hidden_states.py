@@ -87,6 +87,56 @@ class DataPoint:
     aux_hidden_state: Optional[torch.Tensor] = None
 
 
+def _crop_to_response(
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    loss_mask: torch.Tensor,
+    hidden_state: torch.Tensor,
+    aux_hidden_state: Optional[torch.Tensor],
+    context_tokens: int,
+) -> DataPoint:
+    """Keep the supervised response and its immediate target-model context."""
+
+    attended_positions = torch.nonzero(attention_mask, as_tuple=False).flatten()
+    if attended_positions.numel() == 0:
+        raise ValueError("cannot crop a sample with an empty attention mask")
+    sequence_length = int(attended_positions[-1].item()) + 1
+
+    response_positions = torch.nonzero(
+        loss_mask[:sequence_length] > 0, as_tuple=False
+    ).flatten()
+    if response_positions.numel() == 0:
+        raise ValueError("cannot crop a sample with no supervised response tokens")
+
+    response_start = int(response_positions[0].item())
+    response_end = int(response_positions[-1].item()) + 1
+    crop_start = max(0, response_start - context_tokens)
+
+    for name, value in (
+        ("hidden_state", hidden_state),
+        ("aux_hidden_state", aux_hidden_state),
+    ):
+        if value is not None and (value.ndim != 3 or value.shape[1] < response_end):
+            raise ValueError(
+                f"{name} must have shape [1, sequence, hidden] covering "
+                f"{response_end} tokens, got {tuple(value.shape)}"
+            )
+
+    cropped_loss_mask = loss_mask[crop_start:response_end].clone()
+    cropped_loss_mask[: response_start - crop_start] = 0
+    return DataPoint(
+        input_ids=input_ids[crop_start:response_end].clone(),
+        loss_mask=cropped_loss_mask,
+        hidden_state=hidden_state[:, crop_start:response_end].clone(),
+        aux_hidden_state=(
+            aux_hidden_state[:, crop_start:response_end].clone()
+            if aux_hidden_state is not None
+            else None
+        ),
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -132,6 +182,20 @@ def parse_args():
         "--is-preformatted",
         action="store_true",
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
+    )
+    data_group.add_argument(
+        "--response-only",
+        action="store_true",
+        help=(
+            "For DSpark, run the target on the full sequence but save only the "
+            "last supervised response and its preceding context."
+        ),
+    )
+    data_group.add_argument(
+        "--response-context-tokens",
+        type=int,
+        default=128,
+        help="Number of tokens immediately before the response to retain.",
     )
     data_group.add_argument("--num-samples", type=int, default=None)
     data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
@@ -322,6 +386,15 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
+def _data_file_fingerprint(path: str) -> str:
+    """Return a cache fingerprint that changes when a local data file changes."""
+
+    resolved = Path(path).expanduser().resolve()
+    stat = resolved.stat()
+    payload = f"{resolved}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 def _raw_target_config(args: argparse.Namespace) -> Dict[str, object]:
     """Load config.json without dropping model-specific fields."""
 
@@ -458,6 +531,8 @@ class HiddenStatesGenerator:
         file_group_size: int = 2000,
         compress: bool = False,
         compression_level: int = 6,
+        response_only: bool = False,
+        response_context_tokens: int = 128,
     ):
         """
         Args:
@@ -475,6 +550,8 @@ class HiddenStatesGenerator:
         self.compress = compress
         self.compression_level = compression_level
         self.file_extension = ".ckpt.gz" if self.compress else ".ckpt"
+        self.response_only = response_only
+        self.response_context_tokens = response_context_tokens
 
         # progress bar should only shown on TP rank = 0
         self.show_progress = dist.get_rank(get_tp_group()) == 0
@@ -769,12 +846,22 @@ class HiddenStatesGenerator:
                         if last_hidden_states is not None
                         else None
                     )
-                    data_point = DataPoint(
-                        input_ids=filtered_batch["input_ids"][i].clone(),
-                        loss_mask=filtered_batch["loss_mask"][i].clone(),
-                        hidden_state=last_hidden_states,
-                        aux_hidden_state=aux_hidden_states,
-                    )
+                    if self.response_only:
+                        data_point = _crop_to_response(
+                            input_ids=filtered_batch["input_ids"][i],
+                            attention_mask=filtered_batch["attention_mask"][i],
+                            loss_mask=filtered_batch["loss_mask"][i],
+                            hidden_state=last_hidden_states,
+                            aux_hidden_state=aux_hidden_states,
+                            context_tokens=self.response_context_tokens,
+                        )
+                    else:
+                        data_point = DataPoint(
+                            input_ids=filtered_batch["input_ids"][i].clone(),
+                            loss_mask=filtered_batch["loss_mask"][i].clone(),
+                            hidden_state=last_hidden_states,
+                            aux_hidden_state=aux_hidden_states,
+                        )
 
                     # 3. Save asynchronously (the backpressure logic is still crucial)
                     output_file = self._get_file_path(output_path, current_global_idx)
@@ -812,6 +899,10 @@ class HiddenStatesGenerator:
 
 def main():
     args = parse_args()
+    if args.response_only and args.strategy != "dspark":
+        raise ValueError("--response-only is currently supported only for DSpark")
+    if args.response_context_tokens < 0:
+        raise ValueError("--response-context-tokens must be >= 0")
     if args.num_io_threads is None:
         cpu_cores = os.cpu_count() or 1
         args.num_io_threads = max(1, cpu_cores)
@@ -849,6 +940,8 @@ def main():
     assert os.path.exists(
         args.data_path
     ), f"Dataset path {args.data_path} does not exist"
+    data_fingerprint = _data_file_fingerprint(args.data_path)
+    print_with_rank(f"Data source fingerprint: {data_fingerprint}")
 
     with rank_0_priority():
         print_with_rank("Loading/building dataset cache...")
@@ -859,6 +952,7 @@ def main():
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "cache",
                 "hf_dataset",
+                data_fingerprint,
             ),
             num_proc=min(args.build_dataset_num_proc, 32),
         )
@@ -868,7 +962,13 @@ def main():
     tokenizer = load_tokenizer(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
+    cache_params_string = (
+        f"preprocess-v4-{args.data_path}-{data_fingerprint}-"
+        f"{args.max_length}-{args.chat_template}-"
+        f"{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-"
+        f"last-turn={args.response_only}-"
+        f"response-context={args.response_context_tokens}"
+    )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
@@ -882,6 +982,8 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
             is_preformatted=args.is_preformatted,
+            train_only_last_turn=args.response_only,
+            minimum_valid_tokens=2 if args.response_only else None,
             num_proc=args.build_dataset_num_proc,
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
@@ -941,7 +1043,8 @@ def main():
             file_group_size=args.file_group_size,
             compress=args.compress,
             compression_level=args.compression_level,
-            # Other params like io_queue_size can also be added to argparse
+            response_only=args.response_only,
+            response_context_tokens=args.response_context_tokens,
         ) as hidden_states_generator:
 
             # Generate hidden states

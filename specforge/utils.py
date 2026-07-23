@@ -193,12 +193,7 @@ def print_on_rank0(message):
 
 
 def safe_conversations_generator(file_path):
-    """
-    Generator that:
-    1. Extracts the 'conversations' field.
-    2. Preserves all original fields within each message.
-    3. [Key step] Converts all list/dict-type field values to strings to resolve mixed-type conflicts (e.g., for Arrow compatibility).
-    """
+    """Yield normalized conversation or preformatted-text JSONL rows."""
     with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             line = line.strip()
@@ -206,6 +201,16 @@ def safe_conversations_generator(file_path):
                 continue
             try:
                 row = json.loads(line)
+                if "text" in row:
+                    text = row["text"]
+                    if not isinstance(text, str) or not text:
+                        logger.warning(
+                            "Line %d: 'text' is not a non-empty string", i + 1
+                        )
+                        continue
+                    yield {"text": text}
+                    continue
+
                 raw_convs = row.get("conversations", [])
 
                 # 1. Ensure 'conversations' is a list

@@ -112,7 +112,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
-    tools: Optional[List[List[Dict]]] = [[]],
+    tools: Optional[List[List[Dict]]] = None,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -144,6 +144,13 @@ def preprocess_conversations(
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
+    if tools is None:
+        tools = [[] for _ in conversations]
+    elif len(tools) != len(conversations):
+        raise ValueError(
+            f"tools must contain one entry per conversation: "
+            f"{len(tools)} != {len(conversations)}"
+        )
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
