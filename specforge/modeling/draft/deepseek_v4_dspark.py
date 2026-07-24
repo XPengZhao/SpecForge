@@ -760,16 +760,31 @@ def _hyper_connection(
     pre_b, post_b, comb_b = base.float().split([hc_mult, hc_mult, hc_mult * hc_mult])
     pre_scale, post_scale, comb_scale = scale.float().unbind(0)
     pre = torch.sigmoid(pre_w * pre_scale + pre_b) + eps
-    post = torch.sigmoid(post_w * post_scale + post_b) + eps
+    post = torch.sigmoid(post_w * post_scale + post_b) * 2.0
     comb_logits = comb_w.view(
         *comb_w.shape[:-1], hc_mult, hc_mult
     ) * comb_scale + comb_b.view(hc_mult, hc_mult)
-    comb = torch.sigmoid(comb_logits) + eps
-    for _ in range(sinkhorn_iters):
+    comb = torch.softmax(comb_logits, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
         comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
     collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2)
     return post, comb, collapsed.to(hidden_streams.dtype)
+
+
+def _apply_hyper_connection(
+    output: torch.Tensor,
+    hidden_streams: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    mixed_residual = torch.matmul(
+        comb.transpose(-1, -2),
+        hidden_streams.float(),
+    )
+    post_term = post.unsqueeze(-1) * output.float().unsqueeze(-2)
+    return (mixed_residual + post_term).to(hidden_streams.dtype)
 
 
 class DeepseekV4DSparkStage(nn.Module):
@@ -851,7 +866,6 @@ class DeepseekV4DSparkStage(nn.Module):
         position_ids: torch.Tensor,
         attention_mask,
     ) -> torch.Tensor:
-        dtype = hidden_streams.dtype
         post, comb, collapsed = _hyper_connection(
             hidden_streams,
             self.hc_attn_fn,
@@ -867,9 +881,12 @@ class DeepseekV4DSparkStage(nn.Module):
             position_ids,
             attention_mask,
         )
-        hidden_streams = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(
-            -2
-        ) + torch.matmul(comb.to(dtype), hidden_streams)
+        hidden_streams = _apply_hyper_connection(
+            attn_output,
+            hidden_streams,
+            post,
+            comb,
+        )
 
         post, comb, collapsed = _hyper_connection(
             hidden_streams,
@@ -881,8 +898,11 @@ class DeepseekV4DSparkStage(nn.Module):
             sinkhorn_iters=self.hc_sinkhorn_iters,
         )
         ffn_output = self.ffn(self.ffn_norm(collapsed))
-        return post.to(dtype).unsqueeze(-1) * ffn_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype), hidden_streams
+        return _apply_hyper_connection(
+            ffn_output,
+            hidden_streams,
+            post,
+            comb,
         )
 
     def collapse_head(self, hidden_streams: torch.Tensor) -> torch.Tensor:

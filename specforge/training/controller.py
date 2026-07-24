@@ -309,8 +309,19 @@ class TrainerCore:
             else:
                 continue
             scalar_metrics[key] = scalar
+        weighted_accuracy = (
+            "acc" in scalar_metrics and "accuracy_denom" in scalar_metrics
+        )
+        if weighted_accuracy:
+            scalar_metrics["acc"] = (
+                scalar_metrics["acc"] * scalar_metrics["accuracy_denom"]
+            )
         if stepped:
             scalar_metrics = _dp_mean_scalars(scalar_metrics)
+        if weighted_accuracy:
+            scalar_metrics["acc"] = scalar_metrics["acc"] / scalar_metrics[
+                "accuracy_denom"
+            ].clamp_min(1e-6)
         metrics.update({key: _scalar(value) for key, value in scalar_metrics.items()})
         gn = _scalar(grad_norm) if grad_norm is not None else None
         if gn is not None:
