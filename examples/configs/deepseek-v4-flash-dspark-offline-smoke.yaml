@@ -27,7 +27,7 @@ training:
   attention_backend: "flex_attention"
   tp_size: 1
   num_anchors: 32
-  dspark_ce_loss_alpha: 0.1
+  dspark_ce_loss_alpha: 1.0
   dspark_l1_loss_alpha: 0.9
   dspark_confidence_head_alpha: 1.0
   save_interval: 0
