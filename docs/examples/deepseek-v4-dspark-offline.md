@@ -136,8 +136,15 @@ uv run --active --no-sync python scripts/export_deepseek_v4_dspark_checkpoint.py
   --overwrite
 ```
 
-The exporter keeps target weights unchanged, writes trained `mtp.*` tensors into
-new overlay safetensors shards, and updates `model.safetensors.index.json`.
-Base safetensors are hardlinked by default to avoid duplicating the target
-checkpoint; pass `--copy-base-weights` if the output must be physically
-self-contained.
+The exporter keeps target weights unchanged. By default, each trained tensor is
+converted back to the storage format used by the corresponding base tensor:
+MXFP4 expert weights are repacked with UE8M0 scales, FP8 weights receive
+regenerated block scales, and unquantized tensors retain their base dtype.
+
+Shards unaffected by `mtp.*` are hardlinked from the base model. Shards that
+contain replaced `mtp.*` tensors are rewritten so every checkpoint key occurs
+only once; this avoids depending on safetensors file iteration order in serving
+loaders. Pass `--copy-base-weights` if all unaffected shards must also be
+physically copied. For debugging only,
+`--draft-format floating --dtype bfloat16` retains the older floating-point
+overlay behavior.
