@@ -11,11 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Send preformatted prompts to vLLM for DSpark acceptance-rate measurement.
-
-The script reports request-side throughput and failures. DSpark acceptance
-statistics are emitted by the vLLM server as ``SpecDecoding metrics``.
-"""
+"""Send preformatted prompts to vLLM and measure DSpark acceptance rates."""
 
 from __future__ import annotations
 
@@ -27,12 +23,25 @@ import urllib.error
 import urllib.request
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from specforge.utils import load_tokenizer
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ASSISTANT_MARKER = "<｜Assistant｜>"
+
+
+@dataclass
+class SpecDecodeMetrics:
+    """Cumulative speculative-decoding counters exposed by vLLM."""
+
+    num_drafts: int
+    num_draft_tokens: int
+    num_accepted_tokens: int
+    accepted_per_pos: dict[int, int]
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +58,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--request-timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--tokenizer-path",
+        default=None,
+        help="Tokenizer used to save the prompt's final input tokens.",
+    )
+    parser.add_argument(
+        "--input-preview-tokens",
+        type=int,
+        default=128,
+        help="Number of trailing prompt tokens to save in each output record.",
+    )
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--stop",
         action="append",
@@ -83,6 +104,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-tokens must be > 0")
     if args.request_timeout <= 0:
         raise ValueError("--request-timeout must be > 0")
+    if args.input_preview_tokens < 0:
+        raise ValueError("--input-preview-tokens must be >= 0")
+    if (
+        args.input_preview_tokens > 0
+        and args.output_jsonl is not None
+        and not args.tokenizer_path
+    ):
+        raise ValueError(
+            "--tokenizer-path is required when saving token-based input previews"
+        )
     if not args.assistant_marker:
         raise ValueError("--assistant-marker must not be empty")
     if args.output_jsonl is not None and args.output_jsonl.exists():
@@ -174,12 +205,125 @@ def post_completion(
         raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
     elapsed = time.perf_counter() - started
     usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
+    choices = parsed.get("choices", []) if isinstance(parsed, dict) else []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     return {
         "elapsed_sec": elapsed,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
-        "response": parsed,
+        "output_text": choice.get("text"),
+        "finish_reason": choice.get("finish_reason"),
     }
+
+
+def fetch_spec_decode_metrics(
+    server_url: str,
+    timeout: float,
+) -> SpecDecodeMetrics | None:
+    """Read cumulative speculative-decoding counters from vLLM."""
+    request = urllib.request.Request(
+        server_url.rstrip("/") + "/metrics",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        logger.warning("Could not read vLLM metrics: %s", exc)
+        return None
+
+    num_drafts = 0
+    num_draft_tokens = 0
+    num_accepted_tokens = 0
+    accepted_per_pos: dict[int, int] = {}
+    found = False
+    for line in body.splitlines():
+        line = line.strip()
+        if (
+            not line
+            or line.startswith("#")
+            or not line.startswith("vllm:spec_decode")
+        ):
+            continue
+        parts = line.split(None, 1)
+        metric_name = parts[0].split("{", 1)[0]
+        if len(parts) != 2 or not metric_name.endswith("_total"):
+            continue
+        try:
+            value = int(float(parts[1]))
+        except ValueError:
+            continue
+        found = True
+        if "num_drafts" in metric_name:
+            num_drafts += value
+        elif "num_draft_tokens" in metric_name:
+            num_draft_tokens += value
+        elif "num_accepted_tokens_per_pos" in metric_name:
+            marker = 'position="'
+            if marker not in line:
+                continue
+            start = line.index(marker) + len(marker)
+            position = int(line[start : line.index('"', start)])
+            accepted_per_pos[position] = accepted_per_pos.get(position, 0) + value
+        elif "num_accepted_tokens" in metric_name:
+            num_accepted_tokens += value
+
+    if not found:
+        logger.warning("No speculative-decoding counters found at /metrics")
+        return None
+    return SpecDecodeMetrics(
+        num_drafts=num_drafts,
+        num_draft_tokens=num_draft_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        accepted_per_pos=accepted_per_pos,
+    )
+
+
+def subtract_metrics(
+    before: SpecDecodeMetrics,
+    after: SpecDecodeMetrics,
+) -> SpecDecodeMetrics:
+    """Return counters accumulated between two metrics snapshots."""
+    positions = set(before.accepted_per_pos) | set(after.accepted_per_pos)
+    return SpecDecodeMetrics(
+        num_drafts=after.num_drafts - before.num_drafts,
+        num_draft_tokens=after.num_draft_tokens - before.num_draft_tokens,
+        num_accepted_tokens=after.num_accepted_tokens - before.num_accepted_tokens,
+        accepted_per_pos={
+            position: after.accepted_per_pos.get(position, 0)
+            - before.accepted_per_pos.get(position, 0)
+            for position in positions
+        },
+    )
+
+
+def log_spec_decode_metrics(metrics: SpecDecodeMetrics) -> None:
+    """Log exact acceptance statistics for the benchmark interval."""
+    acceptance_rate = (
+        metrics.num_accepted_tokens / metrics.num_draft_tokens
+        if metrics.num_draft_tokens > 0
+        else 0.0
+    )
+    acceptance_length = (
+        1.0 + metrics.num_accepted_tokens / metrics.num_drafts
+        if metrics.num_drafts > 0
+        else 1.0
+    )
+    per_position = [
+        metrics.accepted_per_pos[position] / metrics.num_drafts
+        if metrics.num_drafts > 0
+        else 0.0
+        for position in sorted(metrics.accepted_per_pos)
+    ]
+    logger.info("DSpark drafts: %d", metrics.num_drafts)
+    logger.info("DSpark drafted tokens: %d", metrics.num_draft_tokens)
+    logger.info("DSpark accepted tokens: %d", metrics.num_accepted_tokens)
+    logger.info("DSpark acceptance rate: %.4f", acceptance_rate)
+    logger.info("DSpark mean acceptance length: %.4f", acceptance_length)
+    logger.info(
+        "DSpark per-position acceptance: %s",
+        ", ".join(f"{rate:.4f}" for rate in per_position),
+    )
 
 
 def write_jsonl(handle, item: dict[str, Any]) -> None:
@@ -200,6 +344,8 @@ def drain_completed(
     done, pending = wait(pending, return_when=FIRST_COMPLETED)
     for future in done:
         line_number = getattr(future, "line_number")
+        input_tail = getattr(future, "input_tail")
+        input_tail_tokens = getattr(future, "input_tail_tokens")
         try:
             result = future.result()
         except Exception as exc:
@@ -210,6 +356,8 @@ def drain_completed(
                 {
                     "line_number": line_number,
                     "ok": False,
+                    "input_tail": input_tail,
+                    "input_tail_tokens": input_tail_tokens,
                     "error": str(exc),
                 },
             )
@@ -230,6 +378,10 @@ def drain_completed(
                 "elapsed_sec": result["elapsed_sec"],
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "input_tail": input_tail,
+                "input_tail_tokens": input_tail_tokens,
+                "output_text": result["output_text"],
+                "finish_reason": result["finish_reason"],
             },
         )
 
@@ -251,6 +403,12 @@ def run(args: argparse.Namespace) -> Counter:
     endpoint = args.server_url.rstrip("/") + "/v1/completions"
     stats: Counter = Counter()
     started_at = time.perf_counter()
+    tokenizer = None
+    if args.tokenizer_path:
+        tokenizer = load_tokenizer(
+            args.tokenizer_path,
+            trust_remote_code=args.trust_remote_code,
+        )
     output_handle = None
     if args.output_jsonl is not None:
         args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -281,6 +439,13 @@ def run(args: argparse.Namespace) -> Counter:
                     )
 
                 stats["submitted"] += 1
+                input_tail = None
+                input_tail_tokens = 0
+                if tokenizer is not None and args.input_preview_tokens > 0:
+                    prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                    tail_token_ids = prompt_token_ids[-args.input_preview_tokens :]
+                    input_tail = tokenizer.decode(tail_token_ids)
+                    input_tail_tokens = len(tail_token_ids)
                 future = executor.submit(
                     post_completion,
                     endpoint=endpoint,
@@ -293,6 +458,8 @@ def run(args: argparse.Namespace) -> Counter:
                     timeout=args.request_timeout,
                 )
                 setattr(future, "line_number", line_number)
+                setattr(future, "input_tail", input_tail)
+                setattr(future, "input_tail_tokens", input_tail_tokens)
                 pending.add(future)
 
             while pending:
@@ -315,13 +482,14 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
     validate_args(args)
+    metrics_before = fetch_spec_decode_metrics(args.server_url, args.request_timeout)
     stats = run(args)
+    metrics_after = fetch_spec_decode_metrics(args.server_url, args.request_timeout)
     logger.info("Finished request benchmark")
     for key in sorted(stats):
         logger.info("%s: %s", key, stats[key])
-    logger.info(
-        "Read DSpark acceptance from the vLLM server log: grep 'SpecDecoding metrics' <server.log>"
-    )
+    if metrics_before is not None and metrics_after is not None:
+        log_spec_decode_metrics(subtract_metrics(metrics_before, metrics_after))
     return 0
 
 
