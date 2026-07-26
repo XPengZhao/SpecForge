@@ -19,8 +19,58 @@ For each non-empty assistant response ending with
 `<｜end▁of▁sentence｜>`, the converter writes a `{"text": ...}` record containing
 the full conversation prefix through that response. Prefixes repeated in later
 request snapshots are deduplicated by SHA-256 and records retain their
-first-seen order. Pass the converted file with `--is-preformatted` and the
-DeepSeek template:
+first-seen order.
+
+### Generate target rollouts
+
+When the recorded assistant responses were produced by a different model or
+agent policy, regenerate them with the exact target model used for DSpark
+serving. Start a target-only vLLM server without `--speculative-config`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name DeepSeek-V4-Flash-DSpark \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --no-enable-prefix-caching \
+  --max-num-seqs 2 \
+  --max-model-len 128000 \
+  --max-num-batched-tokens 32768 \
+  --kv-cache-dtype fp8
+```
+
+Generate one target response for every preformatted prompt:
+
+```bash
+uv run --active --no-sync python scripts/generate_target_rollouts.py \
+  --server-url http://127.0.0.1:8000 \
+  --model DeepSeek-V4-Flash-DSpark \
+  --tokenizer-path /path/to/DeepSeek-V4-Flash-DSpark \
+  --data-path /path/to/dspark-preformatted.jsonl \
+  --output-path /path/to/dspark-target-rollouts.jsonl \
+  --max-length 128000 \
+  --max-tokens 2048 \
+  --temperature 0 \
+  --top-p 1.0 \
+  --concurrency 2 \
+  --trust-remote-code
+```
+
+The output remains preformatted JSONL and can be passed directly to feature
+capture. If generation is interrupted, rerun with `--resume`; completed source
+line numbers are skipped. Responses stopped by the model receive the DeepSeek
+end marker. Length-truncated responses remain valid partial target trajectories
+and are retained unless `--drop-truncated` is set. Client concurrency should
+not exceed the vLLM server's `--max-num-seqs`; start at two for long prompts
+and increase both values only after checking KV-cache headroom.
+
+### Capture target features
+
+Pass the target-rollout file with `--is-preformatted` and the DeepSeek
+template:
 
 ```bash
 python -m torch.distributed.run --nproc_per_node=8 \
@@ -28,7 +78,7 @@ python -m torch.distributed.run --nproc_per_node=8 \
   --strategy dspark \
   --target-model-path /path/to/DeepSeek-V4-Flash-DSpark \
   --draft-model-config configs/deepseek-v4-flash-dspark.json \
-  --data-path /path/to/dspark-preformatted.jsonl \
+  --data-path /path/to/dspark-target-rollouts.jsonl \
   --output-path /path/to/dspark-hidden-states \
   --is-preformatted \
   --chat-template deepseek-v3 \
