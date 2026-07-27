@@ -163,6 +163,7 @@ class FSDPTrainingBackend(TrainingBackend):
         self._wrapper_kind = "none"
         self.auto_wrap_block_classes = set()
         self.ignored_frozen_modules = tuple()
+        self.replicated_trainable_parameters = tuple()
 
     @property
     def optimizer_state_is_replicated(self) -> bool:
@@ -210,6 +211,13 @@ class FSDPTrainingBackend(TrainingBackend):
 
             pc = self.parallel_config
             ignored_frozen_modules = self._frozen_target_modules(model)
+            replicated_parameters = tuple(
+                getattr(
+                    optimizer_target,
+                    "fsdp_replicated_parameters",
+                    lambda: (),
+                )()
+            )
             # DFlash-family models expose their transformer block class through
             # ``_no_split_modules``.  Preserve the legacy per-block FSDP policy:
             # it overlaps all-gather/reduce-scatter with decoder compute and is
@@ -260,8 +268,16 @@ class FSDPTrainingBackend(TrainingBackend):
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
                 )
-                if ignored_frozen_modules:
-                    fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
+                ignored_parameters = {
+                    id(parameter): parameter
+                    for module in ignored_frozen_modules
+                    for parameter in module.parameters()
+                }
+                ignored_parameters.update(
+                    {id(parameter): parameter for parameter in replicated_parameters}
+                )
+                if ignored_parameters:
+                    fsdp_kwargs["ignored_states"] = tuple(ignored_parameters.values())
                 if block_classes:
                     fsdp_kwargs.update(
                         auto_wrap_policy=functools.partial(
@@ -280,6 +296,9 @@ class FSDPTrainingBackend(TrainingBackend):
                 block_classes if self._wrapper_kind == "fsdp" else set()
             )
             self.ignored_frozen_modules = ignored_frozen_modules
+            self.replicated_trainable_parameters = (
+                replicated_parameters if self._wrapper_kind == "fsdp" else tuple()
+            )
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)
@@ -299,7 +318,34 @@ class FSDPTrainingBackend(TrainingBackend):
                     self._wrapped
                     and self.parallel_config.sharding_strategy != "NO_SHARD"
                 ),
+                replicated_parameters=self.replicated_trainable_parameters,
             )
+
+    def _sync_replicated_gradients(self) -> None:
+        gradients = [
+            parameter.grad
+            for parameter in self.replicated_trainable_parameters
+            if parameter.grad is not None
+        ]
+        if not gradients or not dist.is_initialized():
+            return
+
+        flat_gradients = torch.cat(
+            [gradient.detach().reshape(-1) for gradient in gradients]
+        )
+        process_group = self.parallel_config.fsdp_process_group
+        dist.all_reduce(
+            flat_gradients,
+            op=dist.ReduceOp.SUM,
+            group=process_group,
+        )
+        flat_gradients.div_(dist.get_world_size(process_group))
+
+        offset = 0
+        for gradient in gradients:
+            numel = gradient.numel()
+            gradient.copy_(flat_gradients[offset : offset + numel].view_as(gradient))
+            offset += numel
 
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-step with one gradient collective per window.
@@ -309,6 +355,8 @@ class FSDPTrainingBackend(TrainingBackend):
         """
         if is_boundary or not self._wrapped:
             loss.backward()
+            if is_boundary and self._wrapper_kind == "fsdp":
+                self._sync_replicated_gradients()
         else:
             with self.module.no_sync():
                 loss.backward()

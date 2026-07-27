@@ -195,6 +195,6 @@ Shards unaffected by `mtp.*` are hardlinked from the base model. Shards that
 contain replaced `mtp.*` tensors are rewritten so every checkpoint key occurs
 only once; this avoids depending on safetensors file iteration order in serving
 loaders. Pass `--copy-base-weights` if all unaffected shards must also be
-physically copied. For debugging only,
-`--draft-format floating --dtype bfloat16` retains the older floating-point
-overlay behavior.
+physically copied. For a draft-only training artifact, use
+`--draft-format floating --dtype keep`; this preserves the checkpoint's BF16
+weights and strict FP32 mHC, attention-sink, router-bias, and RMSNorm tensors.

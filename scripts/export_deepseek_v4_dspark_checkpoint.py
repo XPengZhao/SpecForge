@@ -448,7 +448,7 @@ def export_deepseek_v4_dspark_checkpoint(
     base_hf_model: str,
     checkpoint: str,
     output_dir: str,
-    dtype: torch.dtype | None = torch.bfloat16,
+    dtype: torch.dtype | None = None,
     quantize_like_base: bool = True,
     max_shard_size: int = DEFAULT_SHARD_SIZE_BYTES,
     overwrite: bool = False,
@@ -601,11 +601,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--dtype",
-        default="bfloat16",
+        default="keep",
         type=_dtype_from_arg,
         help=(
             "Floating dtype used only with --draft-format floating. "
-            "Use 'keep' to preserve checkpoint dtype."
+            "Defaults to 'keep' so strict FP32 DSpark parameters are preserved."
         ),
     )
     parser.add_argument(
