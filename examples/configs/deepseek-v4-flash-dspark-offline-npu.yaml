@@ -1,0 +1,54 @@
+model:
+  target_model_path: /path/to/DeepSeek-V4-Flash-DSpark
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  draft_checkpoint_path: /path/to/DeepSeek-V4-Flash-DSpark
+  embedding_key: embed.weight     # ← 覆盖默认 model.embed_tokens.weight
+  lm_head_key: head.weight        # ← 覆盖默认 lm_head.weight
+  torch_dtype: bfloat16
+  # （可选）每个 FSDP unit 包含的 expert 数量，默认 32。
+  # 256 / 32 = 8 组。值越小显存占用越低，但通信次数越多。
+  moe_train_group_size: 16
+  # （可选）dense attention 分块大小，默认 256。长序列 / 多 anchor 导致
+  # attention OOM 时调小此值（如 64 或 32）。
+  attention_chunk_size: 64
+
+data:
+  hidden_states_path: /path/to/dspark-hidden-states
+  max_length: 1024
+
+training:
+  strategy: dspark
+  # Ascend NPU has no flex_attention; sdpa selects the dense block-diagonal
+  # attention path in DeepseekV4DSparkAttention (see _dense_attention).
+  attention_backend: eager
+  # FSDP is the default backend; FULL_SHARD shards params + grads + optimizer
+  # state across ranks (vs the default SHARD_GRAD_OP which keeps full params).
+  fsdp_sharding: FULL_SHARD
+  batch_size: 1
+  num_anchors: 64
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  # 是否在 backward 中重算 per-position DSpark loss（CE + L1 + confidence）
+  # 以降低 loss 步的显存峰值。true 约省 2.6 GiB（512x5x129280）；
+  # false（默认）不重算，更快但显存占用更高。
+  recompute_loss: false  # 按默认值
+  # Activation checkpointing 粒度："stage"（整层 attn+MoE）、
+  # "attention"（仅 attention）、"none"（关闭，默认）。
+  # 长序列 / 多 anchor 导致 OOM 时建议设为 "stage" 或 "attention"。
+  activation_checkpointing: "attention"
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+run_id: deepseek-v4-dspark-npu-offline
+output_dir: ./outputs/deepseek-v4-dspark-npu-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

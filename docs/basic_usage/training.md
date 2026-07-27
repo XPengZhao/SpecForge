@@ -206,6 +206,7 @@ The checked-in examples are the canonical starting points:
 | EAGLE3 offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](../../examples/configs/qwen3-8b-eagle3-offline-disaggregated.yaml) |
 | Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml) |
 | Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml) |
+| Ascend NPU DSpark offline | [`deepseek-v4-flash-dspark-offline-npu.yaml`](../../examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml) |
 
 ## Online and offline data
 

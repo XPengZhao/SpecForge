@@ -70,6 +70,7 @@ def _assemble_trainer(
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
     dataloader_num_workers: int = 0,
+    activation_checkpointing: str = "none",
     profiling_options=None,
     fit_context=None,
     on_fit_success: Optional[Callable[[int], None]] = None,
@@ -144,6 +145,7 @@ def _assemble_trainer(
         sp_ulysses_size=sp_ulysses_size,
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
+        activation_checkpointing=activation_checkpointing,
         profiling_options=profiling_options,
         fit_context=fit_context,
         on_fit_success=on_fit_success,
@@ -541,6 +543,7 @@ def build_offline_runtime(
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     dataloader_num_workers: int = 0,
     profiling_options=None,
+    activation_checkpointing: str = "none",
 ):
     """Assemble the colocated offline dataflow (``LocalFeatureStore``).
 
@@ -630,6 +633,7 @@ def build_offline_runtime(
         sp_ring_size=sp_ring_size,
         dataloader_num_workers=dataloader_num_workers,
         profiling_options=profiling_options,
+        activation_checkpointing=activation_checkpointing,
     )
 
 

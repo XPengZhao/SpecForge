@@ -110,6 +110,7 @@ class Trainer:
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         dataloader_num_workers: int = 0,
+        activation_checkpointing: str = "none",
         profiling_options=None,
         fit_context=None,
         on_fit_success: Optional[Callable[[int], None]] = None,
@@ -422,7 +423,11 @@ class Trainer:
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        wrapped = backend.prepare_model(
+            model,
+            optimizer_target=model.draft_model,
+            activation_checkpointing=activation_checkpointing,
+        )
         if resume is not None:
             backend.load_state_dict(resume["backend"])
         strategy = make_step_strategy(

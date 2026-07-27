@@ -51,12 +51,26 @@ without target inference. PyTorch exposes ROCm accelerators through its
 
 ### Ascend NPU
 
-Install the vendor-matched PyTorch and `torch_npu` packages first, then install
-SpecForge. The checked-in
-[`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml)
+Install the Ascend driver/firmware and the CANN toolkit first, matching the
+`torch_npu` release you intend to use (see its release notes). Source CANN's
+environment, then install the checked-in NPU requirements before the package:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python -m pip install -r requirements-npu.txt
+python -m pip install -e .
+```
+
+`requirements-npu.txt` pins `torch==2.11.0` plus a matching `torch_npu`; adjust
+the exact `torch_npu` patch to the release that matches torch 2.11.0. The
+checked-in
+[`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml),
+[`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml),
 and
-[`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml)
-recipes use external SGLang server capture with SDPA consumers. Install a
-compatible SGLang/Mooncake service first. The unified launcher detects the NPU
-device, self-launches the process count recorded in YAML, and selects HCCL; see
-the [training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).
+[`deepseek-v4-flash-dspark-offline-npu.yaml`](../../examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml)
+recipes use external SGLang server capture with SDPA consumers. `sglang` is a
+hard import dependency: the stock wheel satisfies offline-training imports,
+but online capture requires an NPU-compatible SGLang/Mooncake service. The
+unified launcher detects the NPU device, self-launches the process count
+recorded in YAML, and selects HCCL; see the
+[training guide](../basic_usage/training.md#cuda-rocm-and-ascend-npu).

@@ -511,6 +511,7 @@ def _common_launch_kwargs(
         tp_size=t.tp_size,
         sp_ulysses_size=t.sp_ulysses_size,
         sp_ring_size=t.sp_ring_size,
+        activation_checkpointing=t.activation_checkpointing,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )

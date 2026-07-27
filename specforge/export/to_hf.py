@@ -109,6 +109,22 @@ def export_to_hf(
             embedding_source, embedding_key
         )
     full_state.update(state["draft_state_dict"])  # trained keys win
+
+    # Reverse the expert-group key mapping so the exported weights use the
+    # original HuggingFace ``experts.<i>.*`` layout instead of the training
+    # ``expert_groups.<g>.experts.<i>.*`` layout.
+    architectures = list(getattr(model.config, "architectures", None) or [])
+    if "DeepseekV4DSparkDraftModel" in architectures:
+        from specforge.modeling.draft.deepseek_v4_dspark import (
+            remap_checkpoint_keys_for_hf_export,
+        )
+
+        group_size = int(getattr(model.config, "moe_train_group_size", 32))
+        full_state = remap_checkpoint_keys_for_hf_export(full_state, group_size)
+        # Drop the training-only field so the saved config matches upstream HF.
+        if hasattr(model.config, "moe_train_group_size"):
+            del model.config.moe_train_group_size
+
     model.save_pretrained(output_dir, state_dict=full_state)
     return output_dir
 

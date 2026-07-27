@@ -47,6 +47,14 @@ class ModelConfig(StrictConfigModel):
     draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
     #: Optional DFlash block-size override (auto-generated default: 16).
     draft_block_size: Optional[int] = Field(default=None, gt=0)
+    #: Number of routed experts per FSDP unit in DeepseekV4DSparkMoE.
+    #: 256 experts / 32 = 8 groups; smaller values reduce per-unit memory at
+    #: the cost of more all-gather communication (default: 32).
+    moe_train_group_size: Optional[int] = Field(default=None, gt=0)
+    #: Chunk size for the chunked dense attention path on devices without
+    #: flex_attention (e.g. NPU).  Smaller values reduce peak memory at the
+    #: cost of more kernel launches (default: 256).
+    attention_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
     #: configs naming them fail at load instead of being silently ignored.
@@ -497,6 +505,16 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    #: Recompute the per-position DSpark loss (CE + L1 + confidence) under
+    #: gradient checkpointing in backward to cut the loss-step memory peak.
+    #: ``true`` saves ~2.6 GiB at 512x5x129280; ``false`` (default) disables
+    #: recomputation (faster, more memory).
+    recompute_loss: bool = False
+    #: Activation checkpointing granularity: ``"stage"`` wraps the whole
+    #: DSPark stage (attention + MoE), ``"attention"`` wraps only the
+    #: attention module, ``"none"`` disables checkpointing entirely.
+    #: Finer granularity saves less memory but adds less recompute overhead.
+    activation_checkpointing: Literal["stage", "attention", "none"] = "none"
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

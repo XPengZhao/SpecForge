@@ -1,0 +1,39 @@
+# Ascend NPU environment.
+#
+# Prerequisites (install before this file):
+#   1. Ascend driver/firmware and the CANN toolkit whose version matches the
+#      torch_npu release below (see the torch_npu release notes).
+#   2. Source CANN's environment before pip installs, e.g.:
+#        source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#
+# torch_npu extends the stock PyTorch wheel, so no special torch index is
+# needed. Pin the exact torch_npu patch that matches torch==2.11.0.
+#
+# Install order:
+#   pip install -r requirements-npu.txt
+#   pip install -e .
+#
+# sglang is a hard import dependency. For offline training with pre-captured
+# features the stock wheel is enough to satisfy imports; for online capture you
+# must instead install an NPU-compatible SGLang/Mooncake service (see
+# docs/get_started/installation.md).
+
+torch==2.11.0
+torch_npu  # pin the patch matching torch 2.11.0, e.g. torch_npu==2.11.0.post1
+transformers==5.8.1
+datasets
+setuptools
+tqdm
+wandb
+psutil
+numpy
+accelerate
+pydantic
+pyyaml
+requests
+safetensors
+sglang[all]==0.5.14
+openai-harmony
+tensorboard
+typing-extensions
+yunchang

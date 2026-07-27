@@ -509,7 +509,10 @@ class TrainerController:
                     # durable ack transaction at the optimizer-step boundary
                     self.ack_fn(pending_ack, self.global_step)
                     pending_ack = []
-                if self.logger and self.global_step % max(1, self.log_interval) == 0:
+                if self.logger and (
+                    self.global_step == 1
+                    or self.global_step % max(1, self.log_interval) == 0
+                ):
                     log_metrics = dict(result.metrics)
                     optimizer = getattr(self.core.backend, "optimizer", None)
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)

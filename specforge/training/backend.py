@@ -142,6 +142,27 @@ class TrainingBackend(abc.ABC):
     def load_state_dict(self, state: dict) -> None: ...
 
 
+def _empty_device_cache() -> None:
+    """Release cached (non-active) blocks in the device caching allocator.
+
+    The caching allocator keeps freed tensors around for reuse.  After weight
+    loading (FP4→bf16 dequantisation intermediates) and after FSDP flattening
+    (thousands of small weight tensors replaced by a handful of contiguous
+    FlatParameters) the cache can hold many GB of fragmented blocks that no
+    single subsequent allocation can satisfy.  Calling ``empty_cache`` returns
+    those blocks to the device driver so large contiguous allocations such as
+    the FSDP all-gather buffer can succeed.
+    """
+    try:
+        for device_type in ("cuda", "npu"):
+            module = getattr(torch, device_type, None)
+            empty = getattr(module, "empty_cache", None)
+            if callable(empty):
+                empty()
+    except Exception:
+        pass
+
+
 class FSDPTrainingBackend(TrainingBackend):
     """FSDP1 backend for the canonical SpecForge training math: FSDP with
     ``use_orig_params=True`` / bf16 mixed precision over the configured process
@@ -191,12 +212,18 @@ class FSDPTrainingBackend(TrainingBackend):
                 modules.append(module)
         return tuple(modules)
 
+    _AC_MODULES = {
+        "stage": frozenset({"DeepseekV4DSparkStage"}),
+        "attention": frozenset({"DeepseekV4DSparkAttention"}),
+    }
+
     def prepare_model(
         self,
         model: nn.Module,
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
+        activation_checkpointing: str = "none",
     ) -> nn.Module:
         """Register and wrap the trainable module unless ``wrap=False``.
 
@@ -289,7 +316,42 @@ class FSDPTrainingBackend(TrainingBackend):
                         limit_all_gathers=True,
                     )
                 model = FSDP(model, **fsdp_kwargs)
+                # Apply activation checkpointing AFTER FSDP wrapping so the
+                # checkpoint wrapper sits *inside* the FSDP unit.  During
+                # forward FSDP all-gathers params, the inner module runs
+                # (activations NOT saved), and during backward the inner
+                # module re-runs (params still gathered).
+                ac_modules = self._AC_MODULES.get(activation_checkpointing)
+                if ac_modules:
+                    import functools
+
+                    from torch.utils.checkpoint import checkpoint as _torch_ac
+
+                    patched = 0
+                    for module in model.modules():
+                        if type(module).__name__ in ac_modules:
+                            _orig = module.forward
+
+                            @functools.wraps(_orig)
+                            def _ac_forward(*args, _orig=_orig, **kwargs):
+                                return _torch_ac(
+                                    _orig, *args, use_reentrant=False, **kwargs
+                                )
+
+                            module.forward = _ac_forward
+                            patched += 1
+                    _logger = logging.getLogger(__name__)
+                    _logger.info(
+                        "activation checkpointing=%r applied to %d module(s): %s",
+                        activation_checkpointing, patched,
+                        ", ".join(sorted(ac_modules)),
+                    )
                 self._wrapper_kind = "fsdp"
+            # Release cached allocator blocks left over from weight loading
+            # (e.g. dequantised FP4→bf16 intermediates) so FSDP wrapping
+            # sees a clean heap and can allocate its FlatParameters without
+            # fragmentation pressure.
+            _empty_device_cache()
             self.module = model
             self._wrapped = True
             self.auto_wrap_block_classes = (
@@ -302,6 +364,13 @@ class FSDPTrainingBackend(TrainingBackend):
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)
+            # The original 2600+ parameter tensors have now been freed by
+            # FSDP (replaced by a handful of contiguous FlatParameters).
+            # Their storage sits fragmented in the device caching allocator.
+            # empty_cache() returns those fragments to the driver so that
+            # the 12 GB all-gather buffer during backward can obtain a
+            # single contiguous allocation.
+            _empty_device_cache()
             self._configure_optimizer_grad_norm()
         return self.module
 

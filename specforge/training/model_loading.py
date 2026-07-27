@@ -261,6 +261,10 @@ def _apply_draft_overrides(
         draft_config.num_hidden_layers = num_layers
     if cfg.model.draft_block_size is not None:
         draft_config.block_size = cfg.model.draft_block_size
+    if cfg.model.moe_train_group_size is not None:
+        draft_config.moe_train_group_size = cfg.model.moe_train_group_size
+    if cfg.model.attention_chunk_size is not None:
+        draft_config.attention_chunk_size = cfg.model.attention_chunk_size
     if provider.apply_overrides is not None:
         provider.apply_overrides(cfg, draft_config)
 
@@ -414,6 +418,7 @@ def warm_start_draft_model(
             model,
             source,
             cache_dir=cache_dir,
+            group_size=getattr(draft_config, "moe_train_group_size", 32),
         )
         if missing_keys:
             raise ValueError(

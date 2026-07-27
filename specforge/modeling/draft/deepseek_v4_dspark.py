@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from typing import Optional
 
 import torch
@@ -66,6 +68,8 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
         *,
         dflash_config: Optional[dict] = None,
         draft_vocab_size: Optional[int] = None,
+        moe_train_group_size: int = 32,
+        attention_chunk_size: int = 256,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -75,6 +79,8 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
             if draft_vocab_size is not None
             else int(self.vocab_size)
         )
+        self.moe_train_group_size = int(moe_train_group_size)
+        self.attention_chunk_size = int(attention_chunk_size)
 
 
 class DeepseekV4DSparkRMSNorm(DeepseekV4RMSNorm):
@@ -171,11 +177,106 @@ def _dequantize_fp8(
     )
 
 
+def _expert_group_key(ckpt_key: str, group_size: int) -> str:
+    """Map a checkpoint ``...experts.<i>...`` key to the grouped model path.
+
+    Checkpoint stores:  ``mtp.0.ffn.experts.5.w1.weight``
+    Model uses:         ``mtp.0.ffn.expert_groups.0.experts.5.w1.weight``
+                        (expert 5 is in group 0 = experts 0-31 when group_size=32)
+    """
+    parts = ckpt_key.split(".")
+    try:
+        idx = parts.index("experts")
+    except ValueError:
+        return ckpt_key
+    # parts[idx] = "experts", parts[idx+1] = expert index
+    expert_id = int(parts[idx + 1])
+    group_idx = expert_id // group_size
+    local_idx = expert_id % group_size
+    # Insert "expert_groups.<g>" before "experts"
+    new_parts = (
+        parts[:idx]
+        + ["expert_groups", str(group_idx), "experts", str(local_idx)]
+        + parts[idx + 2 :]
+    )
+    return ".".join(new_parts)
+
+
+def _ungroup_expert_key(model_key: str) -> str:
+    """Reverse of :func:`_expert_group_key`: flatten grouped keys for HF export.
+
+    Model stores:  ``mtp.0.ffn.expert_groups.0.experts.5.w1.weight``
+    HF expects:    ``mtp.0.ffn.experts.5.w1.weight``
+    """
+    parts = model_key.split(".")
+    try:
+        gidx = parts.index("expert_groups")
+    except ValueError:
+        return model_key
+    # parts: [..., "expert_groups", "<g>", "experts", "<local>", ...]
+    group_idx = int(parts[gidx + 1])
+    local_idx = int(parts[gidx + 3])
+    expert_id = group_idx * 32 + local_idx  # group_size is implicit; see _expert_group_key
+    # Collapse "expert_groups.<g>.experts.<local>" → "experts.<expert_id>"
+    new_parts = parts[:gidx] + ["experts", str(expert_id)] + parts[gidx + 4 :]
+    return ".".join(new_parts)
+
+
+def remap_checkpoint_keys_for_hf_export(
+    state_dict: dict[str, object],
+    group_size: int = 32,
+) -> dict[str, object]:
+    """Convert grouped expert keys back to flat ``experts.<i>`` form.
+
+    Called during HF export so the saved weights match the original
+    DeepSeek-V4 checkpoint layout.
+    """
+    result: dict[str, object] = {}
+    for key, value in state_dict.items():
+        parts = key.split(".")
+        if "expert_groups" in parts:
+            gidx = parts.index("expert_groups")
+            group_idx = int(parts[gidx + 1])
+            local_idx = int(parts[gidx + 3])
+            expert_id = group_idx * group_size + local_idx
+            new_key = ".".join(
+                parts[:gidx] + ["experts", str(expert_id)] + parts[gidx + 4 :]
+            )
+            result[new_key] = value
+        else:
+            result[key] = value
+    return result
+
+
+def build_ckpt_to_model_key_map(
+    model_keys: set[str], ckpt_keys: set[str], group_size: int
+) -> dict[str, str]:
+    """Build ``{model_key: ckpt_key}`` mapping handling expert grouping."""
+    # Pre-build reverse index: grouped checkpoint key → original checkpoint key
+    ckpt_by_grouped: dict[str, str] = {}
+    for ck in ckpt_keys:
+        grouped = _expert_group_key(ck, group_size)
+        if grouped != ck:
+            ckpt_by_grouped[grouped] = ck
+
+    mapping = {}
+    for mkey in model_keys:
+        if mkey in ckpt_keys:
+            mapping[mkey] = mkey
+            continue
+        # O(1) lookup via pre-built index
+        ck = ckpt_by_grouped.get(mkey)
+        if ck is not None:
+            mapping[mkey] = ck
+    return mapping
+
+
 def load_deepseek_v4_dspark_hf_weights(
     model: nn.Module,
     source: str,
     *,
     cache_dir: Optional[str] = None,
+    group_size: int = 32,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream only ``mtp.*`` tensors from a full DSv4 HF checkpoint."""
 
@@ -196,35 +297,48 @@ def load_deepseek_v4_dspark_hf_weights(
         weight_map = json.load(stream).get("weight_map", {})
 
     destination = model.state_dict(keep_vars=True)
-    required = {key for key in destination if key.startswith("mtp.")}
-    missing = sorted(required - weight_map.keys())
+    model_keys = {key for key in destination if key.startswith("mtp.")}
+    # Build mapping from model keys to checkpoint keys
+    ckpt_keys = set(weight_map.keys())
+    key_map = build_ckpt_to_model_key_map(model_keys, ckpt_keys, group_size)
+    missing = sorted(model_keys - key_map.keys())
     if missing:
         return 0, tuple(missing)
 
-    shard_to_keys: dict[str, list[str]] = {}
-    for key in sorted(required):
-        shard_to_keys.setdefault(weight_map[key], []).append(key)
+    shard_to_keys: dict[str, list[tuple[str, str]]] = {}
+    for mkey in sorted(model_keys):
+        ck_key = key_map[mkey]
+        shard_to_keys.setdefault(weight_map[ck_key], []).append((mkey, ck_key))
 
+    logger = logging.getLogger(__name__)
+    total_weights = len(model_keys)
+    logger.info(
+        "Loading %d DeepSeek-V4 DSpark weights from %d shard(s) ...",
+        total_weights, len(shard_to_keys),
+    )
+    t_start = time.monotonic()
     loaded = 0
 
-    def load_scale(scale_key: str) -> torch.Tensor:
-        shard = weight_map.get(scale_key)
+    def load_scale(ck_scale_key: str) -> torch.Tensor:
+        shard = weight_map.get(ck_scale_key)
         if shard is None:
-            raise KeyError(scale_key)
+            raise KeyError(ck_scale_key)
         with safe_open(
             os.path.join(local_source, shard), framework="pt", device="cpu"
         ) as handle:
-            return handle.get_tensor(scale_key)
+            return handle.get_tensor(ck_scale_key)
 
-    for shard, keys in shard_to_keys.items():
+    for shard, pairs in shard_to_keys.items():
         with safe_open(
             os.path.join(local_source, shard), framework="pt", device="cpu"
         ) as handle:
             shard_names = set(handle.keys())
-            for key in keys:
-                value = handle.get_tensor(key)
+            for mkey, ck_key in pairs:
+                value = handle.get_tensor(ck_key)
                 scale_key = (
-                    key[: -len(".weight")] + ".scale" if key.endswith(".weight") else ""
+                    ck_key[: -len(".weight")] + ".scale"
+                    if ck_key.endswith(".weight")
+                    else ""
                 )
                 if value.dtype == torch.int8 and scale_key:
                     scale = (
@@ -232,23 +346,29 @@ def load_deepseek_v4_dspark_hf_weights(
                         if scale_key in shard_names
                         else load_scale(scale_key)
                     )
-                    value = _dequantize_fp4(value, scale, destination[key].dtype)
+                    value = _dequantize_fp4(value, scale, destination[mkey].dtype)
                 elif value.dtype == torch.float8_e4m3fn and scale_key:
                     scale = (
                         handle.get_tensor(scale_key)
                         if scale_key in shard_names
                         else load_scale(scale_key)
                     )
-                    value = _dequantize_fp8(value, scale, destination[key].dtype)
+                    value = _dequantize_fp8(value, scale, destination[mkey].dtype)
                 else:
-                    value = value.to(destination[key].dtype)
-                if value.shape != destination[key].shape:
+                    value = value.to(destination[mkey].dtype)
+                if value.shape != destination[mkey].shape:
                     raise ValueError(
-                        f"DeepSeek-V4 DSpark tensor shape mismatch for {key}: "
-                        f"checkpoint={tuple(value.shape)}, model={tuple(destination[key].shape)}"
+                        f"DeepSeek-V4 DSpark tensor shape mismatch for {mkey}: "
+                        f"checkpoint={tuple(value.shape)}, "
+                        f"model={tuple(destination[mkey].shape)}"
                     )
-                destination[key].data.copy_(value)
+                destination[mkey].data.copy_(value)
                 loaded += 1
+    elapsed = time.monotonic() - t_start
+    logger.info(
+        "Loaded %d weights in %.1fs (%.0f weights/s)",
+        loaded, elapsed, loaded / elapsed if elapsed > 0 else float("inf"),
+    )
     return loaded, ()
 
 
@@ -262,6 +382,8 @@ class DeepseekV4DSparkAttention(nn.Module):
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = int(config.head_dim)
         self.scaling = self.head_dim**-0.5
+        self.block_size = int(_method_config(config).get("block_size", 0))
+        self.attention_chunk_size = int(getattr(config, "attention_chunk_size", 256))
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = DeepseekV4DSparkRMSNorm(
@@ -291,6 +413,134 @@ class DeepseekV4DSparkAttention(nn.Module):
             torch.empty(self.num_heads, dtype=torch.float32)
         )
 
+    # ----------------------------------------------------------------------
+    # Future optimization opportunity (dense-anchor / whole-response loss)
+    # ----------------------------------------------------------------------
+    # Planned change: stop sampling a sparse set of anchors and instead put
+    # the whole response into the loss -- i.e. every response token becomes an
+    # anchor (N = response length R). Two structural consequences:
+    #
+    # 1. The context mask becomes *causal*: query at position a attends to
+    #    context [0..a]. That is a standard lower-triangular causal mask,
+    #    which fused kernels support natively -- including on Ascend NPU via
+    #    ``F.scaled_dot_product_attention(..., is_causal=True)``. The causal
+    #    path is the well-supported one on NPU (unlike arbitrary user masks),
+    #    so the context segment could switch from the dense ``Q x S`` matmul
+    #    to a fused causal kernel, dropping the custom context mask entirely.
+    #
+    # 2. The draft segment degenerates:
+    #    - If ``block_size`` also collapses to 1 (one-token "blocks"), the
+    #      draft-draft region becomes a 1x1 self-attention per position. With
+    #      ``include_anchor_context=True`` each query already attends to
+    #      itself via the context, so the draft segment is fully redundant and
+    #      the whole split-softmax below can be removed -- attention reduces to
+    #      plain causal (± sliding_window) over the full sequence. That removes
+    #      BOTH the custom-mask problem and the Q != KV problem that forced us
+    #      off fused SDPA in the first place, enabling a single fused
+    #      causal/flash call (with sliding window if supported).
+    #    - If ``block_size`` stays > 1, the block-diagonal structure is
+    #      preserved so the split-softmax here remains valid and beneficial;
+    #      but Q grows to R*block_size, so the context chunk loop is mandatory
+    #      and the context part should still move to a fused causal kernel.
+    #
+    # 3. The learned attention sink still needs the per-query logsumexp. A
+    #    fused flash/causal kernel can return LSE directly (``return_lse`` or
+    #    equivalent), so the separate scores matmul for the sink can be dropped
+    #    as well -- the sink gate becomes a cheap post-pass on kernel LSE.
+    #
+    # 4. ``sliding_window`` (128) turns the causal mask into causal+window
+    #    (a band mask); many fused backends support this natively, otherwise it
+    #    stays a cheap additive band mask on top of the causal kernel.
+    #
+    # Net: dense anchors let the NPU path collapse from "custom dense mask +
+    # split-softmax + chunked manual matmul" to "one fused causal/flash call +
+    # LSE-based sink gate", which is both simpler and dramatically faster.
+    # Not implemented yet -- left as a comment per plan.
+    # ----------------------------------------------------------------------
+    def _dense_attention(
+        self,
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Manual dense-mask attention for devices without flex_attention.
+
+        Used on Ascend NPU, where ``F.scaled_dot_product_attention`` cannot be
+        relied on for a custom dense boolean mask with ``Q_LEN != KV_LEN``.
+        This path is plain matmul/softmax, so it imposes no Q/KV length
+        constraint and no mask-format constraint.  It also returns the
+        logsumexp needed by the learned attention sink.
+
+        ``attention_mask`` is the boolean tensor from ``create_dflash_sdpa_mask``
+        with shape ``(B, 1, Q, KV)`` (``True`` = attend); ``KV = S + N*bs`` and
+        ``Q = N*bs``.  The draft-draft region of the mask is block-diagonal: each
+        query block attends only to its own ``bs`` draft tokens, so computing
+        the full ``Q*KV`` scores wastes the off-diagonal ``Q*Q`` block.  We split
+        the softmax into a context part (``Q x S``, chunked over Q) and a draft
+        part (``N`` independent ``bs x bs`` blocks) and merge them exactly via
+        ``output = (o_ctx + o_draft) / (Z_ctx + Z_draft)``,
+        ``lse = log(Z_ctx + Z_draft)``.  Shared-KV MLA uses ``kv`` as both keys
+        and values, broadcast from one head to all query heads.
+        """
+        chunk = self.attention_chunk_size
+        mask = attention_mask.bool()
+        B, H, Q, d = query.shape
+        KV = kv.shape[2]
+        S = KV - Q
+        bs = self.block_size
+        N = Q // bs
+        kv_f = kv.float()
+        neg = torch.finfo(torch.float32).min
+        tiny = torch.finfo(torch.float32).tiny
+
+        # --- Part A: context attention (Q x S), chunked over Q ---
+        # Use stable softmax/logsumexp per chunk; derive the unnormalised
+        # output o_ctx = Z_ctx * (softmax @ V) so the merge is exact.
+        kv_ctx = kv_f[:, :, :S, :]                  # (B, 1, S, d)
+        kv_ctx_t = kv_ctx.transpose(-1, -2)         # (B, 1, d, S)
+        o_ctx_parts, z_ctx_parts = [], []
+        for start in range(0, Q, chunk):
+            q_chunk = query[:, :, start : start + chunk].float()   # (B, H, c, d)
+            m_ctx = mask[:, :, start : start + chunk, :S]           # (B, 1, c, S)
+            scores = torch.matmul(q_chunk, kv_ctx_t) * self.scaling  # (B, H, c, S)
+            scores = scores.masked_fill(~m_ctx, neg)
+            lse_c = torch.logsumexp(scores, dim=-1)                # (B, H, c)
+            attn = torch.softmax(scores, dim=-1)                   # (B, H, c, S)
+            z_ctx_parts.append(torch.exp(lse_c))                   # Z_ctx
+            o_ctx_parts.append(
+                torch.exp(lse_c).unsqueeze(-1) * torch.matmul(attn, kv_ctx)
+            )
+        o_ctx = torch.cat(o_ctx_parts, dim=2)                        # (B, H, Q, d)
+        z_ctx = torch.cat(z_ctx_parts, dim=-1)                       # (B, H, Q)
+
+        # --- Part B: draft block-diagonal attention (N x bs x bs) ---
+        # Per-block diagonal mask: all-True for valid blocks, all-False otherwise.
+        m_draft_full = mask[:, :, :Q, S:]                            # (B, 1, Q, Q)
+        m_diag = m_draft_full.reshape(B, 1, N, bs, N, bs).diagonal(dim1=2, dim2=4)
+        m_diag = m_diag.permute(0, 1, 4, 2, 3).contiguous()           # (B, 1, N, bs, bs)
+        q_blocks = query.reshape(B, H, N, bs, d).float()             # (B, H, N, bs, d)
+        kv_draft = kv_f[:, :, S : S + N * bs, :].reshape(B, 1, N, bs, d)
+        kv_draft_exp = kv_draft.expand(B, H, N, bs, d)
+        scores_d = torch.matmul(q_blocks, kv_draft_exp.transpose(-1, -2)) * self.scaling
+        scores_d = scores_d.masked_fill(~m_diag, neg)                 # (B, H, N, bs, bs)
+        lse_d = torch.logsumexp(scores_d, dim=-1)                    # (B, H, N, bs)
+        attn_d = torch.softmax(scores_d, dim=-1)                     # (B, H, N, bs, bs)
+        z_draft = torch.exp(lse_d)                                   # (B, H, N, bs)
+        o_draft = z_draft.unsqueeze(-1) * torch.matmul(attn_d, kv_draft_exp)
+
+        # --- Exact merge of the two softmax segments ---
+        z_ctx_blk = z_ctx.reshape(B, H, N, bs)
+        o_ctx_blk = o_ctx.reshape(B, H, N, bs, d)
+        z_total = z_ctx_blk + z_draft                                # (B, H, N, bs)
+        output = (o_ctx_blk + o_draft) / z_total.clamp_min(tiny).unsqueeze(-1)
+        output = output.reshape(B, H, Q, d).to(query.dtype)
+        lse = torch.log(z_total.clamp_min(tiny)).reshape(B, H, Q)
+
+        sink_scale = torch.sigmoid(
+            lse - self.attn_sink.float().view(1, -1, 1)
+        ).to(output.dtype)
+        return output * sink_scale.unsqueeze(-1)
+
     def _attention(
         self,
         query: torch.Tensor,
@@ -315,9 +565,13 @@ class DeepseekV4DSparkAttention(nn.Module):
             ).to(output.dtype)
             return output * sink_scale.unsqueeze(-1)
 
+        if isinstance(attention_mask, torch.Tensor):
+            return self._dense_attention(query, kv, attention_mask)
+
         raise ValueError(
-            "DeepSeek-V4 DSpark requires attention_backend=flex_attention "
-            "to preserve sparse masking and the learned attention sink"
+            "DeepSeek-V4 DSpark requires attention_backend=flex_attention or "
+            "sdpa/eager (dense boolean mask); got "
+            f"{type(attention_mask).__name__}"
         )
 
     def forward(
@@ -403,12 +657,72 @@ class DeepseekV4DSparkRouter(nn.Module):
         return indices, weights * self.routed_scaling_factor
 
 
+class DeepseekV4DSparkExpertGroup(nn.Module):
+    """Group of consecutive experts wrapped as one FSDP unit.
+
+    ``group_size=32`` gives ~800M params / 1.6 GB per group, so FULL_SHARD
+    init (which allocates a full flat buffer + scatter buffer = 2× unit size)
+    stays within device memory (~3.2 GB temporary vs ~24 GB for all 256).  The
+    forward iterates experts in ``active_experts`` order just like the flat
+    MoE, so the routing behaviour is identical.
+    """
+
+    def __init__(self, config: DeepseekV4Config, group_size: int, global_offset: int):
+        super().__init__()
+        self.global_offset = global_offset
+        self.experts = nn.ModuleList(
+            [DeepseekV4DSparkExpert(config) for _ in range(group_size)]
+        )
+
+    @property
+    def group_size(self) -> int:
+        return len(self.experts)
+
+    def forward(
+        self,
+        flat: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        routed: torch.Tensor,
+    ) -> torch.Tensor:
+        lo = self.global_offset
+        for local_id, expert in enumerate(self.experts):
+            expert_id = lo + local_id
+            token_slot, route_slot = torch.where(indices == expert_id)
+            if token_slot.numel() > 0:
+                out = expert(flat[token_slot])
+                out = out * weights[token_slot, route_slot].unsqueeze(-1)
+                routed.index_add_(0, token_slot, out.to(routed.dtype))
+        return routed
+
+
 class DeepseekV4DSparkMoE(nn.Module):
+    """MoE with experts partitioned into FSDP-friendly groups.
+
+    ``config.moe_train_group_size`` (default 32) controls the number of
+    experts per group. 256 / 32 = 8 FSDP units.  Smaller values reduce
+    per-unit temporary memory at the cost of more all-gather communication.
+
+    Checkpoint keys under ``experts.`` are remapped to
+    ``expert_groups.<g>.experts.<e>`` during weight loading — see
+    :func:`_expert_group_key` and :func:`load_deepseek_v4_dspark_hf_weights`.
+    """
+
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
         self.gate = DeepseekV4DSparkRouter(config)
-        self.experts = nn.ModuleList(
-            [DeepseekV4DSparkExpert(config) for _ in range(config.n_routed_experts)]
+        n_routed = int(config.n_routed_experts)
+        group_size = int(getattr(config, "moe_train_group_size", 32))
+        assert n_routed % group_size == 0, (
+            f"n_routed_experts ({n_routed}) must be divisible by "
+            f"moe_train_group_size ({group_size})"
+        )
+        self.group_size = group_size
+        self.expert_groups = nn.ModuleList(
+            [
+                DeepseekV4DSparkExpertGroup(config, group_size, s)
+                for s in range(0, n_routed, group_size)
+            ]
         )
         self.shared_experts = DeepseekV4DSparkExpert(config)
 
@@ -417,15 +731,11 @@ class DeepseekV4DSparkMoE(nn.Module):
         flat = hidden_states.reshape(-1, shape[-1])
         indices, weights = self.gate(flat)
         routed = torch.zeros_like(flat)
-        with torch.no_grad():
-            active_experts = torch.unique(indices).tolist()
-        for expert_id in active_experts:
-            token_slot, route_slot = torch.where(indices == expert_id)
-            expert_output = self.experts[expert_id](flat[token_slot])
-            expert_output = expert_output * weights[token_slot, route_slot].unsqueeze(
-                -1
-            )
-            routed.index_add_(0, token_slot, expert_output.to(routed.dtype))
+        # Each ExpertGroup is an FSDP unit — iteration triggers per-group
+        # all-gather.  Groups with no routed tokens touch no parameters
+        # internally, but FSDP gathers the flat-param on entry regardless.
+        for group in self.expert_groups:
+            routed = group(flat, indices, weights, routed)
         return (routed + self.shared_experts(flat)).view(shape)
 
 
@@ -595,7 +905,7 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
     """DeepSeek-V4 DSpark module matching the checkpoint's ``mtp.*`` tree."""
 
     config_class = DeepseekV4DSparkConfig
-    _no_split_modules = ["DeepseekV4DSparkMoE"]
+    _no_split_modules = ["DeepseekV4DSparkMoE", "DeepseekV4DSparkExpertGroup"]
     _keep_in_fp32_modules_strict = [
         "attn_sink",
         "hc_attn_fn",

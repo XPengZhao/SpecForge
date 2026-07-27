@@ -23,6 +23,8 @@ import logging
 import os
 import re
 import shutil
+import time
+import traceback
 from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
@@ -30,6 +32,17 @@ import torch
 logger = logging.getLogger(__name__)
 
 STATE_FILE = "training_state.pt"
+
+
+def _cpu_tensors(obj: Any) -> Any:
+    """Recursively move all tensors in *obj* to CPU."""
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu()
+    if isinstance(obj, dict):
+        return {key: _cpu_tensors(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_cpu_tensors(item) for item in obj)
+    return obj
 
 
 class CheckpointManager:
@@ -80,30 +93,46 @@ class CheckpointManager:
         written by every rank. Collective: any rank's failure raises on all ranks.
         """
         ckpt_dir = self.checkpoint_dir(step)
+        rank = self._rank()
+        t0 = time.monotonic()
+        _pfx = f"[ckpt step={step} rank={rank}]"
+
         err = ""
         try:
             if self.is_rank0():
                 self._rewind(step)
         except Exception as exc:
-            err = f"rewind failed: {type(exc).__name__}: {exc}"
+            err = f"rewind failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
         self._barrier()  # stale >= step dirs are gone before any rank recreates them
+        print(f"{_pfx} rewind done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
+
         if not err:
             try:
                 os.makedirs(ckpt_dir, exist_ok=True)
+                print(f"{_pfx} mkdir done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
+
                 if rank_state is not None:
                     self._atomic_save(
                         rank_state,
-                        os.path.join(ckpt_dir, self._rank_file(self._rank())),
+                        os.path.join(ckpt_dir, self._rank_file(rank)),
                     )
+                print(f"{_pfx} rank_save done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
+
                 if self.is_rank0() and state is not None:
                     self._atomic_save(state, self._state_path(ckpt_dir))
+                    print(f"{_pfx} state_save done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
             except Exception as exc:
-                err = f"{type(exc).__name__}: {exc}"
+                err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+
         self._all_ok(err)
         if self.is_rank0():
             self._point(f"{self.run_id}-latest", ckpt_dir)
             self._rotate(keep_step=step)
+        print(f"{_pfx} rotate done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
+
         self._barrier()  # no rank proceeds before the checkpoint is complete
+        print(f"{_pfx} barrier done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
+
         return ckpt_dir
 
     def _rewind(self, step: int) -> None:
@@ -363,7 +392,9 @@ class CheckpointManager:
     @staticmethod
     def _atomic_save(obj: Any, path: str) -> None:
         tmp = path + ".tmp"
-        torch.save(obj, tmp)
+        torch.save(
+            _cpu_tensors(obj), tmp, _use_new_zipfile_serialization=False
+        )
         os.replace(tmp, path)
 
     @staticmethod
