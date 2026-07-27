@@ -77,13 +77,13 @@ def _materialize_shard(source: Path, target: Path, *, copy_shards: bool) -> None
 def _validate_draft_shards(
     output_dir: Path,
     draft_weight_map: dict[str, str],
-) -> tuple[int, torch.dtype]:
+) -> tuple[int, tuple[torch.dtype, ...]]:
     keys_by_shard: dict[str, list[str]] = defaultdict(list)
     for key, shard in draft_weight_map.items():
         keys_by_shard[shard].append(key)
 
     total_size = 0
-    storage_dtype: torch.dtype | None = None
+    storage_dtypes: set[torch.dtype] = set()
     for shard, expected_keys in sorted(keys_by_shard.items()):
         with safe_open(output_dir / shard, framework="pt", device="cpu") as handle:
             actual_keys = set(handle.keys())
@@ -104,29 +104,26 @@ def _validate_draft_shards(
                         f"draft-only floating artifact contains non-floating tensor "
                         f"{key}: {tensor.dtype}"
                     )
-                if storage_dtype is None:
-                    storage_dtype = tensor.dtype
-                elif tensor.dtype != storage_dtype:
-                    raise ValueError(
-                        "draft-only artifact must use one floating dtype; "
-                        f"{key} is {tensor.dtype}, expected {storage_dtype}"
-                    )
+                storage_dtypes.add(tensor.dtype)
                 total_size += tensor.numel() * tensor.element_size()
 
-    if storage_dtype is None:
+    if not storage_dtypes:
         raise ValueError("draft-only artifact contains no tensors")
-    return total_size, storage_dtype
+    return total_size, tuple(sorted(storage_dtypes, key=str))
 
 
 def _write_readme(
     output_dir: Path,
     *,
     base_model: str,
-    storage_dtype: torch.dtype,
+    storage_dtypes: tuple[torch.dtype, ...],
     num_tensors: int,
     num_shards: int,
 ) -> None:
-    dtype_name = str(storage_dtype).removeprefix("torch.")
+    dtype_names = ", ".join(
+        str(storage_dtype).removeprefix("torch.")
+        for storage_dtype in storage_dtypes
+    )
     readme = f"""# DeepSeek-V4 Flash DSpark Draft
 
 This repository contains only the trained DSpark draft parameters (`mtp.*`).
@@ -135,7 +132,7 @@ This repository contains only the trained DSpark draft parameters (`mtp.*`).
 
 - Base model: `{base_model}`
 - Draft tensor prefix: `mtp.`
-- Storage dtype: `{dtype_name}`
+- Storage dtypes: `{dtype_names}`
 - Draft tensors: {num_tensors}
 - Draft shards: {num_shards}
 - Target weights: not included
@@ -233,21 +230,27 @@ def package_deepseek_v4_dspark_draft(
             copy_shards=copy_shards,
         )
 
-    total_size, storage_dtype = _validate_draft_shards(
+    total_size, storage_dtypes = _validate_draft_shards(
         output_path,
         draft_weight_map,
     )
+    storage_dtype_names = [
+        str(storage_dtype).removeprefix("torch.")
+        for storage_dtype in storage_dtypes
+    ]
 
     draft_index = {
         "metadata": {
             "total_size": total_size,
             "format": "pt",
             "artifact_type": "deepseek-v4-dspark-draft",
-            "storage_dtype": str(storage_dtype).removeprefix("torch."),
+            "storage_dtypes": storage_dtype_names,
             "parameter_prefix": DRAFT_PARAMETER_PREFIX,
         },
         "weight_map": dict(sorted(draft_weight_map.items())),
     }
+    if len(storage_dtype_names) == 1:
+        draft_index["metadata"]["storage_dtype"] = storage_dtype_names[0]
     with (output_path / DRAFT_INDEX_FILE).open("w", encoding="utf-8") as handle:
         json.dump(draft_index, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -256,13 +259,15 @@ def package_deepseek_v4_dspark_draft(
         "artifact_type": "deepseek-v4-dspark-draft",
         "base_model": base_model,
         "base_model_revision": base_model_revision,
-        "storage_dtype": str(storage_dtype).removeprefix("torch."),
+        "storage_dtypes": storage_dtype_names,
         "parameter_prefix": DRAFT_PARAMETER_PREFIX,
         "num_tensors": len(draft_weight_map),
         "num_shards": len(shard_names),
         "target_included": False,
         "serving_ready": False,
     }
+    if len(storage_dtype_names) == 1:
+        draft_config["storage_dtype"] = storage_dtype_names[0]
     with (output_path / DRAFT_CONFIG_FILE).open("w", encoding="utf-8") as handle:
         json.dump(draft_config, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -275,7 +280,7 @@ def package_deepseek_v4_dspark_draft(
     _write_readme(
         output_path,
         base_model=base_model,
-        storage_dtype=storage_dtype,
+        storage_dtypes=storage_dtypes,
         num_tensors=len(draft_weight_map),
         num_shards=len(shard_names),
     )
@@ -284,7 +289,7 @@ def package_deepseek_v4_dspark_draft(
     logger.info("Draft-only artifact: %s", output_path)
     logger.info("Draft tensors: %d", len(draft_weight_map))
     logger.info("Draft shards: %d", len(shard_names))
-    logger.info("Storage dtype: %s", storage_dtype)
+    logger.info("Storage dtypes: %s", ", ".join(storage_dtype_names))
     logger.info("Logical tensor bytes: %d", total_size)
     logger.info(
         "Shard storage mode: %s",
