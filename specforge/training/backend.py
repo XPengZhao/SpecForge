@@ -142,27 +142,6 @@ class TrainingBackend(abc.ABC):
     def load_state_dict(self, state: dict) -> None: ...
 
 
-def _empty_device_cache() -> None:
-    """Release cached (non-active) blocks in the device caching allocator.
-
-    The caching allocator keeps freed tensors around for reuse.  After weight
-    loading (FP4→bf16 dequantisation intermediates) and after FSDP flattening
-    (thousands of small weight tensors replaced by a handful of contiguous
-    FlatParameters) the cache can hold many GB of fragmented blocks that no
-    single subsequent allocation can satisfy.  Calling ``empty_cache`` returns
-    those blocks to the device driver so large contiguous allocations such as
-    the FSDP all-gather buffer can succeed.
-    """
-    try:
-        for device_type in ("cuda", "npu"):
-            module = getattr(torch, device_type, None)
-            empty = getattr(module, "empty_cache", None)
-            if callable(empty):
-                empty()
-    except Exception:
-        pass
-
-
 class FSDPTrainingBackend(TrainingBackend):
     """FSDP1 backend for the canonical SpecForge training math: FSDP with
     ``use_orig_params=True`` / bf16 mixed precision over the configured process
@@ -347,11 +326,6 @@ class FSDPTrainingBackend(TrainingBackend):
                         ", ".join(sorted(ac_modules)),
                     )
                 self._wrapper_kind = "fsdp"
-            # Release cached allocator blocks left over from weight loading
-            # (e.g. dequantised FP4→bf16 intermediates) so FSDP wrapping
-            # sees a clean heap and can allocate its FlatParameters without
-            # fragmentation pressure.
-            _empty_device_cache()
             self.module = model
             self._wrapped = True
             self.auto_wrap_block_classes = (
@@ -364,13 +338,6 @@ class FSDPTrainingBackend(TrainingBackend):
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)
-            # The original 2600+ parameter tensors have now been freed by
-            # FSDP (replaced by a handful of contiguous FlatParameters).
-            # Their storage sits fragmented in the device caching allocator.
-            # empty_cache() returns those fragments to the driver so that
-            # the 12 GB all-gather buffer during backward can obtain a
-            # single contiguous allocation.
-            _empty_device_cache()
             self._configure_optimizer_grad_norm()
         return self.module
 
