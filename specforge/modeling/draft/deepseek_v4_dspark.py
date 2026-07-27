@@ -689,10 +689,12 @@ class DeepseekV4DSparkExpertGroup(nn.Module):
         for local_id, expert in enumerate(self.experts):
             expert_id = lo + local_id
             token_slot, route_slot = torch.where(indices == expert_id)
-            if token_slot.numel() > 0:
-                out = expert(flat[token_slot])
-                out = out * weights[token_slot, route_slot].unsqueeze(-1)
-                routed.index_add_(0, token_slot, out.to(routed.dtype))
+            # Empty [0, hidden] inputs are valid for nn.Linear.  Always running
+            # each expert keeps the FSDP autograd/collective order rank-static
+            # instead of depending on local routing decisions.
+            out = expert(flat[token_slot])
+            out = out * weights[token_slot, route_slot].unsqueeze(-1)
+            routed.index_add_(0, token_slot, out.to(routed.dtype))
         return routed
 
 
@@ -732,8 +734,8 @@ class DeepseekV4DSparkMoE(nn.Module):
         indices, weights = self.gate(flat)
         routed = torch.zeros_like(flat)
         # Each ExpertGroup is an FSDP unit — iteration triggers per-group
-        # all-gather.  Groups with no routed tokens touch no parameters
-        # internally, but FSDP gathers the flat-param on entry regardless.
+        # all-gather.  ExpertGroup.forward also runs empty expert calls so
+        # backward collectives do not depend on local routing decisions.
         for group in self.expert_groups:
             routed = group(flat, indices, weights, routed)
         return (routed + self.shared_experts(flat)).view(shape)
