@@ -207,12 +207,23 @@ def post_completion(
     usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
     choices = parsed.get("choices", []) if isinstance(parsed, dict) else []
     choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    spec_decode = parsed.get("spec_decode") if isinstance(parsed, dict) else None
+    spec_decode_metrics = None
+    if isinstance(spec_decode, dict):
+        accepted_per_pos = spec_decode.get("num_accepted_tokens_per_pos", [])
+        spec_decode_metrics = SpecDecodeMetrics(
+            num_drafts=spec_decode["num_drafts"],
+            num_draft_tokens=spec_decode["num_draft_tokens"],
+            num_accepted_tokens=spec_decode["num_accepted_tokens"],
+            accepted_per_pos=dict(enumerate(accepted_per_pos)),
+        )
     return {
         "elapsed_sec": elapsed,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "output_text": choice.get("text"),
         "finish_reason": choice.get("finish_reason"),
+        "spec_decode_metrics": spec_decode_metrics,
     }
 
 
@@ -297,14 +308,14 @@ def subtract_metrics(
     )
 
 
-def log_spec_decode_metrics(metrics: SpecDecodeMetrics) -> None:
-    """Log exact acceptance statistics for the benchmark interval."""
+def serialize_metrics(metrics: SpecDecodeMetrics) -> dict[str, Any]:
+    """Return counters and derived acceptance statistics."""
     acceptance_rate = (
         metrics.num_accepted_tokens / metrics.num_draft_tokens
         if metrics.num_draft_tokens > 0
         else 0.0
     )
-    acceptance_length = (
+    mean_acceptance_length = (
         1.0 + metrics.num_accepted_tokens / metrics.num_drafts
         if metrics.num_drafts > 0
         else 1.0
@@ -315,14 +326,30 @@ def log_spec_decode_metrics(metrics: SpecDecodeMetrics) -> None:
         else 0.0
         for position in sorted(metrics.accepted_per_pos)
     ]
+    return {
+        "num_drafts": metrics.num_drafts,
+        "num_draft_tokens": metrics.num_draft_tokens,
+        "num_accepted_tokens": metrics.num_accepted_tokens,
+        "acceptance_rate": acceptance_rate,
+        "mean_acceptance_length": mean_acceptance_length,
+        "per_position_acceptance": per_position,
+    }
+
+
+def log_spec_decode_metrics(metrics: SpecDecodeMetrics) -> None:
+    """Log exact acceptance statistics for the benchmark interval."""
+    values = serialize_metrics(metrics)
     logger.info("DSpark drafts: %d", metrics.num_drafts)
     logger.info("DSpark drafted tokens: %d", metrics.num_draft_tokens)
     logger.info("DSpark accepted tokens: %d", metrics.num_accepted_tokens)
-    logger.info("DSpark acceptance rate: %.4f", acceptance_rate)
-    logger.info("DSpark mean acceptance length: %.4f", acceptance_length)
+    logger.info("DSpark acceptance rate: %.4f", values["acceptance_rate"])
+    logger.info(
+        "DSpark mean acceptance length: %.4f",
+        values["mean_acceptance_length"],
+    )
     logger.info(
         "DSpark per-position acceptance: %s",
-        ", ".join(f"{rate:.4f}" for rate in per_position),
+        ", ".join(f"{rate:.4f}" for rate in values["per_position_acceptance"]),
     )
 
 
@@ -370,19 +397,27 @@ def drain_completed(
         prompt_tokens = result.get("prompt_tokens")
         if isinstance(prompt_tokens, int):
             stats["prompt_tokens"] += prompt_tokens
+        spec_decode_metrics = result.get("spec_decode_metrics")
+        if isinstance(spec_decode_metrics, SpecDecodeMetrics):
+            stats["spec_decode_requests"] += 1
+        else:
+            spec_decode_metrics = None
+        output_record = {
+            "line_number": line_number,
+            "ok": True,
+            "elapsed_sec": result["elapsed_sec"],
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "input_tail": input_tail,
+            "input_tail_tokens": input_tail_tokens,
+            "output_text": result["output_text"],
+            "finish_reason": result["finish_reason"],
+        }
+        if spec_decode_metrics is not None:
+            output_record["spec_decode"] = serialize_metrics(spec_decode_metrics)
         write_jsonl(
             output_handle,
-            {
-                "line_number": line_number,
-                "ok": True,
-                "elapsed_sec": result["elapsed_sec"],
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "input_tail": input_tail,
-                "input_tail_tokens": input_tail_tokens,
-                "output_text": result["output_text"],
-                "finish_reason": result["finish_reason"],
-            },
+            output_record,
         )
 
         completed = stats["completed"]
