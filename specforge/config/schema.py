@@ -497,6 +497,16 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    dspark_opd_loss_alpha: float = Field(default=0.0, ge=0.0)
+    dspark_opd_forward_weight: float = Field(default=1.0, ge=0.0)
+    dspark_opd_rejected_weight: float = Field(default=1.0, ge=0.0)
+    dspark_opd_rejected_position_decay: float = Field(
+        default=0.8,
+        gt=0.0,
+        le=1.0,
+    )
+    dspark_opd_logprob_min_clamp: float = Field(default=-80.0, le=0.0)
+    dspark_opd_loss_max_clamp: float = Field(default=10.0, gt=0.0)
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

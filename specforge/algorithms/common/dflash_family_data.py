@@ -8,6 +8,13 @@ from specforge.algorithms.common.collation import pad_and_concatenate_features
 
 NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
+DSPARK_OPD_KEYS = (
+    "opd_anchor_positions",
+    "opd_draft_token_ids",
+    "opd_target_logprobs",
+    "opd_accepted_lengths",
+    "opd_candidate_mask",
+)
 
 
 def normalize_offline_sample(raw, max_len: int):
@@ -117,12 +124,31 @@ def normalize_offline_dspark_sample(raw, max_len: int):
             "target_last_hidden_states="
             f"{target_last_hidden_states.shape[1]}"
         )
-    return {
+    normalized = {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
         "hidden_states": hidden_states,
         "target_last_hidden_states": target_last_hidden_states,
     }
+    present_opd_keys = [key for key in DSPARK_OPD_KEYS if key in raw]
+    if present_opd_keys and len(present_opd_keys) != len(DSPARK_OPD_KEYS):
+        missing = sorted(set(DSPARK_OPD_KEYS) - set(present_opd_keys))
+        raise ValueError(f"offline DSpark sample has incomplete OPD features: {missing}")
+    if present_opd_keys:
+        anchors = raw["opd_anchor_positions"]
+        valid = (anchors >= 0) & (anchors < max_len - 1)
+        normalized.update(
+            {
+                "opd_anchor_positions": anchors[valid].unsqueeze(0),
+                "opd_draft_token_ids": raw["opd_draft_token_ids"][valid].unsqueeze(0),
+                "opd_target_logprobs": raw["opd_target_logprobs"][valid].unsqueeze(0),
+                "opd_accepted_lengths": raw["opd_accepted_lengths"][valid].unsqueeze(
+                    0
+                ),
+                "opd_candidate_mask": raw["opd_candidate_mask"][valid].unsqueeze(0),
+            }
+        )
+    return normalized
 
 
 def build_offline_dspark_reader(
@@ -144,6 +170,7 @@ def build_offline_dspark_reader(
             "aux_hidden_state",
             "hidden_state",
         ),
+        optional_feature_keys=DSPARK_OPD_KEYS,
         target_repr="hidden_state",
         ttt_length=ttt_length,
         max_len=max_len,
@@ -171,7 +198,12 @@ def build_collator():
 
 def build_dspark_collator():
     def collate(features):
-        return pad_and_concatenate_features(
+        optional_keys = (
+            DSPARK_OPD_KEYS
+            if features and all(key in features[0] for key in DSPARK_OPD_KEYS)
+            else ()
+        )
+        batch = pad_and_concatenate_features(
             features,
             sequence_axes={
                 "input_ids": 1,
@@ -186,6 +218,31 @@ def build_dspark_collator():
                 "target_last_hidden_states",
             ),
         )
+        if optional_keys:
+            import torch
+
+            max_blocks = max(
+                int(feature["opd_anchor_positions"].shape[1])
+                for feature in features
+            )
+            max_candidates = max(
+                int(feature["opd_draft_token_ids"].shape[2])
+                for feature in features
+            )
+            for key in optional_keys:
+                values = []
+                for feature in features:
+                    value = feature[key]
+                    shape = list(value.shape)
+                    shape[1] = max_blocks
+                    if value.dim() == 3:
+                        shape[2] = max_candidates
+                    padded = value.new_zeros(shape)
+                    slices = tuple(slice(0, size) for size in value.shape)
+                    padded[slices] = value
+                    values.append(padded)
+                batch[key] = torch.cat(values, dim=0)
+        return batch
 
     return collate
 

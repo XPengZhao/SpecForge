@@ -75,6 +75,23 @@ def resume_contract(_config, draft_model, training_model):
         "dspark_confidence_head_alpha": float(
             training_model.dspark_confidence_head_alpha
         ),
+        "dspark_opd_objective_version": "verified_response_forward_kl_rejected_k3_v2",
+        "dspark_opd_loss_alpha": float(training_model.dspark_opd_loss_alpha),
+        "dspark_opd_forward_weight": float(
+            training_model.dspark_opd_forward_weight
+        ),
+        "dspark_opd_rejected_weight": float(
+            training_model.dspark_opd_rejected_weight
+        ),
+        "dspark_opd_rejected_position_decay": float(
+            training_model.dspark_opd_rejected_position_decay
+        ),
+        "dspark_opd_logprob_min_clamp": float(
+            training_model.dspark_opd_logprob_min_clamp
+        ),
+        "dspark_opd_loss_max_clamp": float(
+            training_model.dspark_opd_loss_max_clamp
+        ),
     }
 
 

@@ -67,6 +67,50 @@ and are retained unless `--drop-truncated` is set. Client concurrency should
 not exceed the vLLM server's `--max-num-seqs`; start at two for long prompts
 and increase both values only after checking KV-cache headroom.
 
+### Collect Draft-OPD traces
+
+Draft-OPD collection must use a vLLM server running the current DSpark draft.
+The patched verification path records each proposed block, its accepted prefix,
+and the target log probability of every proposed token. Add
+`--collect-spec-decode-trace` when generating rollouts:
+
+```bash
+uv run --active --no-sync python scripts/generate_target_rollouts.py \
+  --server-url http://127.0.0.1:8000 \
+  --model DeepSeek-V4-Flash-DSpark \
+  --tokenizer-path /path/to/DeepSeek-V4-Flash-DSpark \
+  --data-path /path/to/dspark-preformatted.jsonl \
+  --output-path /path/to/dspark-opd-rollouts.jsonl \
+  --max-length 128000 \
+  --max-tokens 2048 \
+  --temperature 1.0 \
+  --top-p 1.0 \
+  --concurrency 2 \
+  --collect-spec-decode-trace \
+  --trust-remote-code
+```
+
+Use a new output path when enabling trace collection; `--resume` treats an
+existing source line as complete even if it was generated without a trace.
+The vLLM hidden-state dump script copies the trace into each feature file as
+`opd_anchor_positions`, `opd_draft_token_ids`, `opd_target_logprobs`,
+`opd_accepted_lengths`, and `opd_candidate_mask`.
+
+```bash
+python /path/to/vllm/examples/features/speculative_decoding/dspark_dump_hidden_states_server.py \
+  --server-url http://127.0.0.1:8000 \
+  --model DeepSeek-V4-Flash-DSpark \
+  --tokenizer-path /path/to/DeepSeek-V4-Flash-DSpark \
+  --data-path /path/to/dspark-opd-rollouts.jsonl \
+  --output-path /path/to/dspark-opd-hidden-states \
+  --max-length 128000 \
+  --response-context-tokens 128 \
+  --trust-remote-code
+```
+
+Use this server-backed dump path for OPD data; the generic
+`prepare_hidden_states.py` path does not propagate rollout trace metadata.
+
 ### Capture target features
 
 Pass the target-rollout file with `--is-preformatted` and the DeepSeek
@@ -133,6 +177,7 @@ training:
   dspark_ce_loss_alpha: 0.1
   dspark_l1_loss_alpha: 0.9
   dspark_confidence_head_alpha: 1.0
+  dspark_opd_loss_alpha: 0.0
 
 deployment:
   mode: local_colocated
@@ -140,6 +185,26 @@ deployment:
     nnodes: 1
     nproc_per_node: 8
 ```
+
+Set `dspark_opd_loss_alpha` to a positive value only for feature files carrying
+the five `opd_*` tensors. Verified response tokens use a local Bernoulli
+forward KL, while rejected draft suffix tokens use the sampled k3 reverse-KL
+estimator. A rejected speculative step contributes its accepted prefix and
+Target recovery token to the response stream; later response tokens belong to
+subsequent trace anchors and are not counted twice:
+
+```yaml
+training:
+  dspark_opd_loss_alpha: 1.0
+  dspark_opd_forward_weight: 1.0
+  dspark_opd_rejected_weight: 1.0
+  dspark_opd_rejected_position_decay: 0.8
+  dspark_opd_logprob_min_clamp: -80.0
+```
+
+The existing CE, distribution L1, and confidence losses remain independently
+controlled by their existing alpha values. Set those alphas to zero for a pure
+OPD run, or keep them positive for an SFT-plus-OPD run.
 
 Run the 8-GPU smoke training from the repository root:
 

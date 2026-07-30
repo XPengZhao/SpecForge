@@ -192,6 +192,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 cache/
+exports/
 outputs/
 wandb/
 .idea

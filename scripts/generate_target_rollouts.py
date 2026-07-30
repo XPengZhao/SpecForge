@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--drop-truncated", action="store_true")
+    parser.add_argument("--collect-spec-decode-trace", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     return parser.parse_args()
 
@@ -148,6 +149,7 @@ def post_completion(
     top_p: float,
     end_marker: str,
     timeout: float,
+    collect_spec_decode_trace: bool,
 ) -> dict[str, Any]:
     """Request one target rollout from the OpenAI-compatible completion API."""
     payload = {
@@ -158,6 +160,8 @@ def post_completion(
         "top_p": top_p,
         "stop": [end_marker],
     }
+    if collect_spec_decode_trace:
+        payload["vllm_xargs"] = {"collect_spec_decode_trace": 1}
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
@@ -185,11 +189,35 @@ def post_completion(
     )
     if not isinstance(output_text, str) or (not output_text and not stopped_after_token):
         raise RuntimeError(f"completion response has empty text: {parsed}")
+    spec_decode = parsed.get("spec_decode")
+    if collect_spec_decode_trace:
+        if not isinstance(spec_decode, dict):
+            if isinstance(completion_tokens, int) and completion_tokens <= 1:
+                spec_decode = {"trace": [], "verified_token_ids": []}
+            else:
+                raise RuntimeError(
+                    f"completion response has no spec_decode trace: {parsed}"
+                )
+        elif not isinstance(spec_decode.get("trace"), list):
+            raise RuntimeError(
+                f"completion response has no spec_decode trace: {parsed}"
+            )
+        for entry in spec_decode["trace"]:
+            draft_token_ids = entry.get("draft_token_ids")
+            target_logprobs = entry.get("target_logprobs")
+            if (
+                not isinstance(draft_token_ids, list)
+                or not isinstance(target_logprobs, list)
+                or len(draft_token_ids) != len(target_logprobs)
+                or any(token_id < 0 for token_id in draft_token_ids)
+            ):
+                raise RuntimeError(f"completion response has invalid spec_decode trace: {entry}")
     return {
         "output_text": output_text,
         "finish_reason": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": completion_tokens,
+        "spec_decode": spec_decode,
     }
 
 
@@ -213,6 +241,7 @@ def request_with_retries(
                 top_p=args.top_p,
                 end_marker=args.end_marker,
                 timeout=args.request_timeout,
+                collect_spec_decode_trace=args.collect_spec_decode_trace,
             )
         except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
             if attempt == args.max_retries:
@@ -263,16 +292,19 @@ def run(args: argparse.Namespace) -> None:
         rollout_text = job.prompt + result["output_text"]
         if finish_reason != "length" and not rollout_text.endswith(args.end_marker):
             rollout_text += args.end_marker
+        target_rollout = {
+            "finish_reason": finish_reason,
+            "prompt_tokens": result["prompt_tokens"],
+            "completion_tokens": result["completion_tokens"],
+        }
+        if result["spec_decode"] is not None:
+            target_rollout["spec_decode"] = result["spec_decode"]
         output_handle.write(
             json.dumps(
                 {
                     "text": rollout_text,
                     "source_line_number": job.source_line,
-                    "target_rollout": {
-                        "finish_reason": finish_reason,
-                        "prompt_tokens": result["prompt_tokens"],
-                        "completion_tokens": result["completion_tokens"],
-                    },
+                    "target_rollout": target_rollout,
                 },
                 ensure_ascii=False,
             )

@@ -34,7 +34,9 @@ _OFFLINE_EAGLE3_KEYS = ("input_ids", "loss_mask", "hidden_state", "aux_hidden_st
 
 
 def _inspect_feature_file(
-    path: str, feature_keys: Tuple[str, ...]
+    path: str,
+    feature_keys: Tuple[str, ...],
+    optional_feature_keys: Tuple[str, ...] = (),
 ) -> Tuple[Dict[str, FeatureSpec], int, int]:
     raw = load_feature_file(path)
     missing = [key for key in feature_keys if key not in raw]
@@ -43,7 +45,10 @@ def _inspect_feature_file(
 
     specs: Dict[str, FeatureSpec] = {}
     estimated_bytes = 0
-    for key in feature_keys:
+    selected_keys = feature_keys + tuple(
+        key for key in optional_feature_keys if key in raw
+    )
+    for key in selected_keys:
         value = raw[key]
         if not hasattr(value, "shape") or not hasattr(value, "dtype"):
             raise TypeError(f"{path} feature {key!r} is not a tensor: {type(value)!r}")
@@ -80,6 +85,7 @@ class OfflineManifestReader:
         target_model_version: str = "unknown",
         tokenizer_version: str = "unknown",
         feature_keys: tuple = _OFFLINE_EAGLE3_KEYS,
+        optional_feature_keys: tuple = (),
         ttt_length: int = 7,
         max_len: int = 2048,
         target_repr: Optional[str] = "hidden_state",
@@ -91,6 +97,7 @@ class OfflineManifestReader:
         self.target_model_version = target_model_version
         self.tokenizer_version = tokenizer_version
         self.feature_keys = tuple(feature_keys)
+        self.optional_feature_keys = tuple(optional_feature_keys)
         self.ttt_length = ttt_length
         self.max_len = max_len
         self.target_repr = target_repr
@@ -103,14 +110,17 @@ class OfflineManifestReader:
         estimated_bytes = 0
         if self.validate_files:
             specs, num_tokens, estimated_bytes = _inspect_feature_file(
-                path, self.feature_keys
+                path,
+                self.feature_keys,
+                self.optional_feature_keys,
             )
+        selected_keys = tuple(specs) if specs else self.feature_keys
         return SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
             source_task_id=None,
             feature_store_uri=f"file://{path}",
-            feature_keys={k: k for k in self.feature_keys},
+            feature_keys={k: k for k in selected_keys},
             feature_specs=specs,
             strategy=self.strategy,
             schema_version=SCHEMA_VERSION,
