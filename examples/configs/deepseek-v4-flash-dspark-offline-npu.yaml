@@ -26,8 +26,12 @@ training:
   fsdp_sharding: FULL_SHARD
   batch_size: 1
   num_anchors: 64
+  # DSpark loss mode: "original" keeps CE + L1 + confidence; "kl" replaces
+  # CE/L1 with KL(target || draft). For pure KL, set confidence alpha to 0.
+  dspark_loss_mode: original
   dspark_ce_loss_alpha: 0.1
   dspark_l1_loss_alpha: 0.9
+  dspark_kl_loss_alpha: 1.0
   dspark_confidence_head_alpha: 1.0
   # 是否在 backward 中重算 per-position DSpark loss（CE + L1 + confidence）
   # 以降低 loss 步的显存峰值。true 约省 2.6 GiB（512x5x129280）；

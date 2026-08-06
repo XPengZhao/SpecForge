@@ -60,7 +60,7 @@ def resume_contract(_config, draft_model, training_model):
         if draft_layers is not None
         else int(draft_model.config.num_hidden_layers)
     )
-    return {
+    contract = {
         "dspark_draft_num_hidden_layers": num_draft_layers,
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -76,6 +76,10 @@ def resume_contract(_config, draft_model, training_model):
             training_model.dspark_confidence_head_alpha
         ),
     }
+    if str(training_model.dspark_loss_mode) == "kl":
+        contract["dspark_loss_mode"] = "kl"
+        contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    return contract
 
 
 def build_draft(config, draft_config):
