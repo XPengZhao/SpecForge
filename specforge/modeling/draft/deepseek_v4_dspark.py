@@ -303,6 +303,7 @@ class DeepseekV4DSparkAttention(nn.Module):
                 kv,
                 kv,
                 block_mask=attention_mask,
+                kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
                 scale=self.scaling,
                 enable_gqa=True,
                 return_aux=_LSE_AUX_REQUEST,
