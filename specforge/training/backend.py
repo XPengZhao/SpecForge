@@ -194,14 +194,14 @@ class FSDPTrainingBackend(TrainingBackend):
     _AC_MODULES = {
         "stage": frozenset(
             {
-                "DeepseekV3DSparkStage",
                 "DeepseekV4DSparkStage",
+                "Glm52DSparkStage",
             }
         ),
         "attention": frozenset(
             {
-                "DeepseekV3DSparkAttention",
                 "DeepseekV4DSparkAttention",
+                "Glm52DSparkAttention",
             }
         ),
     }

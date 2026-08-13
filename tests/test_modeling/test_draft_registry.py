@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from transformers import LlamaConfig, Qwen3Config
 
@@ -16,9 +17,9 @@ from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlashDraftModel,
-    DeepseekV3DSparkDraftModel,
     DominoDraftModel,
     DSparkDraftModel,
+    Glm52DSparkDraftModel,
     LlamaForCausalLMEagle3,
     available_drafts,
     register_draft,
@@ -38,6 +39,8 @@ TINY_EAGLE3 = {
     "draft_vocab_size": 64,
     "tie_word_embeddings": False,
 }
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 TINY_DFLASH = {
     "architectures": ["DFlashDraftModel"],
@@ -94,14 +97,14 @@ class DraftRegistryTest(unittest.TestCase):
         self.assertIn("DFlashDraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
-        self.assertIn("DeepseekV3DSparkDraftModel", available_drafts())
+        self.assertIn("Glm52DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)
         self.assertIs(resolve_draft("DSparkDraftModel"), DSparkDraftModel)
         self.assertIs(
-            resolve_draft("DeepseekV3DSparkDraftModel"),
-            DeepseekV3DSparkDraftModel,
+            resolve_draft("Glm52DSparkDraftModel"),
+            Glm52DSparkDraftModel,
         )
 
     def test_unknown_architecture_raises_with_available_list(self):
@@ -135,6 +138,17 @@ class DraftRegistryTest(unittest.TestCase):
 
 
 class AutoLoaderRegistryTest(unittest.TestCase):
+    def test_glm52_recipe_config_resolves_registered_config_class(self):
+        config = AutoDraftModelConfig.from_file(
+            str(REPO_ROOT / "configs" / "glm-5.2-dspark.json")
+        )
+        self.assertEqual(
+            config.architectures,
+            ["Glm52DSparkDraftModel"],
+        )
+        self.assertEqual(config.dflash_config["target_layer_ids"], [75, 76, 77])
+        self.assertEqual(config.sliding_window, 128)
+
     def test_from_file_resolves_eagle3_via_registry(self):
         path = _write(TINY_EAGLE3)
         self.addCleanup(os.unlink, path)

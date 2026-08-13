@@ -92,6 +92,18 @@ class ModelLoadingSchemaTest(unittest.TestCase):
         self.assertEqual(dflash.model.draft_num_hidden_layers, 3)
         self.assertEqual(dflash.model.draft_block_size, 8)
 
+        dspark = Config.model_validate(
+            _payload(
+                "dspark",
+                draft_model_config="/draft.json",
+                draft_num_hidden_layers=3,
+                draft_block_size=5,
+            )
+        )
+        resolve_run(dspark)
+        self.assertEqual(dspark.model.draft_num_hidden_layers, 3)
+        self.assertEqual(dspark.model.draft_block_size, 5)
+
         with self.assertRaisesRegex(
             ValueError,
             "requires model.draft_num_hidden_layers=1",

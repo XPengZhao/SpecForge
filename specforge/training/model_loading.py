@@ -256,17 +256,21 @@ def _apply_draft_overrides(
     draft_config: "PretrainedConfig",
     provider: "DraftConfigProvider",
 ) -> None:
+    handled = set()
+    if provider.apply_overrides is not None:
+        handled = set(provider.apply_overrides(cfg, draft_config) or ())
     num_layers = cfg.model.draft_num_hidden_layers
-    if num_layers is not None:
+    if num_layers is not None and "num_hidden_layers" not in handled:
         draft_config.num_hidden_layers = num_layers
-    if cfg.model.draft_block_size is not None:
+    if (
+        cfg.model.draft_block_size is not None
+        and "block_size" not in handled
+    ):
         draft_config.block_size = cfg.model.draft_block_size
     if cfg.model.moe_train_group_size is not None:
         draft_config.moe_train_group_size = cfg.model.moe_train_group_size
     if cfg.model.attention_chunk_size is not None:
         draft_config.attention_chunk_size = cfg.model.attention_chunk_size
-    if provider.apply_overrides is not None:
-        provider.apply_overrides(cfg, draft_config)
 
 
 def resolve_draft_config(

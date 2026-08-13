@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -14,6 +15,7 @@ import torch
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.model_loading import (
+    _apply_draft_overrides,
     load_draft_config_source,
     resolve_draft_config,
     warm_start_draft_model,
@@ -180,6 +182,51 @@ assert not torch.cuda.is_initialized()
         self.assertEqual(resolved.num_hidden_layers, 2)
         self.assertEqual(resolved.block_size, 8)
         self.assertEqual(len(resolved.dflash_config["target_layer_ids"]), 2)
+
+    def test_dspark_overrides_preserve_target_depth_and_update_method_config(
+        self,
+    ):
+        cfg = _run_config(
+            "dspark",
+            draft_num_hidden_layers=3,
+            draft_block_size=5,
+        )
+        draft = SimpleNamespace(
+            architectures=["Glm52DSparkDraftModel"],
+            num_hidden_layers=78,
+            dflash_config={"target_layer_ids": [75, 76, 77]},
+        )
+
+        _apply_draft_overrides(
+            cfg,
+            draft,
+            _draft_config_provider("dspark"),
+        )
+
+        self.assertEqual(draft.num_hidden_layers, 78)
+        self.assertEqual(draft.dflash_config["num_layers"], 3)
+        self.assertEqual(draft.dflash_config["block_size"], 5)
+
+    def test_generic_dspark_overrides_remain_top_level(self):
+        cfg = _run_config(
+            "dspark",
+            draft_num_hidden_layers=2,
+            draft_block_size=4,
+        )
+        draft = SimpleNamespace(
+            architectures=["DSparkDraftModel"],
+            num_hidden_layers=1,
+            block_size=8,
+        )
+
+        _apply_draft_overrides(
+            cfg,
+            draft,
+            _draft_config_provider("dspark"),
+        )
+
+        self.assertEqual(draft.num_hidden_layers, 2)
+        self.assertEqual(draft.block_size, 4)
 
     def test_local_json_and_directory_are_equivalent_sources(self):
         with tempfile.TemporaryDirectory() as directory:

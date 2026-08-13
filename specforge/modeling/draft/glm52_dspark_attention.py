@@ -12,28 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-V3 MLA attention for a sliding-window DSpark draft block.
-
-The surrounding DFlash-family wrapper owns the attention topology: it builds a
-mask in which each draft block sees only its target-context sliding window and
-its own non-causal draft tokens.  This module owns the DeepSeek-V3 projection
-layout and applies that mask through Flex Attention or a dense fallback.
-"""
+"""GLM-5.2 MLA attention for fixed-window DSpark draft blocks."""
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
-    DeepseekV3Config,
+from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
+    GlmMoeDsaConfig,
 )
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-    DeepseekV3RMSNorm,
-    DeepseekV3RotaryEmbedding,
-    apply_rotary_pos_emb,
-    apply_rotary_pos_emb_interleave,
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+    GlmMoeDsaRMSNorm,
+    GlmMoeDsaRotaryEmbedding,
 )
 
 from .flex_attention import compile_friendly_flex_attention
@@ -44,43 +34,39 @@ except ImportError:
     BlockMask = None
 
 
-def _yarn_attention_scale(config: DeepseekV3Config) -> float:
-    """Match the YaRN attention scaling used by HF DeepSeek-V3."""
-    scaling = float(config.qk_head_dim) ** -0.5
-    rope_parameters = config.rope_parameters
-    if rope_parameters.get("rope_type", "default") == "default":
-        return scaling
-
-    mscale_all_dim = rope_parameters.get("mscale_all_dim", 0)
-    factor = rope_parameters["factor"]
-    if mscale_all_dim and factor > 1:
-        mscale = 0.1 * float(mscale_all_dim) * math.log(factor) + 1.0
-        scaling *= mscale * mscale
-    return scaling
+def _method_config(config: GlmMoeDsaConfig) -> dict:
+    value = getattr(config, "dflash_config", None)
+    return dict(value) if value else {}
 
 
-class DeepseekV3DSparkAttention(nn.Module):
-    """DeepSeek-V3 MLA over target context and non-causal DSpark draft blocks.
+def _rotate_interleaved(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Rotate adjacent RoPE pairs in GPT-J/interleaved order."""
+    even = hidden_states[..., ::2]
+    odd = hidden_states[..., 1::2]
+    return torch.stack((-odd, even), dim=-1).flatten(-2)
 
-    Parameter names intentionally follow ``DeepseekV3Attention``:
 
-    * ``q_proj`` or ``q_a_proj`` / ``q_a_layernorm`` / ``q_b_proj``
-    * ``kv_a_proj_with_mqa`` / ``kv_a_layernorm`` / ``kv_b_proj``
-    * ``o_proj``
+def apply_interleaved_rope(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply GLM-5.2 interleaved RoPE to a ``(B, H, S, D)`` tensor."""
+    half_dim = cos.shape[-1] // 2
+    cos = cos[..., :half_dim].repeat_interleave(2, dim=-1).unsqueeze(1)
+    sin = sin[..., :half_dim].repeat_interleave(2, dim=-1).unsqueeze(1)
+    return hidden_states * cos + _rotate_interleaved(hidden_states) * sin
 
-    Unlike DeepSeek-V4 attention, V3 has separate non-RoPE query/key dimensions
-    and value dimensions.  It therefore expands compressed KV to per-head K/V
-    before attention and does not use V4's attention sink, shared K=V tensor,
-    inverse output rotation, or grouped output projection.
-    """
+
+class Glm52DSparkAttention(nn.Module):
+    """GLM-5.2 MLA over an SWA context and independent DSpark blocks."""
 
     def __init__(
         self,
-        config: DeepseekV3Config,
-        rotary_emb: DeepseekV3RotaryEmbedding,
+        config: GlmMoeDsaConfig,
+        rotary_emb: GlmMoeDsaRotaryEmbedding,
     ) -> None:
         super().__init__()
-        self.config = config
         self.rotary_emb = rotary_emb
         self.num_heads = int(config.num_attention_heads)
         self.q_lora_rank = config.q_lora_rank
@@ -89,7 +75,8 @@ class DeepseekV3DSparkAttention(nn.Module):
         self.v_head_dim = int(config.v_head_dim)
         self.qk_nope_head_dim = int(config.qk_nope_head_dim)
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.scaling = _yarn_attention_scale(config)
+        self.scaling = self.qk_head_dim**-0.5
+        self.block_size = int(_method_config(config).get("block_size", 0))
         self.attention_chunk_size = int(
             getattr(config, "attention_chunk_size", 256)
         )
@@ -113,7 +100,7 @@ class DeepseekV3DSparkAttention(nn.Module):
             else None
         )
         self.q_a_layernorm = (
-            DeepseekV3RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            GlmMoeDsaRMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             if self.q_lora_rank is not None
             else None
         )
@@ -126,13 +113,12 @@ class DeepseekV3DSparkAttention(nn.Module):
             if self.q_lora_rank is not None
             else None
         )
-
         self.kv_a_proj_with_mqa = nn.Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = DeepseekV3RMSNorm(
+        self.kv_a_layernorm = GlmMoeDsaRMSNorm(
             self.kv_lora_rank,
             eps=config.rms_norm_eps,
         )
@@ -165,16 +151,16 @@ class DeepseekV3DSparkAttention(nn.Module):
     def _project_kv(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         batch_size, kv_length, _ = hidden_states.shape
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        kv_pass, key_rope = torch.split(
+        kv_latent, key_rope = torch.split(
             compressed_kv,
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_pass = self.kv_a_layernorm(kv_pass)
-        expanded = self.kv_b_proj(kv_pass).view(
+        kv_latent = self.kv_a_layernorm(kv_latent)
+        expanded = self.kv_b_proj(kv_latent).view(
             batch_size,
             kv_length,
             self.num_heads,
@@ -204,24 +190,36 @@ class DeepseekV3DSparkAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         query_cos, query_sin = self.rotary_emb(query_rope, query_positions)
         key_cos, key_sin = self.rotary_emb(key_rope, kv_positions)
-        rope_fn = (
-            apply_rotary_pos_emb_interleave
-            if self.config.rope_interleave
-            else apply_rotary_pos_emb
-        )
-        query_rope, _ = rope_fn(
-            query_rope,
+        query_rope = apply_interleaved_rope(
             query_rope,
             query_cos,
             query_sin,
         )
-        _, key_rope = rope_fn(
-            key_rope,
-            key_rope,
-            key_cos,
-            key_sin,
-        )
+        key_rope = apply_interleaved_rope(key_rope, key_cos, key_sin)
         return query_rope, key_rope
+
+    def _chunked_dense_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = []
+        key_t = key.float().transpose(-1, -2)
+        for start in range(0, query.shape[2], self.attention_chunk_size):
+            stop = start + self.attention_chunk_size
+            scores = torch.matmul(query[:, :, start:stop].float(), key_t)
+            scores = scores * self.scaling
+            mask = attention_mask[..., start:stop, :]
+            if mask.dtype == torch.bool:
+                scores = scores.masked_fill(~mask, float("-inf"))
+            else:
+                scores = scores + mask.float()
+            probabilities = torch.softmax(scores, dim=-1)
+            probabilities = torch.nan_to_num(probabilities, nan=0.0)
+            outputs.append(torch.matmul(probabilities, value.float()))
+        return torch.cat(outputs, dim=2).to(query.dtype)
 
     def _dense_attention(
         self,
@@ -230,27 +228,125 @@ class DeepseekV3DSparkAttention(nn.Module):
         value: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Chunked eager attention for dense DSpark boolean/additive masks."""
-        outputs = []
-        key_t = key.transpose(-1, -2)
-        mask_is_bool = attention_mask.dtype == torch.bool
+        """Compute SWA context and block-diagonal draft attention exactly."""
+        if attention_mask.dtype != torch.bool:
+            return self._chunked_dense_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+            )
 
-        for start in range(0, query.shape[2], self.attention_chunk_size):
+        batch_size, num_heads, query_length, key_dim = query.shape
+        context_length = key.shape[2] - query_length
+        block_size = self.block_size
+        if block_size <= 0 or query_length % block_size:
+            raise ValueError(
+                "GLM-5.2 DSpark query length must be divisible by block_size: "
+                f"query_length={query_length}, block_size={block_size}"
+            )
+        num_blocks = query_length // block_size
+        mask = attention_mask.bool()
+        key = key.float()
+        value = value.float()
+
+        context_key = key[:, :, :context_length]
+        context_value = value[:, :, :context_length]
+        context_key_t = context_key.transpose(-1, -2)
+        context_outputs = []
+        context_lse = []
+        for start in range(0, query_length, self.attention_chunk_size):
             stop = start + self.attention_chunk_size
-            query_chunk = query[:, :, start:stop].float()
-            scores = torch.matmul(query_chunk, key_t.float()) * self.scaling
-            mask = attention_mask[..., start:stop, :]
-            if mask_is_bool:
-                scores = scores.masked_fill(~mask, float("-inf"))
-            else:
-                scores = scores + mask.float()
-
+            scores = torch.matmul(
+                query[:, :, start:stop].float(),
+                context_key_t,
+            )
+            scores = scores * self.scaling
+            context_mask = mask[:, :, start:stop, :context_length]
+            scores = scores.masked_fill(~context_mask, float("-inf"))
             probabilities = torch.softmax(scores, dim=-1)
-            # Invalid/padded DSpark blocks can have fully masked rows.
             probabilities = torch.nan_to_num(probabilities, nan=0.0)
-            outputs.append(torch.matmul(probabilities, value.float()))
+            context_outputs.append(torch.matmul(probabilities, context_value))
+            context_lse.append(torch.logsumexp(scores, dim=-1))
+        context_output = torch.cat(context_outputs, dim=2)
+        context_lse = torch.cat(context_lse, dim=2)
 
-        return torch.cat(outputs, dim=2).to(query.dtype)
+        draft_mask = mask[:, :, :, context_length:]
+        diagonal_mask = draft_mask.reshape(
+            batch_size,
+            1,
+            num_blocks,
+            block_size,
+            num_blocks,
+            block_size,
+        ).diagonal(dim1=2, dim2=4)
+        diagonal_mask = diagonal_mask.permute(0, 1, 4, 2, 3).contiguous()
+        query_blocks = query.reshape(
+            batch_size,
+            num_heads,
+            num_blocks,
+            block_size,
+            key_dim,
+        ).float()
+        draft_key = key[:, :, context_length:].reshape(
+            batch_size,
+            num_heads,
+            num_blocks,
+            block_size,
+            key_dim,
+        )
+        draft_value = value[:, :, context_length:].reshape(
+            batch_size,
+            num_heads,
+            num_blocks,
+            block_size,
+            self.v_head_dim,
+        )
+        draft_scores = torch.matmul(
+            query_blocks,
+            draft_key.transpose(-1, -2),
+        )
+        draft_scores = draft_scores * self.scaling
+        draft_scores = draft_scores.masked_fill(
+            ~diagonal_mask,
+            float("-inf"),
+        )
+        draft_probabilities = torch.softmax(draft_scores, dim=-1)
+        draft_probabilities = torch.nan_to_num(
+            draft_probabilities,
+            nan=0.0,
+        )
+        draft_output = torch.matmul(draft_probabilities, draft_value)
+        draft_lse = torch.logsumexp(draft_scores, dim=-1)
+
+        context_output = context_output.reshape(
+            batch_size,
+            num_heads,
+            num_blocks,
+            block_size,
+            self.v_head_dim,
+        )
+        context_lse = context_lse.reshape(
+            batch_size,
+            num_heads,
+            num_blocks,
+            block_size,
+        )
+        total_lse = torch.logaddexp(context_lse, draft_lse)
+        context_weight = torch.exp(context_lse - total_lse)
+        draft_weight = torch.exp(draft_lse - total_lse)
+        context_weight = torch.nan_to_num(context_weight, nan=0.0)
+        draft_weight = torch.nan_to_num(draft_weight, nan=0.0)
+        output = (
+            context_output * context_weight.unsqueeze(-1)
+            + draft_output * draft_weight.unsqueeze(-1)
+        )
+        return output.reshape(
+            batch_size,
+            num_heads,
+            query_length,
+            self.v_head_dim,
+        ).to(query.dtype)
 
     def _attention(
         self,
@@ -270,8 +366,8 @@ class DeepseekV3DSparkAttention(nn.Module):
         if isinstance(attention_mask, torch.Tensor):
             return self._dense_attention(query, key, value, attention_mask)
         raise ValueError(
-            "DeepSeek-V3 DSpark requires a Flex Attention BlockMask or a "
-            f"dense tensor mask; got {type(attention_mask).__name__}"
+            "GLM-5.2 DSpark requires a Flex Attention BlockMask or a dense "
+            f"tensor mask; got {type(attention_mask).__name__}"
         )
 
     def forward(
@@ -281,12 +377,7 @@ class DeepseekV3DSparkAttention(nn.Module):
         position_ids: torch.Tensor,
         attention_mask,
     ) -> torch.Tensor:
-        """Run MLA for draft queries against context plus draft K/V.
-
-        ``position_ids`` contains context positions followed by the absolute
-        positions of every parallel draft block, matching the layout used by
-        ``create_dflash_block_mask`` and ``create_dflash_sdpa_mask``.
-        """
+        """Run GLM MLA for draft queries against context plus draft K/V."""
         batch_size, query_length, _ = hidden_states.shape
         context_length = target_hidden.shape[1]
         kv_hidden = torch.cat((target_hidden, hidden_states), dim=1)
@@ -298,7 +389,6 @@ class DeepseekV3DSparkAttention(nn.Module):
             dim=-1,
         )
         (key_nope, key_rope), value = self._project_kv(kv_hidden)
-
         query_rope, key_rope = self._apply_rope(
             query_rope,
             key_rope,
@@ -320,4 +410,4 @@ class DeepseekV3DSparkAttention(nn.Module):
         return self.o_proj(output)
 
 
-__all__ = ["DeepseekV3DSparkAttention"]
+__all__ = ["Glm52DSparkAttention", "apply_interleaved_rope"]

@@ -33,20 +33,20 @@ from specforge.algorithms.contracts import (
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
-DEEPSEEK_V3_DRAFT_ARCHITECTURE = "DeepseekV3DSparkDraftModel"
 DEEPSEEK_V4_DRAFT_ARCHITECTURE = "DeepseekV4DSparkDraftModel"
+GLM52_DRAFT_ARCHITECTURE = "Glm52DSparkDraftModel"
 
 
 class DSparkDraftConfigProvider(DraftConfigProvider):
-    """DSpark accepts generic, DeepSeek-V3, and DeepSeek-V4 draft models."""
+    """DSpark accepts generic, DeepSeek-V4, and GLM-5.2 draft models."""
 
     @property
     def compatible_architectures(self) -> frozenset[str]:
         return frozenset(
             {
                 DRAFT_ARCHITECTURE,
-                DEEPSEEK_V3_DRAFT_ARCHITECTURE,
                 DEEPSEEK_V4_DRAFT_ARCHITECTURE,
+                GLM52_DRAFT_ARCHITECTURE,
             }
         )
 
@@ -74,6 +74,13 @@ def resume_contract(_config, draft_model, training_model):
         ),
         "dspark_block_size": int(training_model.block_size),
         "dspark_mask_token_id": int(training_model.mask_token_id),
+        "dspark_context_window": getattr(draft_model, "context_window", None),
+        "dspark_mlp_type": str(
+            (getattr(draft_model.config, "dflash_config", None) or {}).get(
+                "mlp_type",
+                "unspecified",
+            )
+        ),
         "dspark_attention_backend": str(training_model.attention_backend),
         "dspark_num_anchors": int(training_model.num_anchors),
         "dspark_loss_decay_gamma": training_model.loss_decay_gamma,
@@ -93,6 +100,24 @@ def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
     return build_registered_draft(config, draft_config)
+
+
+def apply_draft_overrides(config, draft_config):
+    architectures = set(getattr(draft_config, "architectures", None) or ())
+    nested_architectures = {
+        DEEPSEEK_V4_DRAFT_ARCHITECTURE,
+        GLM52_DRAFT_ARCHITECTURE,
+    }
+    if not architectures.intersection(nested_architectures):
+        return None
+
+    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
+    if config.model.draft_num_hidden_layers is not None:
+        method_config["num_layers"] = config.model.draft_num_hidden_layers
+    if config.model.draft_block_size is not None:
+        method_config["block_size"] = config.model.draft_block_size
+    draft_config.dflash_config = method_config
+    return {"num_hidden_layers", "block_size"}
 
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
@@ -137,10 +162,11 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures={
                 DRAFT_ARCHITECTURE,
-                DEEPSEEK_V3_DRAFT_ARCHITECTURE,
                 DEEPSEEK_V4_DRAFT_ARCHITECTURE,
+                GLM52_DRAFT_ARCHITECTURE,
             },
             default_architecture=DRAFT_ARCHITECTURE,
+            supported_overrides={"num_hidden_layers", "block_size"},
         ),
         feature_contracts=(
             FeatureContract(
@@ -188,6 +214,7 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DSparkDraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 expected_auto_map_model="dspark.DSparkDraftModel",
+                apply_overrides=apply_draft_overrides,
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

@@ -32,9 +32,9 @@ class BuiltinProviderContractTest(unittest.TestCase):
         self.assertEqual(BUILTINS, self.registry.names)
         self.assertIsNot(builtin_algorithm_registry(), self.registry)
 
-    def test_dspark_accepts_deepseek_v3_draft(self):
+    def test_dspark_accepts_glm52_draft(self):
         registration = self.registry.resolve("dspark")
-        architecture = "DeepseekV3DSparkDraftModel"
+        architecture = "Glm52DSparkDraftModel"
         self.assertIn(
             architecture,
             registration.spec.draft.compatible_architectures,
@@ -144,11 +144,35 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(vocab_size, defaults.draft_vocab_size)
                 self.assertEqual(has_override, policy.apply_overrides is not None)
 
-        for name in ("domino", "dspark"):
+        for name in ("domino",):
             with self.subTest(algorithm=name):
                 policy = self.registry.resolve(name).providers.model.draft_config
                 self.assertIsNone(policy.target_defaults)
                 self.assertIsNone(policy.apply_overrides)
+        dspark = self.registry.resolve("dspark").providers.model.draft_config
+        self.assertIsNone(dspark.target_defaults)
+        self.assertIsNotNone(dspark.apply_overrides)
+
+    def test_dspark_overrides_write_nested_method_config(self):
+        provider = self.registry.resolve("dspark").providers.model.draft_config
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                draft_num_hidden_layers=3,
+                draft_block_size=5,
+            )
+        )
+        draft = SimpleNamespace(
+            architectures=["Glm52DSparkDraftModel"],
+            num_hidden_layers=78,
+            dflash_config={"target_layer_ids": [75, 76, 77]},
+        )
+
+        handled = provider.apply_overrides(config, draft)
+
+        self.assertEqual(draft.num_hidden_layers, 78)
+        self.assertEqual(draft.dflash_config["num_layers"], 3)
+        self.assertEqual(draft.dflash_config["block_size"], 5)
+        self.assertEqual(handled, {"num_hidden_layers", "block_size"})
 
     def test_vlm_is_not_registered_as_a_builtin(self):
         for registration in self.registry:
@@ -233,6 +257,8 @@ class BuiltinProviderContractTest(unittest.TestCase):
             },
             "dspark": {
                 "dspark_block_size",
+                "dspark_context_window",
+                "dspark_mlp_type",
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
