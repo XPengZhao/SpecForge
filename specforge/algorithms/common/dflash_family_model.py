@@ -849,6 +849,24 @@ class OnlineDSparkModel(OnlineDFlashModel):
             indices,
             torch.full_like(indices, seq_len + 1),
         )
+        if not self.training:
+            sorted_valid = masked_indices.sort(dim=1).values
+            slots = torch.arange(max_n, device=device).unsqueeze(0).expand(bsz, -1)
+            kept_counts = valid_counts.clamp(max=max_n)
+            source_indices = torch.round(
+                slots.float()
+                * (valid_counts.clamp_min(1).unsqueeze(1) - 1).float()
+                / (kept_counts.clamp_min(2).unsqueeze(1) - 1).float()
+            ).long()
+            source_indices = torch.minimum(
+                source_indices,
+                valid_counts.clamp_min(1).unsqueeze(1) - 1,
+            ).clamp(max=max(num_candidates - 1, 0))
+            anchors = torch.gather(sorted_valid, 1, source_indices)
+            keep_mask = slots < kept_counts.unsqueeze(1)
+            anchors = torch.where(keep_mask, anchors, torch.zeros_like(anchors))
+            return anchors, keep_mask
+
         random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(valid, random_vals, torch.full_like(random_vals, 2.0))
         _, sorted_idx = random_vals.sort(dim=1)
@@ -959,15 +977,49 @@ class OnlineDSparkModel(OnlineDFlashModel):
         valid_blocks &= anchor_positions >= 0
         valid_blocks &= anchor_positions < input_ids.size(1) - 1
         width = self.num_anchors
-        scores = torch.rand(valid_blocks.shape, device=input_ids.device)
-        scores = torch.where(valid_blocks, scores, torch.full_like(scores, 2.0))
-        selected = scores.argsort(dim=1)
-        if num_blocks < width:
-            selected = F.pad(selected, (0, width - num_blocks))
-        selected = selected[:, :width]
-        block_keep_mask = torch.gather(valid_blocks, 1, selected)
-        if num_blocks < width:
-            block_keep_mask[:, num_blocks:] = False
+        if self.training:
+            scores = torch.rand(valid_blocks.shape, device=input_ids.device)
+            scores = torch.where(
+                valid_blocks, scores, torch.full_like(scores, 2.0)
+            )
+            selected = scores.argsort(dim=1)
+            if num_blocks < width:
+                selected = F.pad(selected, (0, width - num_blocks))
+            selected = selected[:, :width]
+            block_keep_mask = torch.gather(valid_blocks, 1, selected)
+            if num_blocks < width:
+                block_keep_mask[:, num_blocks:] = False
+        else:
+            valid_counts = valid_blocks.sum(dim=1)
+            indices = torch.arange(num_blocks, device=input_ids.device)
+            indices = indices.unsqueeze(0).expand_as(valid_blocks)
+            masked_anchor_positions = torch.where(
+                valid_blocks,
+                anchor_positions,
+                torch.full_like(anchor_positions, input_ids.size(1)),
+            )
+            sorted_valid = torch.gather(
+                indices,
+                1,
+                masked_anchor_positions.argsort(dim=1),
+            )
+            slots = torch.arange(width, device=input_ids.device).unsqueeze(0)
+            slots = slots.expand(valid_blocks.size(0), -1)
+            kept_counts = valid_counts.clamp(max=width)
+            source_indices = torch.round(
+                slots.float()
+                * (valid_counts.clamp_min(1).unsqueeze(1) - 1).float()
+                / (kept_counts.clamp_min(2).unsqueeze(1) - 1).float()
+            ).long()
+            source_indices = torch.minimum(
+                source_indices,
+                valid_counts.clamp_min(1).unsqueeze(1) - 1,
+            ).clamp(max=num_blocks - 1)
+            selected = torch.gather(sorted_valid, 1, source_indices)
+            block_keep_mask = slots < kept_counts.unsqueeze(1)
+            selected = torch.where(
+                block_keep_mask, selected, torch.zeros_like(selected)
+            )
 
         def gather_blocks(value: torch.Tensor) -> torch.Tensor:
             index = selected
@@ -1154,6 +1206,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "opd_response_tokens": global_stats[2] / world_size,
             "opd_accepted_tokens": global_stats[3] / world_size,
             "opd_rejected_tokens": global_stats[4] / world_size,
+            "_eval_opd_loss_sum": numerator.detach(),
+            "_eval_opd_loss_denom": denominator.detach(),
         }
         return opd_loss, metrics
 
@@ -1174,18 +1228,26 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         ce_loss_den = flat_weights.sum()
-        ce_loss = (loss_per_token * flat_weights).sum() / (ce_loss_den + 1e-6)
+        ce_loss_sum = (loss_per_token * flat_weights).sum()
+        ce_loss = ce_loss_sum / (ce_loss_den + 1e-6)
         loss_per_position = loss_per_token.reshape_as(target_ids)
 
         position_metrics = {}
+        eval_metric_sums = {}
+        eval_metric_denoms = {}
         for position in range(self.block_size):
             position_weights = loss_weight_mask[..., position]
-            position_loss = (
+            position_denom = position_weights.sum()
+            position_sum = (
                 loss_per_position[..., position] * position_weights
-            ).sum() / (position_weights.sum() + 1e-6)
+            ).sum()
+            position_loss = position_sum / (position_denom + 1e-6)
             position_metrics[f"mtp_{position + 1}_loss"] = position_loss.detach()
+            eval_metric_sums[f"mtp_{position + 1}_ce"] = position_sum.detach()
+            eval_metric_denoms[f"mtp_{position + 1}_ce"] = position_denom.detach()
 
         l1_loss = ce_loss.new_zeros(())
+        l1_loss_sum = ce_loss.new_zeros(())
         accept_rate_3d = None
         needs_target_distribution = (
             self.dspark_l1_loss_alpha > 0
@@ -1193,6 +1255,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 confidence_pred is not None
                 and self.dspark_confidence_head_alpha > 0
             )
+            or not self.training
         )
         if aligned_target_logits is not None and needs_target_distribution:
             draft_probs = torch.softmax(draft_logits.float(), dim=-1)
@@ -1200,8 +1263,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
             accept_rate_3d = 1.0 - 0.5 * l1_dist
             accept_rate_3d = accept_rate_3d.clamp_(0.0, 1.0)
-            if self.dspark_l1_loss_alpha > 0:
-                l1_loss = (l1_dist * loss_weight_mask).sum() / (ce_loss_den + 1e-6)
+            l1_loss_sum = (l1_dist * loss_weight_mask).sum()
+            l1_loss = l1_loss_sum / (ce_loss_den + 1e-6)
+            for position in range(self.block_size):
+                position_weights = loss_weight_mask[..., position]
+                name = f"mtp_{position + 1}_l1"
+                eval_metric_sums[name] = (
+                    l1_dist[..., position] * position_weights
+                ).sum().detach()
+                eval_metric_denoms[name] = position_weights.sum().detach()
         elif self.dspark_l1_loss_alpha > 0 or self.dspark_confidence_head_alpha > 0:
             raise ValueError(
                 "DSpark L1/confidence loss requires target_last_hidden_states. "
@@ -1210,6 +1280,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
 
         confidence_loss = ce_loss.new_zeros(())
+        confidence_loss_sum = ce_loss.new_zeros(())
         confidence_abs_error = ce_loss.new_zeros(())
         if confidence_pred is not None and self.dspark_confidence_head_alpha > 0:
             if accept_rate_3d is None:
@@ -1221,9 +1292,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 accept_rate_3d.detach(),
                 reduction="none",
             )
-            confidence_loss = (confidence_errors * loss_weight_mask).sum() / (
-                ce_loss_den + 1e-6
-            )
+            confidence_loss_sum = (confidence_errors * loss_weight_mask).sum()
+            confidence_loss = confidence_loss_sum / (ce_loss_den + 1e-6)
             with torch.no_grad():
                 confidence_abs_error = (
                     (confidence_pred.float().sigmoid() - accept_rate_3d).abs()
@@ -1240,8 +1310,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "l1_loss": l1_loss.detach(),
             "confidence_loss": confidence_loss.detach(),
             "confidence_abs_error": confidence_abs_error.detach(),
+            "metric_loss_denoms": [ce_loss_den.detach()],
+            "eval_metric_sums": eval_metric_sums,
+            "eval_metric_denoms": eval_metric_denoms,
             **position_metrics,
         }
+        eval_metric_sums["ce_loss"] = ce_loss_sum.detach()
+        eval_metric_denoms["ce_loss"] = ce_loss_den.detach()
+        if aligned_target_logits is not None and needs_target_distribution:
+            eval_metric_sums["l1_loss"] = l1_loss_sum.detach()
+            eval_metric_denoms["l1_loss"] = ce_loss_den.detach()
+        if confidence_pred is not None and self.dspark_confidence_head_alpha > 0:
+            eval_metric_sums["confidence_loss"] = confidence_loss_sum.detach()
+            eval_metric_denoms["confidence_loss"] = ce_loss_den.detach()
         return loss, metrics
 
     def forward(
@@ -1389,8 +1470,24 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 accepted_lengths=selected_accepted_lengths,
                 candidate_mask=selected_candidate_mask,
             )
+            opd_loss_sum = opd_metrics.pop("_eval_opd_loss_sum")
+            opd_loss_denom = opd_metrics.pop("_eval_opd_loss_denom")
             loss = loss + self.dspark_opd_loss_alpha * opd_loss
             metrics.update(opd_metrics)
+            metrics["eval_metric_sums"]["opd_loss"] = opd_loss_sum
+            metrics["eval_metric_denoms"]["opd_loss"] = opd_loss_denom
+        if not self.training:
+            objective_weights = {
+                "ce_loss": self.dspark_ce_loss_alpha,
+                "l1_loss": self.dspark_l1_loss_alpha,
+                "confidence_loss": self.dspark_confidence_head_alpha,
+                "opd_loss": self.dspark_opd_loss_alpha,
+            }
+            metrics["eval_objective_weights"] = {
+                name: weight
+                for name, weight in objective_weights.items()
+                if weight > 0 and name in metrics["eval_metric_sums"]
+            }
         flat_logits = draft_logits.reshape(-1, draft_logits.size(-1))
         flat_targets = target_ids.reshape(-1)
         binary_eval_mask = eval_mask.reshape(-1)
@@ -1400,4 +1497,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             accuracy_denom = binary_eval_mask.to(torch.float32).sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
             metrics["accuracy_denom"] = accuracy_denom.detach()
+            correct_3d = correct.view_as(eval_mask)
+            metrics["acc_corrects"] = [
+                correct_3d[..., position].sum().detach()
+                for position in range(self.block_size)
+            ]
+            metrics["acc_denoms"] = [
+                eval_mask[..., position].sum().detach()
+                for position in range(self.block_size)
+            ]
         return loss, accuracy, metrics

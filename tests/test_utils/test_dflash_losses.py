@@ -446,6 +446,67 @@ class TestDFlashLosses(unittest.TestCase):
         want = (neg_log_q * weights).sum() / (weights.sum() + 1e-6)
         torch.testing.assert_close(loss, want, rtol=0, atol=1e-6)
 
+    def test_dspark_eval_anchor_sampling_is_deterministic(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+        )
+        sampler = OnlineDSparkModel._sample_anchor_positions.__get__(model)
+        model.num_anchors = 4
+        model.eval()
+        loss_mask = torch.ones(1, 8)
+        first = sampler(8, loss_mask, loss_mask.device)
+        second = sampler(8, loss_mask, loss_mask.device)
+        torch.testing.assert_close(first[0], second[0])
+        torch.testing.assert_close(first[1], second[1])
+        torch.testing.assert_close(first[0], torch.tensor([[0, 2, 4, 6]]))
+        self.assertTrue(first[1].all())
+
+        model.num_anchors = 4
+        short_mask = torch.tensor([[0, 1, 1, 1, 0]], dtype=torch.float32)
+        anchors, keep = sampler(5, short_mask, short_mask.device)
+        torch.testing.assert_close(anchors, torch.tensor([[1, 2, 0, 0]]))
+        torch.testing.assert_close(keep, torch.tensor([[True, True, False, False]]))
+
+    def test_dspark_eval_opd_block_selection_is_deterministic(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            dspark_opd_loss_alpha=1.0,
+        )
+        model.num_anchors = 3
+        model.eval()
+        anchor_positions = torch.arange(7).unsqueeze(0)
+        draft_token_ids = torch.arange(35).reshape(1, 7, 5)
+        target_logprobs = -torch.ones(1, 7, 5)
+        accepted_lengths = torch.arange(7).unsqueeze(0).clamp(max=5)
+        candidate_mask = torch.ones(1, 7, 5, dtype=torch.bool)
+        kwargs = {
+            "input_ids": torch.arange(10).unsqueeze(0),
+            "anchor_positions": anchor_positions,
+            "draft_token_ids": draft_token_ids,
+            "target_logprobs": target_logprobs,
+            "accepted_lengths": accepted_lengths,
+            "candidate_mask": candidate_mask,
+        }
+
+        first = model._select_opd_blocks(**kwargs)
+        second = model._select_opd_blocks(**kwargs)
+
+        for first_value, second_value in zip(first, second):
+            torch.testing.assert_close(first_value, second_value)
+        torch.testing.assert_close(first[0], torch.tensor([[0, 3, 6]]))
+        self.assertTrue(first[1].all())
+        torch.testing.assert_close(first[2], draft_token_ids[:, [0, 3, 6]])
+
     def test_dspark_ce_only_skips_target_distribution(self):
         target_logits = torch.randn_like(self.logits)
         model = _make_dspark_model(
@@ -467,6 +528,27 @@ class TestDFlashLosses(unittest.TestCase):
             )
 
         self.assertTrue(torch.isfinite(loss))
+
+    def test_dspark_eval_reports_l1_when_training_weight_is_zero(self):
+        target_logits = torch.randn_like(self.logits)
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            lm_head=_DualFixedHead(self.logits, target_logits).double(),
+            dspark_ce_loss_alpha=1.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+        )
+        model.eval()
+        _loss, _accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+            target_last_hidden_states=torch.zeros_like(self.hidden_states),
+        )
+        self.assertGreater(metrics["eval_metric_denoms"]["l1_loss"].item(), 0)
+        self.assertGreater(metrics["eval_metric_sums"]["l1_loss"].item(), 0)
 
     def test_dspark_l1_and_confidence_match_reference(self):
         torch.manual_seed(321)

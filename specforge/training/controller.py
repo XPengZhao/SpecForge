@@ -469,6 +469,13 @@ class TrainerController:
         eval_enabled = self._rank0_decision(
             self.eval_interval > 0 and self.eval_data_factory is not None
         )
+        if eval_enabled and self.global_step == 0:
+            eval_metrics = self.evaluate_configured()
+            module.train()
+            if eval_metrics:
+                if self.logger:
+                    self.logger(eval_metrics, self.global_step)
+                self.last_metrics = {**self.last_metrics, **eval_metrics}
         pending_ack: List[str] = []
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch

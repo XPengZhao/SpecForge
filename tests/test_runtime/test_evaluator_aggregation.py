@@ -54,6 +54,21 @@ def _scalar_out(loss, acc, tokens, denom=None):
     return StepOutput(loss=torch.tensor(float(loss)), metrics=metrics)
 
 
+def _scalar_out_with_eval_metrics(
+    loss, acc, tokens, sums, denoms, objective_weights=None
+):
+    out = _scalar_out(loss, acc, tokens)
+    out.metrics["eval_metric_sums"] = {
+        name: torch.tensor(float(value)) for name, value in sums.items()
+    }
+    out.metrics["eval_metric_denoms"] = {
+        name: torch.tensor(float(value)) for name, value in denoms.items()
+    }
+    if objective_weights is not None:
+        out.metrics["eval_objective_weights"] = objective_weights
+    return out
+
+
 class TestEvaluatorAggregation(unittest.TestCase):
     def _run(self, outputs):
         from specforge.eval import Evaluator
@@ -171,10 +186,84 @@ class TestEvaluatorAggregation(unittest.TestCase):
             # loss-token weighting would skew to (0.75*10 + 0.5*50)/60 ~ 0.542
             self.assertNotAlmostEqual(m["eval/avg_acc"], 32.5 / 60, places=2)
 
+    def test_aggregates_named_eval_metrics_and_derives_tv(self):
+        metrics = self._run(
+            [
+                _scalar_out_with_eval_metrics(
+                    1.0,
+                    0.5,
+                    4,
+                    sums={"ce_loss": 2.0, "l1_loss": 0.8, "mtp_1_l1": 0.6},
+                    denoms={"ce_loss": 2.0, "l1_loss": 2.0, "mtp_1_l1": 2.0},
+                ),
+                _scalar_out_with_eval_metrics(
+                    1.0,
+                    0.5,
+                    4,
+                    sums={"ce_loss": 6.0, "l1_loss": 1.2, "mtp_1_l1": 1.0},
+                    denoms={"ce_loss": 3.0, "l1_loss": 3.0, "mtp_1_l1": 3.0},
+                ),
+            ]
+        )
+        self.assertAlmostEqual(metrics["eval/ce_loss"], 8.0 / 5.0)
+        self.assertAlmostEqual(metrics["eval/l1_loss"], 2.0 / 5.0)
+        self.assertAlmostEqual(metrics["eval/overall_tv"], 0.2)
+        self.assertAlmostEqual(metrics["eval/overall_predicted_acceptance"], 0.8)
+        self.assertAlmostEqual(metrics["eval/mtp_1_tv"], 0.16)
+        self.assertAlmostEqual(metrics["eval/mtp_1_predicted_acceptance"], 0.84)
+
+    def test_reconstructs_objective_from_component_denominators(self):
+        metrics = self._run(
+            [
+                _scalar_out_with_eval_metrics(
+                    100.0,
+                    0.5,
+                    2,
+                    sums={"ce_loss": 2.0, "opd_loss": 3.0},
+                    denoms={"ce_loss": 2.0, "opd_loss": 1.0},
+                    objective_weights={"ce_loss": 0.3, "opd_loss": 1.0},
+                ),
+                _scalar_out_with_eval_metrics(
+                    1.0,
+                    0.5,
+                    20,
+                    sums={"ce_loss": 6.0, "opd_loss": 3.0},
+                    denoms={"ce_loss": 3.0, "opd_loss": 3.0},
+                    objective_weights={"ce_loss": 0.3, "opd_loss": 1.0},
+                ),
+            ]
+        )
+        self.assertAlmostEqual(metrics["eval/ce_loss"], 8.0 / 5.0)
+        self.assertAlmostEqual(metrics["eval/opd_loss"], 6.0 / 4.0)
+        self.assertAlmostEqual(
+            metrics["eval/avg_loss"], 0.3 * 8.0 / 5.0 + 6.0 / 4.0
+        )
+
     def test_reports_per_position_acceptance(self):
-        m = self._run([_step_output(1.0, corrects=[3, 2], denoms=[4, 4])])
+        output = _step_output(1.0, corrects=[3, 2], denoms=[4, 4])
+        output.metrics["eval_metric_sums"] = {
+            "mtp_1_l1": torch.tensor(0.8),
+            "mtp_2_l1": torch.tensor(1.6),
+        }
+        output.metrics["eval_metric_denoms"] = {
+            "mtp_1_l1": torch.tensor(4.0),
+            "mtp_2_l1": torch.tensor(4.0),
+        }
+        m = self._run([output])
         self.assertAlmostEqual(m["eval/per_position_acc"][0], 0.75, places=6)
         self.assertAlmostEqual(m["eval/per_position_acc"][1], 0.5, places=6)
+        self.assertAlmostEqual(m["eval/mtp_1_accuracy"], 0.75, places=6)
+        self.assertAlmostEqual(m["eval/mtp_2_accuracy"], 0.5, places=6)
+        self.assertAlmostEqual(
+            m["eval/simulated_top1_accepted_tokens"], 1.125, places=6
+        )
+        self.assertAlmostEqual(m["eval/simulated_top1_mal"], 2.125, places=6)
+        # Per-position overlaps are 0.9 and 0.8, so E[accepted] is
+        # 0.9 + 0.9*0.8 = 1.62 and MAL includes one verified target token.
+        self.assertAlmostEqual(
+            m["eval/simulated_distribution_accepted_tokens"], 1.62, places=6
+        )
+        self.assertAlmostEqual(m["eval/simulated_distribution_mal"], 2.62, places=6)
         self.assertEqual(len(m["eval/per_position_acc"]), 2)
 
     def test_emits_token_weighted_acceptance_rate_and_ploss(self):
@@ -230,11 +319,31 @@ def _dp_worker(rank, world_size, port, results_dir):
     # Scenario 1 — scalar accuracy, uneven shards, accuracy_denom != tokens:
     # both weight sets must be reduced across ranks independently.
     if rank == 0:
-        outs = [_scalar_out(2.0, 0.5, tokens=8, denom=4)]
+        outs = [
+            _scalar_out_with_eval_metrics(
+                2.0,
+                0.5,
+                tokens=8,
+                sums={"l1_loss": 0.8},
+                denoms={"l1_loss": 2.0},
+            )
+        ]
     else:
         outs = [
-            _scalar_out(8.0, 0.7, tokens=2, denom=1),
-            _scalar_out(4.0, 0.9, tokens=10, denom=5),
+            _scalar_out_with_eval_metrics(
+                8.0,
+                0.7,
+                tokens=2,
+                sums={"l1_loss": 0.3},
+                denoms={"l1_loss": 1.0},
+            ),
+            _scalar_out_with_eval_metrics(
+                4.0,
+                0.9,
+                tokens=10,
+                sums={"l1_loss": 1.0},
+                denoms={"l1_loss": 2.0},
+            ),
         ]
     it = iter(outs)
     scalar = Evaluator().run(lambda b: next(it), [_batch() for _ in outs])
@@ -273,6 +382,8 @@ class TestEvaluatorDataParallel(unittest.TestCase):
         self.assertAlmostEqual(scalar["eval/avg_acc"], 0.72, places=6)
         # global token-weighted loss: (2*8 + 8*2 + 4*10) / 20 = 3.6
         self.assertAlmostEqual(scalar["eval/avg_loss"], 3.6, places=6)
+        self.assertAlmostEqual(scalar["eval/l1_loss"], 2.1 / 5.0, places=6)
+        self.assertAlmostEqual(scalar["eval/overall_tv"], 0.21, places=6)
         # the ragged pass completed (no hang) with rank0's counts as the total
         self.assertAlmostEqual(ragged["eval/avg_acc"], 0.75, places=6)
         self.assertAlmostEqual(ragged["eval/simulated_acc_len"], 1.125, places=6)

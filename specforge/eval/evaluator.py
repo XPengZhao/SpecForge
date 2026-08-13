@@ -47,6 +47,9 @@ class Evaluator:
         # pp rows: [correct, denom, acceptance_rate*w, ploss*w] per TTT
         # position, float64 so counts stay exact past 2**24.
         pp = None
+        scalar_metric_sums: Dict[str, torch.Tensor] = {}
+        scalar_metric_denoms: Dict[str, torch.Tensor] = {}
+        objective_weights: Dict[str, float] | None = None
         # [loss*w, w, scalar_acc*denom, scalar_denom, n_batches, ar_w, pl_w]
         sums = None
 
@@ -66,6 +69,35 @@ class Evaluator:
                 sums[0] += loss.to(sums.device) * tokens
                 sums[1] += tokens
                 sums[4] += 1.0
+
+                batch_metric_sums = m.get("eval_metric_sums", {})
+                batch_metric_denoms = m.get("eval_metric_denoms", {})
+                if batch_metric_sums.keys() != batch_metric_denoms.keys():
+                    raise ValueError(
+                        "eval metric sums and denominators must have identical keys"
+                    )
+                for name, value in batch_metric_sums.items():
+                    metric_sum = torch.as_tensor(value).detach().double().sum()
+                    metric_denom = (
+                        torch.as_tensor(batch_metric_denoms[name]).detach().double().sum()
+                    )
+                    if name not in scalar_metric_sums:
+                        scalar_metric_sums[name] = torch.zeros_like(metric_sum)
+                        scalar_metric_denoms[name] = torch.zeros_like(metric_denom)
+                    scalar_metric_sums[name] += metric_sum
+                    scalar_metric_denoms[name] += metric_denom
+
+                batch_objective_weights = {
+                    name: float(value)
+                    for name, value in m.get("eval_objective_weights", {}).items()
+                }
+                if batch_objective_weights:
+                    if objective_weights is None:
+                        objective_weights = batch_objective_weights
+                    elif objective_weights != batch_objective_weights:
+                        raise ValueError(
+                            "eval objective weights must be constant across batches"
+                        )
 
                 if "acc_corrects" in m and "acc_denoms" in m:
                     correct = self._stack(m["acc_corrects"])
@@ -131,32 +163,134 @@ class Evaluator:
             # would poison best-checkpoint tracking.
             return {}
 
+        metric_names = sorted(scalar_metric_sums)
+        if world_size > 1:
+            gathered_names: List[List[str]] = [[] for _ in range(world_size)]
+            dist.all_gather_object(gathered_names, metric_names)
+            metric_names = sorted({name for names in gathered_names for name in names})
+            device = self._comm_device()
+            metric_buffer = torch.zeros(
+                2,
+                len(metric_names),
+                dtype=torch.float64,
+                device=device,
+            )
+            for index, name in enumerate(metric_names):
+                if name in scalar_metric_sums:
+                    metric_buffer[0, index] = scalar_metric_sums[name].to(device)
+                    metric_buffer[1, index] = scalar_metric_denoms[name].to(device)
+            if metric_names:
+                dist.all_reduce(metric_buffer, op=dist.ReduceOp.SUM)
+
+            gathered_weights: List[Dict[str, float] | None] = [
+                None for _ in range(world_size)
+            ]
+            dist.all_gather_object(gathered_weights, objective_weights)
+            nonempty_weights = [weights for weights in gathered_weights if weights]
+            if nonempty_weights:
+                objective_weights = nonempty_weights[0]
+                if any(
+                    weights != objective_weights
+                    for weights in nonempty_weights[1:]
+                ):
+                    raise ValueError(
+                        "eval objective weights must be constant across ranks"
+                    )
+        else:
+            metric_buffer = torch.zeros(2, len(metric_names), dtype=torch.float64)
+            for index, name in enumerate(metric_names):
+                metric_buffer[0, index] = scalar_metric_sums[name].cpu()
+                metric_buffer[1, index] = scalar_metric_denoms[name].cpu()
+
         loss_x_w, loss_w, acc_sum, acc_w, _n, ar_w, pl_w = sums.tolist()
         avg_loss = loss_x_w / max(loss_w, 1.0)
 
         if pp is not None:
             pp = pp.cpu()
             per_position_acc = (pp[0] / pp[1].clamp_min(1.0)).tolist()
+            simulated_acc_len = self._simulated_acc_len(per_position_acc)
             metrics = {
                 "eval/avg_loss": avg_loss,
                 "eval/avg_acc": float(per_position_acc[0]),
                 "eval/per_position_acc": per_position_acc,
-                "eval/simulated_acc_len": self._simulated_acc_len(per_position_acc),
+                "eval/simulated_acc_len": simulated_acc_len,
+                "eval/simulated_top1_accepted_tokens": simulated_acc_len,
+                "eval/simulated_top1_mal": 1.0 + simulated_acc_len,
             }
+            for index, value in enumerate(per_position_acc, start=1):
+                metrics[f"eval/mtp_{index}_accuracy"] = float(value)
             if ar_w > 0:
                 for i, v in enumerate((pp[2] / ar_w).tolist()):
                     metrics[f"eval/acceptance_rate_{i}"] = v
             if pl_w > 0:
                 for i, v in enumerate((pp[3] / pl_w).tolist()):
                     metrics[f"eval/ploss_{i}"] = v
+            self._add_scalar_metrics(metrics, metric_names, metric_buffer)
+            self._set_exact_avg_loss(
+                metrics, metric_names, metric_buffer, objective_weights
+            )
+            overlap = [
+                metrics.get(f"eval/mtp_{index}_predicted_acceptance")
+                for index in range(1, len(per_position_acc) + 1)
+            ]
+            if all(value is not None for value in overlap):
+                accepted_tokens = self._simulated_acc_len(
+                    [float(value) for value in overlap if value is not None]
+                )
+                metrics["eval/simulated_distribution_accepted_tokens"] = (
+                    accepted_tokens
+                )
+                metrics["eval/simulated_distribution_mal"] = 1.0 + accepted_tokens
             return metrics
 
         avg_acc = acc_sum / acc_w if acc_w else 0.0
-        return {
+        metrics = {
             "eval/avg_loss": avg_loss,
             "eval/avg_acc": avg_acc,
             "eval/simulated_acc_len": avg_acc,
         }
+        self._add_scalar_metrics(metrics, metric_names, metric_buffer)
+        self._set_exact_avg_loss(
+            metrics, metric_names, metric_buffer, objective_weights
+        )
+        return metrics
+
+    @staticmethod
+    def _set_exact_avg_loss(
+        metrics: Dict[str, Any],
+        names: List[str],
+        values: torch.Tensor,
+        weights: Dict[str, float] | None,
+    ) -> None:
+        if not weights:
+            return
+        indices = {name: index for index, name in enumerate(names)}
+        objective = 0.0
+        for name, weight in weights.items():
+            if name not in indices:
+                raise ValueError(f"missing eval objective component: {name}")
+            index = indices[name]
+            numerator = float(values[0, index].item())
+            denominator = float(values[1, index].item())
+            objective += weight * numerator / max(denominator, 1.0)
+        metrics["eval/avg_loss"] = objective
+
+    @staticmethod
+    def _add_scalar_metrics(
+        metrics: Dict[str, Any], names: List[str], values: torch.Tensor
+    ) -> None:
+        for index, name in enumerate(names):
+            denom = float(values[1, index].item())
+            if denom <= 0:
+                continue
+            value = float(values[0, index].item()) / denom
+            metrics[f"eval/{name}"] = value
+            if name == "l1_loss" or name.startswith("mtp_") and name.endswith("_l1"):
+                prefix = name.removesuffix("_l1")
+                if name == "l1_loss":
+                    prefix = "overall"
+                metrics[f"eval/{prefix}_tv"] = 0.5 * value
+                metrics[f"eval/{prefix}_predicted_acceptance"] = 1.0 - 0.5 * value
 
     @staticmethod
     def _stack(values: Iterable[Any]) -> torch.Tensor:

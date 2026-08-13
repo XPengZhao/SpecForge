@@ -499,6 +499,17 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         metrics = {
             "accuracy": accuracy.detach(),
         }
+        if not self.dspark_model.training:
+            for name in (
+                "acc_corrects",
+                "acc_denoms",
+                "metric_loss_denoms",
+                "eval_metric_sums",
+                "eval_metric_denoms",
+                "eval_objective_weights",
+            ):
+                if name in model_metrics:
+                    metrics[name] = model_metrics[name]
         for name in (
             "accuracy_denom",
             "ce_loss",
