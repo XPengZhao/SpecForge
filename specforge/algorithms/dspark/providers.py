@@ -33,15 +33,22 @@ from specforge.algorithms.contracts import (
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
+DEEPSEEK_V3_DRAFT_ARCHITECTURE = "DeepseekV3DSparkDraftModel"
 DEEPSEEK_V4_DRAFT_ARCHITECTURE = "DeepseekV4DSparkDraftModel"
 
 
 class DSparkDraftConfigProvider(DraftConfigProvider):
-    """DSpark accepts both the Qwen and DeepSeek-V4 draft implementations."""
+    """DSpark accepts generic, DeepSeek-V3, and DeepSeek-V4 draft models."""
 
     @property
     def compatible_architectures(self) -> frozenset[str]:
-        return frozenset({DRAFT_ARCHITECTURE, DEEPSEEK_V4_DRAFT_ARCHITECTURE})
+        return frozenset(
+            {
+                DRAFT_ARCHITECTURE,
+                DEEPSEEK_V3_DRAFT_ARCHITECTURE,
+                DEEPSEEK_V4_DRAFT_ARCHITECTURE,
+            }
+        )
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -130,6 +137,7 @@ def algorithm_spec() -> AlgorithmSpec:
         draft=DraftRequirement(
             compatible_architectures={
                 DRAFT_ARCHITECTURE,
+                DEEPSEEK_V3_DRAFT_ARCHITECTURE,
                 DEEPSEEK_V4_DRAFT_ARCHITECTURE,
             },
             default_architecture=DRAFT_ARCHITECTURE,

@@ -32,6 +32,27 @@ class BuiltinProviderContractTest(unittest.TestCase):
         self.assertEqual(BUILTINS, self.registry.names)
         self.assertIsNot(builtin_algorithm_registry(), self.registry)
 
+    def test_dspark_accepts_deepseek_v3_draft(self):
+        registration = self.registry.resolve("dspark")
+        architecture = "DeepseekV3DSparkDraftModel"
+        self.assertIn(
+            architecture,
+            registration.spec.draft.compatible_architectures,
+        )
+        self.assertIn(
+            architecture,
+            registration.providers.model.draft_config.compatible_architectures,
+        )
+
+    def test_dspark_reads_nested_block_size_for_minimum_tokens(self):
+        registration = self.registry.resolve("dspark")
+        draft_config = SimpleNamespace(dflash_config={"block_size": 5})
+        minimum = registration.providers.model.minimum_loss_tokens(
+            SimpleNamespace(),
+            draft_config,
+        )
+        self.assertEqual(minimum, 10)
+
     def test_every_registration_pairs_contract_and_providers(self):
         for registration in self.registry:
             with self.subTest(algorithm=registration.name):

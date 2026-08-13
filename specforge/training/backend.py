@@ -192,8 +192,18 @@ class FSDPTrainingBackend(TrainingBackend):
         return tuple(modules)
 
     _AC_MODULES = {
-        "stage": frozenset({"DeepseekV4DSparkStage"}),
-        "attention": frozenset({"DeepseekV4DSparkAttention"}),
+        "stage": frozenset(
+            {
+                "DeepseekV3DSparkStage",
+                "DeepseekV4DSparkStage",
+            }
+        ),
+        "attention": frozenset(
+            {
+                "DeepseekV3DSparkAttention",
+                "DeepseekV4DSparkAttention",
+            }
+        ),
     }
 
     def prepare_model(

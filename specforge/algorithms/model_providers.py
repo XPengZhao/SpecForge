@@ -460,6 +460,9 @@ def domino_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
 
 def dflash_min_loss_tokens(_cfg: Config, draft_config: Any) -> int:
     block_size = getattr(draft_config, "block_size", None)
+    if block_size is None:
+        method_config = getattr(draft_config, "dflash_config", None) or {}
+        block_size = method_config.get("block_size")
     if (
         not isinstance(block_size, int)
         or isinstance(block_size, bool)

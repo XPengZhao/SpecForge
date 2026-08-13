@@ -16,6 +16,7 @@ from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlashDraftModel,
+    DeepseekV3DSparkDraftModel,
     DominoDraftModel,
     DSparkDraftModel,
     LlamaForCausalLMEagle3,
@@ -93,10 +94,15 @@ class DraftRegistryTest(unittest.TestCase):
         self.assertIn("DFlashDraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
+        self.assertIn("DeepseekV3DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)
         self.assertIs(resolve_draft("DSparkDraftModel"), DSparkDraftModel)
+        self.assertIs(
+            resolve_draft("DeepseekV3DSparkDraftModel"),
+            DeepseekV3DSparkDraftModel,
+        )
 
     def test_unknown_architecture_raises_with_available_list(self):
         with self.assertRaises(KeyError) as ctx:
