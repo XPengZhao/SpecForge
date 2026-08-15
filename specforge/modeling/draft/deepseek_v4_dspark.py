@@ -686,7 +686,9 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
             raise ValueError("DeepSeek-V4 DSpark mask token id is missing")
         self.projector_type = "dspark"
         self.context_window = int(config.sliding_window)
-        self.include_anchor_context = True
+        # At inference, the sampled anchor has not passed through the target
+        # model yet, so its target-derived context KV is unavailable.
+        self.include_anchor_context = False
 
         num_stages = int(
             method_config.get(
