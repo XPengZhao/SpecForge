@@ -544,6 +544,16 @@ def export_deepseek_v4_dspark_checkpoint(
         json.dump(output_index, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
+    config_path = out_dir / "config.json"
+    with config_path.open(encoding="utf-8") as handle:
+        output_config = json.load(handle)
+    output_config["dspark_draft_overlay_format"] = (
+        "base" if quantize_like_base else "floating"
+    )
+    with config_path.open("w", encoding="utf-8") as handle:
+        json.dump(output_config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
     print(f"base HF model: {base_dir}")
     print(f"checkpoint: {checkpoint}")
     print(f"output HF model: {out_dir}")

@@ -1229,10 +1229,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         ce_loss_den = flat_weights.sum()
         ce_loss_sum = (loss_per_token * flat_weights).sum()
-        ce_loss = ce_loss_sum / (ce_loss_den + 1e-6)
         loss_per_position = loss_per_token.reshape_as(target_ids)
 
-        position_metrics = {}
+        position_sums = []
+        position_denoms = []
         eval_metric_sums = {}
         eval_metric_denoms = {}
         for position in range(self.block_size):
@@ -1241,13 +1241,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
             position_sum = (
                 loss_per_position[..., position] * position_weights
             ).sum()
-            position_loss = position_sum / (position_denom + 1e-6)
-            position_metrics[f"mtp_{position + 1}_loss"] = position_loss.detach()
+            position_sums.append(position_sum)
+            position_denoms.append(position_denom)
             eval_metric_sums[f"mtp_{position + 1}_ce"] = position_sum.detach()
             eval_metric_denoms[f"mtp_{position + 1}_ce"] = position_denom.detach()
 
-        l1_loss = ce_loss.new_zeros(())
-        l1_loss_sum = ce_loss.new_zeros(())
+        l1_loss_sum = ce_loss_sum.new_zeros(())
         accept_rate_3d = None
         needs_target_distribution = (
             self.dspark_l1_loss_alpha > 0
@@ -1264,7 +1263,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             accept_rate_3d = 1.0 - 0.5 * l1_dist
             accept_rate_3d = accept_rate_3d.clamp_(0.0, 1.0)
             l1_loss_sum = (l1_dist * loss_weight_mask).sum()
-            l1_loss = l1_loss_sum / (ce_loss_den + 1e-6)
             for position in range(self.block_size):
                 position_weights = loss_weight_mask[..., position]
                 name = f"mtp_{position + 1}_l1"
@@ -1279,9 +1277,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "consumer receives target_last_hidden_states."
             )
 
-        confidence_loss = ce_loss.new_zeros(())
-        confidence_loss_sum = ce_loss.new_zeros(())
-        confidence_abs_error = ce_loss.new_zeros(())
+        confidence_loss_sum = ce_loss_sum.new_zeros(())
+        confidence_abs_error_sum = ce_loss_sum.new_zeros(())
         if confidence_pred is not None and self.dspark_confidence_head_alpha > 0:
             if accept_rate_3d is None:
                 raise ValueError(
@@ -1293,23 +1290,60 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 reduction="none",
             )
             confidence_loss_sum = (confidence_errors * loss_weight_mask).sum()
-            confidence_loss = confidence_loss_sum / (ce_loss_den + 1e-6)
             with torch.no_grad():
-                confidence_abs_error = (
+                confidence_abs_error_sum = (
                     (confidence_pred.float().sigmoid() - accept_rate_3d).abs()
                     * loss_weight_mask
-                ).sum() / (ce_loss_den + 1e-6)
+                ).sum()
 
-        loss = (
-            self.dspark_ce_loss_alpha * ce_loss
-            + self.dspark_l1_loss_alpha * l1_loss
-            + self.dspark_confidence_head_alpha * confidence_loss
+        objective_sum = (
+            self.dspark_ce_loss_alpha * ce_loss_sum
+            + self.dspark_l1_loss_alpha * l1_loss_sum
+            + self.dspark_confidence_head_alpha * confidence_loss_sum
         )
+        global_stats = torch.stack(
+            (
+                ce_loss_den.detach(),
+                ce_loss_sum.detach(),
+                l1_loss_sum.detach(),
+                confidence_loss_sum.detach(),
+                confidence_abs_error_sum.detach(),
+                *(value.detach() for value in position_sums),
+                *(value.detach() for value in position_denoms),
+            )
+        )
+        world_size = 1
+        if (
+            self.training
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.all_reduce(global_stats)
+            world_size = torch.distributed.get_world_size()
+
+        global_denominator = global_stats[0].clamp_min(1e-6)
+        # FSDP averages gradients across ranks. Scale each rank's local
+        # numerator so the resulting gradient is sum(N_r) / sum(D_r).
+        loss = objective_sum * world_size / global_denominator
+        position_offset = 5
+        global_position_sums = global_stats[
+            position_offset : position_offset + self.block_size
+        ]
+        global_position_denoms = global_stats[
+            position_offset + self.block_size : position_offset + 2 * self.block_size
+        ]
+        position_metrics = {
+            f"mtp_{position + 1}_loss": (
+                global_position_sums[position]
+                / global_position_denoms[position].clamp_min(1e-6)
+            )
+            for position in range(self.block_size)
+        }
         metrics = {
-            "ce_loss": ce_loss.detach(),
-            "l1_loss": l1_loss.detach(),
-            "confidence_loss": confidence_loss.detach(),
-            "confidence_abs_error": confidence_abs_error.detach(),
+            "ce_loss": global_stats[1] / global_denominator,
+            "l1_loss": global_stats[2] / global_denominator,
+            "confidence_loss": global_stats[3] / global_denominator,
+            "confidence_abs_error": global_stats[4] / global_denominator,
             "metric_loss_denoms": [ce_loss_den.detach()],
             "eval_metric_sums": eval_metric_sums,
             "eval_metric_denoms": eval_metric_denoms,
