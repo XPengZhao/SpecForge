@@ -154,8 +154,14 @@ def _finish_registered_draft(
     draft_config: PretrainedConfig,
     draft_model: Any,
 ):
+    from specforge.modeling.auto import move_model_preserving_strict_fp32
+
     _warm_start(cfg, draft_model, draft_config)
-    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    return move_model_preserving_strict_fp32(
+        draft_model,
+        device=_device(),
+        dtype=_torch_dtype(cfg),
+    )
 
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class BF16Optimizer:
-    """AdamW over fp32 master copies of the bf16 trainable params, with grad
+    """AdamW over FP32 master copies of the trainable params, with grad
     clipping and cosine warmup scheduling."""
 
     def __init__(
@@ -37,6 +37,7 @@ class BF16Optimizer:
         self.last_grad_norm = None
         self._grad_norm_process_group = None
         self._reduce_grad_norm_across_ranks = True
+        self._replicated_parameter_ids = set()
         self.scheduler = CosineAnnealingWarmupLR(
             self.optimizer,
             total_steps=total_steps,
@@ -44,20 +45,46 @@ class BF16Optimizer:
         )
 
     def configure_grad_norm_reduction(
-        self, *, process_group=None, enabled: bool = True
+        self,
+        *,
+        process_group=None,
+        enabled: bool = True,
+        replicated_parameters=(),
     ) -> None:
         """Configure the group that owns disjoint gradient shards.
 
-        FSDP backends disable the reduction for replicated/NO_SHARD parameters.
+        Replicated parameters contribute only once to the global norm even
+        though every rank owns an identical gradient.
         """
         self._grad_norm_process_group = process_group
         self._reduce_grad_norm_across_ranks = enabled
+        self._replicated_parameter_ids = {
+            id(parameter) for parameter in replicated_parameters
+        }
 
     def _clip_grad_norm(self):
         """Clip all FSDP shards with one global L2-norm coefficient."""
-        grads = [mp.grad for mp in self.fp32_params if mp.grad is not None]
-        if grads:
-            total_norm_sq = torch.stack([grad.square().sum() for grad in grads]).sum()
+        parameter_grads = [
+            (parameter, master.grad)
+            for parameter, master in zip(self.model_params, self.fp32_params)
+            if master.grad is not None
+        ]
+        grads = [gradient for _, gradient in parameter_grads]
+        if parameter_grads:
+            world_size = 1
+            if (
+                self._reduce_grad_norm_across_ranks
+                and dist.is_available()
+                and dist.is_initialized()
+            ):
+                world_size = dist.get_world_size(self._grad_norm_process_group)
+            contributions = []
+            for parameter, gradient in parameter_grads:
+                contribution = gradient.square().sum()
+                if id(parameter) in self._replicated_parameter_ids:
+                    contribution = contribution / world_size
+                contributions.append(contribution)
+            total_norm_sq = torch.stack(contributions).sum()
         else:
             device = self.fp32_params[0].device if self.fp32_params else "cpu"
             total_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
@@ -131,7 +158,7 @@ class BF16Optimizer:
         else:
             logger.warning(
                 "checkpoint has no fp32_params; re-cloning master params from "
-                "bf16 weights — resume will not be numerically faithful"
+                "model weights — resume will not be numerically faithful"
             )
             with torch.no_grad():
                 for p, mp in zip(self.model_params, self.fp32_params):
@@ -142,7 +169,7 @@ class BF16Optimizer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "max_grad_norm": self.max_grad_norm,
-            # rank-local fp32 masters; without them a resume re-quantizes from bf16
+            # Rank-local FP32 masters preserve updates beyond storage precision.
             "fp32_params": [t.detach().cpu() for t in self.fp32_params],
         }
 

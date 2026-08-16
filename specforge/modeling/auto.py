@@ -2,11 +2,76 @@ import json
 import os
 from typing import Union
 
+import torch
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import PretrainedConfig, modeling_utils
 
 from .draft.registry import DRAFT_REGISTRY, available_drafts
+
+
+def _matches_strict_selector(name: str, selectors: tuple[str, ...]) -> bool:
+    components = name.split(".")
+    return any(
+        selector == name
+        or selector in components
+        or name.endswith(f".{selector}")
+        for selector in selectors
+    )
+
+
+def move_model_preserving_strict_fp32(
+    model: torch.nn.Module,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.nn.Module:
+    """Move and cast a draft model without narrowing strict FP32 state.
+
+    Drafts may list parameter/module names in
+    ``_keep_in_fp32_modules_strict`` and buffer names in
+    ``_keep_in_fp32_buffers_strict``. Device movement applies to all state,
+    while floating-point dtype conversion skips those selected tensors.
+
+    Args:
+        model: Draft model to move and cast.
+        device: Optional destination device.
+        dtype: Optional dtype for non-strict floating-point state.
+
+    Returns:
+        The same model after the requested conversion.
+    """
+    if device is not None:
+        model.to(device=device)
+    if dtype is None:
+        return model
+
+    strict_parameters = tuple(
+        getattr(model, "_keep_in_fp32_modules_strict", ()) or ()
+    )
+    strict_buffers = tuple(
+        getattr(model, "_keep_in_fp32_buffers_strict", ()) or ()
+    )
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not parameter.is_floating_point():
+                continue
+            target_dtype = (
+                torch.float32
+                if _matches_strict_selector(name, strict_parameters)
+                else dtype
+            )
+            parameter.data = parameter.data.to(dtype=target_dtype)
+        for name, buffer in model.named_buffers():
+            if not buffer.is_floating_point():
+                continue
+            target_dtype = (
+                torch.float32
+                if _matches_strict_selector(name, strict_buffers)
+                else dtype
+            )
+            buffer.data = buffer.data.to(dtype=target_dtype)
+    return model
 
 
 class AutoDraftModel(AutoModelForCausalLMBase):
@@ -37,7 +102,7 @@ class AutoDraftModel(AutoModelForCausalLMBase):
 
         # Convert model to specified dtype if provided
         if torch_dtype is not None:
-            model = model.to(dtype=torch_dtype)
+            model = move_model_preserving_strict_fp32(model, dtype=torch_dtype)
         return model
 
     @classmethod

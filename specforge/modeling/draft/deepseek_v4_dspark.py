@@ -77,6 +77,21 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
         )
 
 
+class DeepseekV4DSparkRMSNorm(DeepseekV4RMSNorm):
+    """DeepSeek-V4 RMSNorm with FP32 affine weights and computation."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__(hidden_size, eps=eps)
+        self.weight.data = self.weight.data.float()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        normalized = hidden_states.float()
+        variance = normalized.square().mean(-1, keepdim=True)
+        normalized = normalized * torch.rsqrt(variance + self.variance_epsilon)
+        return (self.weight * normalized).to(input_dtype)
+
+
 _FP4_E2M1 = (
     0.0,
     0.5,
@@ -249,7 +264,9 @@ class DeepseekV4DSparkAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.q_norm = DeepseekV4DSparkRMSNorm(
+            config.q_lora_rank, eps=config.rms_norm_eps
+        )
         self.wq_b = nn.Linear(
             config.q_lora_rank,
             self.num_heads * self.head_dim,
@@ -257,7 +274,9 @@ class DeepseekV4DSparkAttention(nn.Module):
         )
         self.q_head_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.kv_norm = DeepseekV4DSparkRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )
         self.wo_a = DeepseekV4GroupedLinear(
             self.num_heads * self.head_dim // config.o_groups,
             config.o_groups * config.o_lora_rank,
@@ -268,7 +287,9 @@ class DeepseekV4DSparkAttention(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        self.attn_sink = nn.Parameter(torch.empty(self.num_heads))
+        self.attn_sink = nn.Parameter(
+            torch.empty(self.num_heads, dtype=torch.float32)
+        )
 
     def _attention(
         self,
@@ -359,7 +380,9 @@ class DeepseekV4DSparkRouter(nn.Module):
             torch.empty(config.n_routed_experts, config.hidden_size)
         )
         self.register_buffer(
-            "bias", torch.zeros(config.n_routed_experts), persistent=True
+            "bias",
+            torch.zeros(config.n_routed_experts, dtype=torch.float32),
+            persistent=True,
         )
         self.top_k = int(config.num_experts_per_tok)
         self.score_fn = ACT2FN[config.scoring_func]
@@ -473,24 +496,44 @@ class DeepseekV4DSparkStage(nn.Module):
             self.main_proj = nn.Linear(
                 target_layer_count * hidden_size, hidden_size, bias=False
             )
-            self.main_norm = DeepseekV4RMSNorm(hidden_size, eps=config.rms_norm_eps)
+            self.main_norm = DeepseekV4DSparkRMSNorm(
+                hidden_size, eps=config.rms_norm_eps
+            )
 
-        self.attn_norm = DeepseekV4RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = DeepseekV4RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = DeepseekV4DSparkRMSNorm(
+            hidden_size, eps=config.rms_norm_eps
+        )
+        self.ffn_norm = DeepseekV4DSparkRMSNorm(
+            hidden_size, eps=config.rms_norm_eps
+        )
         self.attn = DeepseekV4DSparkAttention(config, rotary_emb)
         self.ffn = DeepseekV4DSparkMoE(config)
-        self.hc_attn_fn = nn.Parameter(torch.empty(hc_mapping_width, hc_width))
-        self.hc_attn_base = nn.Parameter(torch.empty(hc_mapping_width))
-        self.hc_attn_scale = nn.Parameter(torch.empty(3))
-        self.hc_ffn_fn = nn.Parameter(torch.empty(hc_mapping_width, hc_width))
-        self.hc_ffn_base = nn.Parameter(torch.empty(hc_mapping_width))
-        self.hc_ffn_scale = nn.Parameter(torch.empty(3))
+        self.hc_attn_fn = nn.Parameter(
+            torch.empty(hc_mapping_width, hc_width, dtype=torch.float32)
+        )
+        self.hc_attn_base = nn.Parameter(
+            torch.empty(hc_mapping_width, dtype=torch.float32)
+        )
+        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.hc_ffn_fn = nn.Parameter(
+            torch.empty(hc_mapping_width, hc_width, dtype=torch.float32)
+        )
+        self.hc_ffn_base = nn.Parameter(
+            torch.empty(hc_mapping_width, dtype=torch.float32)
+        )
+        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
         if stage_idx == num_stages - 1:
-            self.norm = DeepseekV4RMSNorm(hidden_size, eps=config.rms_norm_eps)
-            self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_width))
-            self.hc_head_base = nn.Parameter(torch.empty(hc_mult))
-            self.hc_head_scale = nn.Parameter(torch.empty(1))
+            self.norm = DeepseekV4DSparkRMSNorm(
+                hidden_size, eps=config.rms_norm_eps
+            )
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(hc_mult, hc_width, dtype=torch.float32)
+            )
+            self.hc_head_base = nn.Parameter(
+                torch.empty(hc_mult, dtype=torch.float32)
+            )
+            self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
             self.markov_head = VanillaMarkovHead(
                 vocab_size=config.vocab_size,
                 markov_rank=markov_rank,
@@ -573,6 +616,25 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
 
     config_class = DeepseekV4DSparkConfig
     _no_split_modules = ["DeepseekV4DSparkMoE"]
+    _keep_in_fp32_modules_strict = [
+        "attn_sink",
+        "hc_attn_fn",
+        "hc_attn_base",
+        "hc_attn_scale",
+        "hc_ffn_fn",
+        "hc_ffn_base",
+        "hc_ffn_scale",
+        "hc_head_fn",
+        "hc_head_base",
+        "hc_head_scale",
+        "main_norm",
+        "attn_norm",
+        "ffn_norm",
+        "q_norm",
+        "kv_norm",
+        "norm",
+    ]
+    _keep_in_fp32_buffers_strict = ["ffn.gate.bias"]
     _supports_flex_attn = True
 
     @torch.no_grad()
@@ -666,6 +728,14 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
     @property
     def final_stage(self) -> DeepseekV4DSparkStage:
         return self.mtp[-1]
+
+    def fsdp_replicated_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return trainable FP32 parameters excluded from BF16 FSDP casting."""
+        return tuple(
+            parameter
+            for parameter in self.parameters()
+            if parameter.requires_grad and parameter.dtype == torch.float32
+        )
 
     def forward(
         self,
