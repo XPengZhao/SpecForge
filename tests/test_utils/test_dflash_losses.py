@@ -507,6 +507,46 @@ class TestDFlashLosses(unittest.TestCase):
         self.assertTrue(first[1].all())
         torch.testing.assert_close(first[2], draft_token_ids[:, [0, 3, 6]])
 
+    def test_dspark_opd_training_requires_trace_features(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            dspark_opd_loss_alpha=1.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires OPD trace features"):
+            model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+            )
+
+    def test_dspark_opd_eval_allows_dataset_without_trace_features(self):
+        model = _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            dspark_ce_loss_alpha=0.0,
+            dspark_l1_loss_alpha=0.0,
+            dspark_confidence_head_alpha=0.0,
+            dspark_opd_loss_alpha=1.0,
+        )
+        model.eval()
+
+        loss, accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=self.loss_mask,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(accuracy))
+        self.assertNotIn("opd_loss", metrics)
+
     def test_dspark_ce_only_skips_target_distribution(self):
         target_logits = torch.randn_like(self.logits)
         model = _make_dspark_model(

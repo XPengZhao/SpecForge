@@ -1387,11 +1387,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
         has_opd_features = all(value is not None for value in opd_values)
         if any(value is not None for value in opd_values) and not has_opd_features:
             raise ValueError("DSpark OPD requires all opd_* tensors")
-        use_opd = self.dspark_opd_loss_alpha > 0
-        if use_opd and not has_opd_features:
+        if self.training and self.dspark_opd_loss_alpha > 0 and not has_opd_features:
             raise ValueError(
                 "training.dspark_opd_loss_alpha > 0 requires OPD trace features"
             )
+        use_opd = self.dspark_opd_loss_alpha > 0 and has_opd_features
         selected_opd = None
         if use_opd and opd_anchor_positions is not None and opd_anchor_positions.size(1):
             assert opd_anchor_positions is not None
