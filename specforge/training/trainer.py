@@ -33,7 +33,10 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
-_DATA_SIZE_RESUME_KEYS = frozenset({"dataset_size", "source_dataset_size"})
+_DATA_POSITION_RESET_KEYS = frozenset(
+    {"dataset_size", "source_dataset_size", "sampler_shuffle"}
+)
+_LEGACY_RESUME_CONTRACT_DEFAULTS = {"sampler_shuffle": True}
 
 logger = logging.getLogger(__name__)
 
@@ -306,12 +309,16 @@ class Trainer:
                 **persisted_contract,
             }
             for key, current in resume_contract.items():
-                if resume_reset_data_position and key in _DATA_SIZE_RESUME_KEYS:
+                if resume_reset_data_position and key in _DATA_POSITION_RESET_KEYS:
                     continue
                 persisted = state.get(key)
                 persisted_available = key in state
                 comparison_current = current
                 comparison_persisted = persisted
+                if not persisted_available and key in _LEGACY_RESUME_CONTRACT_DEFAULTS:
+                    persisted = _LEGACY_RESUME_CONTRACT_DEFAULTS[key]
+                    comparison_persisted = persisted
+                    persisted_available = True
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
                     from specforge.training.provenance import (
                         model_provenance_for_resume_comparison,
@@ -336,7 +343,7 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "

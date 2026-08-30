@@ -472,6 +472,7 @@ def _build_offline(
         sp_ring_size=cfg.training.sp_ring_size,
         use_usp_preprocess=(cfg.training.attention_backend == "usp"),
         seed=cfg.training.seed,
+        offline_shuffle=cfg.data.offline_shuffle,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )

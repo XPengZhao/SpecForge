@@ -128,6 +128,8 @@ class DataConfig(StrictConfigModel):
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
+    #: Shuffle fixed offline feature refs independently for every epoch.
+    offline_shuffle: bool = True
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
     max_prompts: Optional[int] = Field(default=None, ge=0)
@@ -545,9 +547,9 @@ class TrainingConfig(StrictConfigModel):
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
     #: Keep optimizer/scheduler/global_step from ``resume_from``, but start the
-    #: new dump at epoch 0 / sample 0. Skips ``dataset_size`` /
-    #: ``source_dataset_size`` resume checks so a replacement shard can follow a
-    #: deleted offline dump. Requires ``resume_from``.
+    #: new dump at epoch 0 / sample 0. Skips dataset-size and sampler-shuffle
+    #: resume checks so a replacement shard can follow a deleted offline dump.
+    #: Requires ``resume_from``.
     resume_reset_data_position: bool = False
     #: ``all`` is an offline colocated run. Online runs launch producer and
     #: consumer as separate ``specforge train`` processes with the same config

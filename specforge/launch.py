@@ -538,6 +538,7 @@ def build_offline_runtime(
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
     seed: int = 0,
+    offline_shuffle: bool = True,
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
@@ -578,6 +579,7 @@ def build_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            shuffle=offline_shuffle,
         )
 
     refs = refs_for_epoch(0)
@@ -629,6 +631,7 @@ def build_offline_runtime(
         checkpoint_extra={
             "offline_sampler_version": 1,
             "sampler_seed": seed,
+            "sampler_shuffle": offline_shuffle,
             "source_dataset_size": len(source_refs),
         },
         max_checkpoints=max_checkpoints,
@@ -668,6 +671,7 @@ def build_disagg_offline_runtime(
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
     seed: int = 0,
+    offline_shuffle: bool = True,
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
@@ -699,6 +703,7 @@ def build_disagg_offline_runtime(
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
+            shuffle=offline_shuffle,
         )
 
     refs = refs_for_epoch(0)
@@ -754,6 +759,7 @@ def build_disagg_offline_runtime(
         checkpoint_extra={
             "offline_sampler_version": 1,
             "sampler_seed": seed,
+            "sampler_shuffle": offline_shuffle,
             "source_dataset_size": len(source_refs),
         },
         max_checkpoints=max_checkpoints,

@@ -76,6 +76,14 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_offline_shuffle_is_typed_and_defaults_on(self):
+        default = Config.model_validate(copy.deepcopy(MINIMAL))
+        self.assertTrue(default.data.offline_shuffle)
+
+        payload = copy.deepcopy(MINIMAL)
+        payload["data"]["offline_shuffle"] = False
+        self.assertFalse(Config.model_validate(payload).data.offline_shuffle)
+
     def test_liger_kernel_flag_is_typed_and_defaults_off(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertFalse(default.model.use_liger_kernel)

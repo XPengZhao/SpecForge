@@ -591,6 +591,7 @@ def build_training_run(
             num_epochs=t.num_epochs,
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
+            offline_shuffle=cfg.data.offline_shuffle,
             resume_from=t.resume_from,
             **_common_launch_kwargs(
                 cfg,

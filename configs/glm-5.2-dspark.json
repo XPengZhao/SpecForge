@@ -7,8 +7,8 @@
   "attention_dropout": 0.0,
   "bos_token_id": 0,
   "dflash_config": {
-    "block_size": 5,
-    "markov_rank": 256,
+    "block_size": 7,
+    "markov_rank": 512,
     "mask_token_id": 154821,
     "mlp_type": "dense",
     "num_layers": 3,

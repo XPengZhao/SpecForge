@@ -73,6 +73,7 @@ class TestEvalAssembly(unittest.TestCase):
                 "data": {
                     "hidden_states_path": "/train-features",
                     "eval_hidden_states_path": "/eval-features",
+                    "offline_shuffle": False,
                 },
                 "training": {"eval_interval": 7, "seed": 19},
             }
@@ -99,6 +100,7 @@ class TestEvalAssembly(unittest.TestCase):
         self.assertIs(run.trainer, trainer)
         self.assertEqual(build.call_args.kwargs["eval_interval"], 7)
         self.assertEqual(build.call_args.kwargs["seed"], 19)
+        self.assertFalse(build.call_args.kwargs["offline_shuffle"])
         self.assertEqual(
             build.call_args.kwargs["eval_hidden_states_path"], "/eval-features"
         )
@@ -201,6 +203,7 @@ class TestEvalLaunch(unittest.TestCase):
                 run_id="run",
                 output_dir="/out",
                 seed=31,
+                offline_shuffle=False,
             )
 
         self.assertIs(result, trainer)
@@ -211,6 +214,9 @@ class TestEvalLaunch(unittest.TestCase):
         )
         self.assertEqual(
             assemble.call_args.kwargs["checkpoint_extra"]["sampler_seed"], 31
+        )
+        self.assertFalse(
+            assemble.call_args.kwargs["checkpoint_extra"]["sampler_shuffle"]
         )
 
 

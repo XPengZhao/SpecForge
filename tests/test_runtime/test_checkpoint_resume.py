@@ -123,8 +123,16 @@ def _no_fsdp_wrap():
 
     orig = FSDPTrainingBackend.prepare_model
 
-    def unwrapped(self, model, *, wrap=True, optimizer_target=None):
-        return orig(self, model, wrap=False, optimizer_target=optimizer_target)
+    def unwrapped(
+        self, model, *, wrap=True, optimizer_target=None, activation_checkpointing="none"
+    ):
+        return orig(
+            self,
+            model,
+            wrap=False,
+            optimizer_target=optimizer_target,
+            activation_checkpointing=activation_checkpointing,
+        )
 
     with mock.patch.object(FSDPTrainingBackend, "prepare_model", unwrapped):
         yield
@@ -254,7 +262,11 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
 
         # Phase 2: resume through the production entrypoint (file:// URI).
         t2, model2, seen2 = self._make_trainer(
-            out, feat_dir=feat_dir, max_steps=4, resume_from=checkpoint_uri
+            out,
+            feat_dir=feat_dir,
+            max_steps=4,
+            resume_from=checkpoint_uri,
+            checkpoint_extra={"sampler_shuffle": True},
         )
         self.assertTrue(torch.equal(model2.draft_model.w.detach(), w_cut))
         # exact fp32 masters restored, not re-cloned from the trained weights
@@ -312,6 +324,21 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         ]
         scheduler_epoch = t1.backend.optimizer.scheduler.after_scheduler.last_epoch
 
+        with self.assertRaisesRegex(
+            ValueError, "sampler_shuffle=True but this run has sampler_shuffle=False"
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "shuffle-mismatch"),
+                feat_dir=feat_dir,
+                max_steps=4,
+                resume_from=checkpoint_uri,
+                dataset_size=8,
+                checkpoint_extra={
+                    "source_dataset_size": 8,
+                    "sampler_shuffle": False,
+                },
+            )
+
         smaller = _write_feature_files(os.path.join(workdir, "shard2"), n=4)
         t2, _model2, seen2 = self._make_trainer(
             os.path.join(workdir, "resume"),
@@ -320,7 +347,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             resume_from=checkpoint_uri,
             resume_reset_data_position=True,
             dataset_size=4,
-            checkpoint_extra={"source_dataset_size": 4},
+            checkpoint_extra={
+                "source_dataset_size": 4,
+                "sampler_shuffle": False,
+            },
         )
         ctrl = t2._controller
         self.assertEqual(
@@ -358,7 +388,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         t1, _model1, _seen1 = self._make_trainer(
             out,
             feat_dir=feat_dir,
-            max_steps=4,
+            max_steps=5,
             dataset_size=8,
             checkpoint_extra={"source_dataset_size": 8},
         )
