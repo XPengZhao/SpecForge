@@ -337,8 +337,10 @@ class Glm52DSparkModelTest(unittest.TestCase):
             device=anchor.device,
             context_window=model.context_window,
         )
-        self.assertFalse(windowed[0, 0, 0, :2].any())
-        self.assertTrue(windowed[0, 0, 0, 2:4].all())
+        # A vLLM window of 2 contains the current query and one historical
+        # context token, so only context position 3 is visible to anchor 4.
+        self.assertFalse(windowed[0, 0, 0, :3].any())
+        self.assertTrue(bool(windowed[0, 0, 0, 3]))
         self.assertFalse(bool(windowed[0, 0, 0, 4]))
 
     def test_every_stage_uses_dense_mlp(self):

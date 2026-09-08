@@ -70,7 +70,9 @@ def create_dflash_sdpa_mask(
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
     if context_window is not None:
-        first_context = anchor_expanded - int(context_window)
+        # Match vLLM's sliding-window convention: the configured window
+        # includes the current query, leaving window - 1 historical tokens.
+        first_context = anchor_expanded - int(context_window) + 1
         mask_context = mask_context & (kv_indices >= first_context)
 
     is_draft = kv_indices >= S
@@ -111,7 +113,9 @@ def create_dflash_block_mask(
         is_context = kv_idx < S
         mask_context = is_context & (kv_idx < anchor_pos)
         if context_window is not None:
-            first_context = anchor_pos - int(context_window)
+            # Match vLLM's sliding-window convention: the configured window
+            # includes the current query, leaving window - 1 historical tokens.
+            first_context = anchor_pos - int(context_window) + 1
             mask_context = mask_context & (kv_idx >= first_context)
 
         is_draft = kv_idx >= S
