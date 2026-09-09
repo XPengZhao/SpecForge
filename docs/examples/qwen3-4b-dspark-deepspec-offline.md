@@ -64,3 +64,31 @@ Local colocated training is recommended for large caches. The existing
 disaggregated offline ingestion path can also read this format and write native
 store samples, but that path copies tensors to the destination store and may
 require another cache-sized allocation; it is not the zero-conversion path.
+
+## Training log statistics
+
+DSpark training logs now aggregate every micro-batch in each logging window.
+With `log_interval=10` and accumulation 128, step 10 covers 1280 micro-batches
+per rank; step 20 covers the next 1280. Step 1 remains an early snapshot and
+**does not reset** the first window (unless the interval is 1). A final partial
+logging window is emitted at the stopping boundary. Resume starts a fresh
+window; it does not reconstruct metrics from before the checkpoint.
+
+- `loss`: DeepSpec console-compatible rank-0 mean of local, coefficient-weighted
+  per-micro-batch component losses over the window. Broadcast to all loggers.
+- `ce_loss`, `l1_loss`, `confidence_loss`, `confidence_abs_error`, position losses:
+  sum of local numerators across ranks and micro-batches divided by the matching
+  summed denominator. Position decay weights remain included for loss metrics.
+- `loss_weighted`: coefficients applied to these global window component means.
+  It need not equal `loss` when samples/ranks have different valid token counts.
+- `acc`: total correct tokens divided by total valid tokens across the window;
+  `accuracy_denom` is now that **global window total**, not the old last-batch
+  rank-average. This still measures teacher-forced token accuracy, not online MAL.
+- `log_micro_batches`: the number of micro-batches **per rank** in this window.
+- `lr`, `grad_norm`: values at the last optimizer update in the window.
+
+These changes affect logging only, not backward loss, gradients, optimizer,
+anchor sampling, or learning-rate scheduling. Existing running processes keep
+the old logging until restarted with the updated code. Evaluation retains its
+existing full-dataset aggregation. For comparisons, keep old and new logs in
+separate runs or mark the transition explicitly.

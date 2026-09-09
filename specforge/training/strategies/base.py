@@ -510,7 +510,35 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             ):
                 if name in model_metrics:
                     metrics[name] = model_metrics[name]
-        loss_mode = getattr(self.dspark_model, "dspark_loss_mode", "original")
+        # DDP does not forward arbitrary attributes; FSDP/DDP expose the
+        # underlying model as .module. Unwrap only to read loss metadata:
+        # forward/backward must still pass through self.dspark_model above.
+        loss_model = self.dspark_model
+        while hasattr(loss_model, "module"):
+            loss_model = loss_model.module
+        loss_mode = getattr(loss_model, "dspark_loss_mode", "original")
+        if self.dspark_model.training and "eval_metric_sums" in model_metrics:
+            sums = dict(model_metrics["eval_metric_sums"])
+            denoms = dict(model_metrics["eval_metric_denoms"])
+            components = ("kl",) if loss_mode == "kl" else ("ce", "l1")
+            weights = {
+                f"{name}_loss": float(getattr(loss_model, f"dspark_{name}_loss_alpha"))
+                for name in components
+            }
+            weights["confidence_loss"] = float(loss_model.dspark_confidence_head_alpha)
+            weights["opd_loss"] = float(loss_model.dspark_opd_loss_alpha)
+            weights = {name: weight for name, weight in weights.items() if weight and name in sums}
+            position_component = "kl" if loss_mode == "kl" else "ce"
+            for name in list(sums):
+                if name.startswith("mtp_") and name.endswith(f"_{position_component}"):
+                    alias = name.rsplit("_", 1)[0] + "_loss"
+                    sums[alias], denoms[alias] = sums[name], denoms[name]
+                if name.startswith("mtp_"):
+                    del sums[name], denoms[name]
+            if "acc_corrects" in model_metrics:
+                sums["acc"] = sum(model_metrics["acc_corrects"])
+                denoms["acc"] = sum(model_metrics["acc_denoms"])
+            metrics["log_window"] = {"sums": sums, "denoms": denoms, "weights": weights}
         loss_metric_names = (
             ("kl_loss",)
             if loss_mode == "kl"

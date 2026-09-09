@@ -1459,6 +1459,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if use_confidence_loss:
             eval_metric_sums["confidence_loss"] = confidence_loss_sum.detach()
             eval_metric_denoms["confidence_loss"] = ce_loss_den.detach()
+            eval_metric_sums["confidence_abs_error"] = confidence_abs_error_sum.detach()
+            eval_metric_denoms["confidence_abs_error"] = ce_loss_den.detach()
         return loss, metrics
 
     def forward(

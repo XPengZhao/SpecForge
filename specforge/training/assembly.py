@@ -279,7 +279,22 @@ def _logger(metrics, step):
                 printable[key] = [float(item) for item in value]
             except (TypeError, ValueError):
                 continue
-    print(f"step {step}: {printable}", flush=True)
+    loss_keys = ("train/loss", "loss", "eval/loss")
+    printable = {
+        **{key: printable[key] for key in loss_keys if key in printable},
+        **{key: value for key, value in printable.items() if key not in loss_keys},
+    }
+    timing = []
+    for name, label, scale, unit in (
+        ("elapsed_sec", "elapsed", 60, "min"),
+        ("log_interval_sec", "interval", 1, "s"),
+    ):
+        for key in (f"train/{name}", name):
+            if key in printable:
+                timing.append(f"{label}={printable.pop(key) / scale:.1f}{unit}")
+                break
+    suffix = " | " + " | ".join(timing) if timing else ""
+    print(f"step {step}: {printable}{suffix}", flush=True)
 
 
 def _configured_logger(cfg: Config):

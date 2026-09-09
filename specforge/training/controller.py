@@ -20,6 +20,7 @@ import itertools
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -241,6 +242,9 @@ class TrainerCore:
         self.backend = backend
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
+        from specforge.training.metric_window import MetricWindow
+
+        self.metric_window = MetricWindow()
 
     @property
     def accumulation_remainder(self) -> int:
@@ -258,6 +262,7 @@ class TrainerCore:
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
         grad_norm = self.backend.step() if stepped else None
+        self.metric_window.update(out.metrics.get("log_window"))
         return self._result(out, grad_norm, stepped)
 
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
@@ -464,6 +469,17 @@ class TrainerController:
             return self.global_step
         module = self.core.strategy.trainable_module()
         module.train()
+        self.core.metric_window.reset()
+        session_start = previous_log_time = time.monotonic()
+
+        def log_training(metrics):
+            nonlocal previous_log_time
+            now = time.monotonic()
+            metrics["elapsed_sec"] = now - session_start
+            metrics["log_interval_sec"] = now - previous_log_time
+            self.logger(metrics, self.global_step)
+            previous_log_time = now
+
         # Rank0-broadcast once: rank-local assembly must not let ranks enter or
         # skip the evaluator's collectives independently.
         eval_enabled = self._rank0_decision(
@@ -477,6 +493,7 @@ class TrainerController:
                     self.logger(eval_metrics, self.global_step)
                 self.last_metrics = {**self.last_metrics, **eval_metrics}
         pending_ack: List[str] = []
+        last_training_log_step = None
         for epoch in range(self.epoch, self.num_epochs):
             self.epoch = epoch
             if hasattr(data, "set_epoch"):
@@ -530,13 +547,25 @@ class TrainerController:
                 if self.logger and (
                     self.global_step == 1
                     or self.global_step % max(1, self.log_interval) == 0
+                    or (self.global_step == self.max_steps and self.core.metric_window.count)
                 ):
                     log_metrics = dict(result.metrics)
+                    window_metrics = self.core.metric_window.summary(
+                        reset=(self.global_step % max(1, self.log_interval) == 0
+                               or self.global_step == self.max_steps)
+                    )
+                    if window_metrics is not None:
+                        log_metrics = window_metrics
+                        if result.grad_norm is not None:
+                            log_metrics["grad_norm"] = result.grad_norm
                     optimizer = getattr(self.core.backend, "optimizer", None)
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
-                    self.logger(log_metrics, self.global_step)
+                    log_training(log_metrics)
+                    last_training_log_step = self.global_step
+                    if window_metrics is not None:
+                        self.last_metrics = log_metrics
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
                     eval_metrics = self.evaluate_configured()
@@ -579,6 +608,18 @@ class TrainerController:
                 "micro-batches after the last optimizer step; no partial "
                 "optimizer step or durable acknowledgement was committed"
             )
+        if self.logger and self.core.metric_window.count:
+            # Natural exhaustion can end between log intervals. Emit the
+            # completed updates since the last log, just as for a max_steps cap.
+            log_metrics = self.core.metric_window.summary()
+            if self.last_metrics.get("grad_norm") is not None:
+                log_metrics["grad_norm"] = self.last_metrics["grad_norm"]
+            optimizer = getattr(self.core.backend, "optimizer", None)
+            if callable(getattr(optimizer, "get_learning_rate", None)):
+                log_metrics["lr"] = float(optimizer.get_learning_rate())
+            if last_training_log_step != self.global_step:
+                log_training(log_metrics)
+            self.last_metrics = log_metrics
         return self.global_step
 
     def close_profiler(self) -> None:
