@@ -88,7 +88,7 @@ def normalize_offline_dspark_sample(raw, max_len: int):
 
     input_ids = raw["input_ids"][:max_len].unsqueeze(0)
     loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
-    if loss_mask.numel() > 0:
+    if loss_mask.numel() > 0 and not raw.get("loss_mask_is_token_aligned", False):
         loss_mask[0, -1] = 0
 
     def normalize_hidden_state(key):
@@ -159,6 +159,14 @@ def build_offline_dspark_reader(
     max_len,
 ):
     from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+    from specforge.runtime.data_plane.deepspec_cache import (
+        DeepSpecCacheReader, is_deepspec_cache,
+    )
+
+    if is_deepspec_cache(hidden_states_path):
+        return DeepSpecCacheReader(
+            hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len,
+        )
 
     return OfflineManifestReader(
         hidden_states_path,
@@ -170,7 +178,7 @@ def build_offline_dspark_reader(
             "aux_hidden_state",
             "hidden_state",
         ),
-        optional_feature_keys=DSPARK_OPD_KEYS,
+        optional_feature_keys=DSPARK_OPD_KEYS + ("loss_mask_is_token_aligned",),
         target_repr="hidden_state",
         ttt_length=ttt_length,
         max_len=max_len,

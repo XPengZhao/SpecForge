@@ -175,6 +175,20 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
         trust_remote_code=cfg.model.trust_remote_code,
     )
     text_config = _target_text_config(target_config)
+    if cfg.mode == "offline":
+        from specforge.runtime.data_plane.deepspec_cache import (
+            DeepSpecCacheReader, is_deepspec_cache,
+        )
+
+        for path in (cfg.data.hidden_states_path, cfg.data.eval_hidden_states_path):
+            if path and is_deepspec_cache(path):
+                if algorithm.name != "dspark":
+                    raise ValueError("DeepSpec target caches currently require strategy=dspark")
+                DeepSpecCacheReader(path).validate_model(
+                    hidden_size=draft_config.hidden_size,
+                    target_layer_ids=draft_model.target_layer_ids,
+                    target_model_path=cfg.model.target_model_path,
+                )
     target_hidden_size = int(text_config.hidden_size)
     target_vocab_size = int(text_config.vocab_size)
     draft_vocab_size = int(

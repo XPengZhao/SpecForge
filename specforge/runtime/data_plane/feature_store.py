@@ -376,7 +376,12 @@ class LocalFeatureStore(FeatureStore):
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         uri = sample_ref.feature_store_uri
         wanted = names or list(sample_ref.feature_keys.keys())
-        if uri.startswith("file://"):
+        if uri.startswith("deepspec://"):
+            from .deepspec_cache import read_deepspec_features
+
+            tensors = read_deepspec_features(sample_ref, wanted)
+            handle = self._register_file_lease(sample_ref)
+        elif uri.startswith("file://"):
             tensors = self._get_from_file(uri[len("file://") :], sample_ref, wanted)
             handle = self._register_file_lease(sample_ref)
         else:

@@ -59,6 +59,30 @@ def ingest_offline_features(
         ttt_length=ttt_length,
         max_len=max_len,
     )
+    from specforge.runtime.data_plane.deepspec_cache import DeepSpecCacheReader
+
+    if isinstance(reader, DeepSpecCacheReader):
+        # Reuse the normal store write protocol, including the token-aligned
+        # mask marker. This mode copies selected samples; local training reads
+        # original shards directly and is preferred for large caches.
+        from itertools import islice
+        from specforge.runtime.data_plane.feature_store import LocalFeatureStore
+
+        source = LocalFeatureStore(run_id)
+        refs = []
+        for original in islice(reader, limit):
+            tensors, handle = source.get(original)
+            source.release(handle)
+            ref = store.put(
+                tensors, sample_id=original.sample_id,
+                metadata={**original.metadata, "run_id": run_id,
+                          "strategy": algorithm_name, "num_tokens": original.num_tokens,
+                          "target_model_version": original.target_model_version},
+            )
+            refs.append(ref)
+            if on_ref is not None:
+                on_ref(ref)
+        return refs
     feature_keys = tuple(reader.feature_keys)
     paths = list_feature_files(hidden_states_path)
     if limit is not None:
