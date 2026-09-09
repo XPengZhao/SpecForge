@@ -82,38 +82,30 @@ class Glm52DSparkAttention(nn.Module):
             getattr(config, "attention_chunk_size", 256)
         )
 
-        self.q_proj = (
-            nn.Linear(
+        if self.q_lora_rank is None:
+            self.q_proj = nn.Linear(
                 config.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
             )
-            if self.q_lora_rank is None
-            else None
-        )
-        self.q_a_proj = (
-            nn.Linear(
+            self.q_a_proj = None
+            self.q_a_layernorm = None
+            self.q_b_proj = None
+        else:
+            self.q_proj = None
+            self.q_a_proj = nn.Linear(
                 config.hidden_size,
                 self.q_lora_rank,
                 bias=config.attention_bias,
             )
-            if self.q_lora_rank is not None
-            else None
-        )
-        self.q_a_layernorm = (
-            GlmMoeDsaRMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            if self.q_lora_rank is not None
-            else None
-        )
-        self.q_b_proj = (
-            nn.Linear(
+            self.q_a_layernorm = GlmMoeDsaRMSNorm(
+                self.q_lora_rank, eps=config.rms_norm_eps
+            )
+            self.q_b_proj = nn.Linear(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
             )
-            if self.q_lora_rank is not None
-            else None
-        )
         self.kv_a_proj_with_mqa = nn.Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -247,6 +239,7 @@ class Glm52DSparkAttention(nn.Module):
                 f"query_length={query_length}, block_size={block_size}"
             )
         num_blocks = query_length // block_size
+        block_shape = (batch_size, num_heads, num_blocks, block_size)
         mask = attention_mask.bool()
         key = key.float()
         value = value.float()
@@ -282,26 +275,10 @@ class Glm52DSparkAttention(nn.Module):
             block_size,
         ).diagonal(dim1=2, dim2=4)
         diagonal_mask = diagonal_mask.permute(0, 1, 4, 2, 3).contiguous()
-        query_blocks = query.reshape(
-            batch_size,
-            num_heads,
-            num_blocks,
-            block_size,
-            key_dim,
-        ).float()
-        draft_key = key[:, :, context_length:].reshape(
-            batch_size,
-            num_heads,
-            num_blocks,
-            block_size,
-            key_dim,
-        )
+        query_blocks = query.reshape(*block_shape, key_dim).float()
+        draft_key = key[:, :, context_length:].reshape(*block_shape, key_dim)
         draft_value = value[:, :, context_length:].reshape(
-            batch_size,
-            num_heads,
-            num_blocks,
-            block_size,
-            self.v_head_dim,
+            *block_shape, self.v_head_dim
         )
         draft_scores = torch.matmul(
             query_blocks,
@@ -320,19 +297,8 @@ class Glm52DSparkAttention(nn.Module):
         draft_output = torch.matmul(draft_probabilities, draft_value)
         draft_lse = torch.logsumexp(draft_scores, dim=-1)
 
-        context_output = context_output.reshape(
-            batch_size,
-            num_heads,
-            num_blocks,
-            block_size,
-            self.v_head_dim,
-        )
-        context_lse = context_lse.reshape(
-            batch_size,
-            num_heads,
-            num_blocks,
-            block_size,
-        )
+        context_output = context_output.reshape(*block_shape, self.v_head_dim)
+        context_lse = context_lse.reshape(*block_shape)
         total_lse = torch.logaddexp(context_lse, draft_lse)
         context_weight = torch.exp(context_lse - total_lse)
         draft_weight = torch.exp(draft_lse - total_lse)
