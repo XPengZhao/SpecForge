@@ -473,6 +473,7 @@ def _build_offline(
         use_usp_preprocess=(cfg.training.attention_backend == "usp"),
         seed=cfg.training.seed,
         offline_shuffle=cfg.data.offline_shuffle,
+        dspark_supervision=cfg.data.dspark_supervision,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )

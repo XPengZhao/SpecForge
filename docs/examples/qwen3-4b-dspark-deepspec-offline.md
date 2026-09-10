@@ -92,3 +92,35 @@ anchor sampling, or learning-rate scheduling. Existing running processes keep
 the old logging until restarted with the updated code. Evaluation retains its
 existing full-dataset aggregation. For comparisons, keep old and new logs in
 separate runs or mark the transition explicitly.
+
+### Prompt + response supervision ablation
+
+The default `data.dspark_supervision=response` preserves the cached response
+mask. Set `data.dspark_supervision=full_sequence` to supervise all real tokens
+in each cached sequence, including prompt and chat-template tokens. This option
+currently requires offline DSpark with token-aligned, unpadded DeepSpec v2
+features (or their native roundtrip) and does not support fixed OPD anchors.
+The cache is reused without rewriting or recapturing hidden states.
+
+The mask is expanded before batch collation, so padding and out-of-range labels
+remain excluded. Both anchor sampling and CE/L1/confidence supervision use the
+expanded mask; the anchor budget remains 512. This samples anchors across the
+full sequence rather than exhaustively training every token on every step.
+Evaluation retains the original cached response mask for comparison.
+
+Start a separate run from the same initialization and training schedule:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -m specforge.cli train \
+  -c examples/configs/qwen3-4b-dspark-deepspec-offline.yaml \
+  data.dspark_supervision=full_sequence \
+  training.max_steps=2616 \
+  tracking.report_to=tensorboard \
+  run_id=qwen3-4b-deepspec-full-sequence \
+  output_dir=outputs/qwen3-4b-deepspec-full-sequence
+```
+
+Here `total_steps` stays at the baseline 26160 to preserve its learning-rate
+schedule. Training loss/accuracy/acceptance metrics now include prompt targets;
+compare response-only evaluation and identical inference MAL, rather than
+interpreting their difference from response-only training metrics as improvement.

@@ -130,6 +130,8 @@ class DataConfig(StrictConfigModel):
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     #: Shuffle fixed offline feature refs independently for every epoch.
     offline_shuffle: bool = True
+    #: DSpark offline training only; evaluation retains the stored response mask.
+    dspark_supervision: Literal["response", "full_sequence"] = "response"
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
     max_prompts: Optional[int] = Field(default=None, ge=0)
@@ -693,6 +695,10 @@ class Config(StrictConfigModel):
                 "online training requires deployment.mode=disaggregated; "
                 "colocated online training is no longer supported"
             )
+        if self.data.dspark_supervision == "full_sequence" and (
+            mode != "offline" or self.training.strategy != "dspark"
+        ):
+            raise ValueError("data.dspark_supervision=full_sequence requires offline DSpark training")
         if mode == "online" and self.model.target_backend != "sglang":
             raise ValueError(
                 "online training uses an external SGLang capture server and "

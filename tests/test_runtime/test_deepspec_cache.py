@@ -48,6 +48,29 @@ def write_fixture(root):
 
 
 class TestDeepSpecCache(unittest.TestCase):
+    def test_full_sequence_supervision_before_padding(self):
+        store = LocalFeatureStore()
+        samples = []
+        for ref in self.reader(max_len=4):
+            raw, handle = store.get(ref)
+            store.release(handle)
+            original = raw['loss_mask'].clone()
+            response = normalize_offline_dspark_sample(raw, 4)
+            full = normalize_offline_dspark_sample(raw, 4, 'full_sequence')
+            self.assertEqual(response['loss_mask'][0, 0].item(), 0)
+            self.assertTrue(full['loss_mask'].bool().all())
+            torch.testing.assert_close(raw['loss_mask'], original)
+            for key in ('input_ids', 'hidden_states', 'target_last_hidden_states'):
+                torch.testing.assert_close(response[key], full[key])
+            samples.append(full)
+        batch = build_dspark_collator()(samples)
+        torch.testing.assert_close(batch['loss_mask'], torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]], dtype=torch.uint8))
+        # Candidate anchors need both the anchor and its first target valid.
+        candidates = batch['loss_mask'][:, :-1].bool() & batch['loss_mask'][:, 1:].bool()
+        self.assertEqual(candidates.sum(dim=-1).tolist(), [3, 2])
+        with self.assertRaisesRegex(ValueError, 'token-aligned'):
+            normalize_offline_dspark_sample(self.expected[0], 4, 'full_sequence')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -83,11 +83,21 @@ def build_offline_normalizer(max_len, **_topology):
     return partial(normalize_offline_sample, max_len=max_len)
 
 
-def normalize_offline_dspark_sample(raw, max_len: int):
+def normalize_offline_dspark_sample(raw, max_len: int, dspark_supervision="response"):
     """Map stored target captures to the DSpark training feature names."""
 
     input_ids = raw["input_ids"][:max_len].unsqueeze(0)
     loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
+    if dspark_supervision not in ("response", "full_sequence"):
+        raise ValueError(f"Unknown DSpark supervision: {dspark_supervision}")
+    if dspark_supervision == "full_sequence":
+        if not raw.get("loss_mask_is_token_aligned", False):
+            raise ValueError("Full-sequence DSpark requires a token-aligned, unpadded cache (DeepSpec v2)")
+        if any(key in raw for key in DSPARK_OPD_KEYS):
+            raise ValueError("Full-sequence DSpark does not support fixed OPD response anchors")
+        # Before collation: only real cached tokens become supervised.
+        # The collator still pads loss_mask with zeros.
+        loss_mask.fill_(1)
     if loss_mask.numel() > 0 and not raw.get("loss_mask_is_token_aligned", False):
         loss_mask[0, -1] = 0
 
@@ -185,8 +195,11 @@ def build_offline_dspark_reader(
     )
 
 
-def build_offline_dspark_normalizer(max_len, **_topology):
-    return partial(normalize_offline_dspark_sample, max_len=max_len)
+def build_offline_dspark_normalizer(max_len, dspark_supervision="response", **_topology):
+    return partial(
+        normalize_offline_dspark_sample, max_len=max_len,
+        dspark_supervision=dspark_supervision,
+    )
 
 
 def build_collator():

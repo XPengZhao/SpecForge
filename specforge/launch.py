@@ -164,13 +164,19 @@ def _offline_io(
     *,
     ttt_length: int,
     use_usp_preprocess: bool,
+    dspark_supervision: str = "response",
 ):
     """Resolve the algorithm-owned normalizer and collator for one modality."""
     provider = algorithm.providers.offline_for(modality)
+    supervision_kwargs = (
+        {"dspark_supervision": dspark_supervision}
+        if dspark_supervision != "response" else {}
+    )
     return provider.build_collator(), provider.build_normalizer(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        **supervision_kwargs,
     )
 
 
@@ -539,6 +545,7 @@ def build_offline_runtime(
     use_usp_preprocess: bool = False,
     seed: int = 0,
     offline_shuffle: bool = True,
+    dspark_supervision: str = "response",
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
@@ -563,6 +570,7 @@ def build_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        dspark_supervision=dspark_supervision,
     )
     controller = DataFlowController(
         run_id,
@@ -672,6 +680,7 @@ def build_disagg_offline_runtime(
     use_usp_preprocess: bool = False,
     seed: int = 0,
     offline_shuffle: bool = True,
+    dspark_supervision: str = "response",
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
@@ -694,6 +703,7 @@ def build_disagg_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        dspark_supervision=dspark_supervision,
     )
     source_refs = list(refs)
 
