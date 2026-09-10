@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.algorithms.common.dspark_metrics import acceptance_stats
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -1285,6 +1286,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         position_denoms = []
         eval_metric_sums = {}
         eval_metric_denoms = {}
+        accept_rates = []
         use_confidence_loss = (
             confidence_pred is not None and self.dspark_confidence_head_alpha > 0
         )
@@ -1361,6 +1363,23 @@ class OnlineDSparkModel(OnlineDFlashModel):
             else:
                 kl_position_sum = kl_p.new_zeros(())
 
+            if aligned_target_logits is not None:
+                with torch.no_grad():
+                    # Reuse the loss's L1 when available; KL/CE-only runs
+                    # still need actual distribution overlap for this metric.
+                    if tl_p is not None and (
+                        (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
+                        or cconf_p is not None
+                        or not self.training
+                    ):
+                        metric_l1 = l1_p.detach()
+                    else:
+                        metric_l1 = (
+                            dl_p.float().softmax(dim=-1)
+                            - aligned_target_logits[:, :, position, :].float().softmax(dim=-1)
+                        ).abs().sum(dim=-1)
+                    accept_rates.append((1.0 - 0.5 * metric_l1).clamp(0.0, 1.0))
+
             position_sum = (
                 ce_position_sum
                 if self.dspark_loss_mode == "original"
@@ -1378,6 +1397,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     confidence_abs_error_sum = confidence_abs_error_sum + (
                         (cconf_p.float().sigmoid() - accept_p).abs() * wmask_p
                     ).sum()
+
+        if accept_rates:
+            accept_sums, accept_denoms = acceptance_stats(
+                torch.stack(accept_rates, dim=-1), eval_mask
+            )
+            eval_metric_sums.update(accept_sums)
+            eval_metric_denoms.update(accept_denoms)
 
         if self.dspark_loss_mode == "original":
             objective_sum = (
