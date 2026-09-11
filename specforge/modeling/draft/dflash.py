@@ -1,4 +1,5 @@
 from typing import Callable, Optional
+from copy import deepcopy
 
 import torch
 from torch import nn
@@ -149,7 +150,16 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(
+        attention_type = getattr(config, "draft_attention_type", "gqa")
+        if attention_type == "mla":
+            from .dspark_mla import DSparkMLAAttention
+
+            attention_class = DSparkMLAAttention
+        elif attention_type == "gqa":
+            attention_class = Qwen3DFlashAttention
+        else:
+            raise ValueError(f"Unsupported draft_attention_type: {attention_type!r}")
+        self.self_attn = attention_class(
             config=config,
             layer_idx=layer_idx,
             kernels=kernels,
@@ -290,7 +300,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        rotary_config = config
+        if getattr(config, "draft_attention_type", "gqa") == "mla":
+            rotary_config = deepcopy(config)
+            rotary_config.head_dim = config.mla_qk_rope_head_dim
+        self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,
