@@ -63,3 +63,36 @@ identical. Parameter counts and initialization differ across attention types;
 report them alongside loss, positional acceptance, and inference MAL. Equal
 seeds do not imply identical initialization for the shared layers after attention
 modules consume different amounts of randomness.
+
+## MLA + SWA 128
+
+Use `examples/configs/qwen3-4b-dspark-mla-swa128-offline.yaml`. Its draft JSON
+sets `dspark_context_window=128`; all five layers use the existing DSpark
+block mask with history positions `[max(0, anchor-127), anchor)`. All tokens in
+the same draft block remain mutually visible, and other draft blocks remain
+invisible. This is a block-anchored context-window ablation, not per-query
+causal sliding attention. To retain 128 strictly historical tokens, use 129.
+
+Do not enable Qwen's `layer_types=sliding_attention` or backend
+`sliding_window` here: the packed training layout does not use contiguous
+logical query positions. The explicit SDPA/Flex block mask enforces the window.
+Only draft attention is windowed; cached target features still encode the
+original full-context target forward. Anchor sampling and the loss are unchanged.
+
+Start a fresh run with the same schedule as the MLA full-context baseline:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -m specforge.cli train \
+  -c examples/configs/qwen3-4b-dspark-mla-swa128-offline.yaml \
+  training.max_steps=2 training.log_interval=1 training.save_interval=2 \
+  tracking.report_to=tensorboard \
+  run_id=qwen3-4b-mla-swa128-smoke \
+  output_dir=outputs/qwen3-4b-mla-swa128-smoke
+```
+
+For one epoch, start a fresh run/output and set max_steps=2616,
+log_interval=10, save_interval=2616, retaining total_steps=26160.
+The new field is persisted in checkpoints. Offline evaluation uses the same
+window mask. Generic unmasked generation now raises for windowed drafts;
+inference must supply an equivalent mask before comparing MAL. This training
+change does not implement cache eviction or a windowed serving adapter.

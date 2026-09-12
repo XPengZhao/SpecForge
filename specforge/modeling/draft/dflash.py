@@ -288,6 +288,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         super().__init__(config)
         self.config = config
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
+        self.context_window = getattr(config, "dspark_context_window", None)
+        if self.context_window is not None and (
+            not isinstance(self.context_window, int)
+            or isinstance(self.context_window, bool)
+            or self.context_window < 1
+        ):
+            raise ValueError("dspark_context_window must be a positive integer or null")
         self.layers = nn.ModuleList(
             [
                 Qwen3DFlashDecoderLayer(config, layer_idx, kernels)
@@ -385,6 +392,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        if self.context_window is not None and attention_mask is None:
+            raise ValueError(
+                "Windowed draft attention requires an explicit block/context mask; "
+                "the unmasked generation path does not implement dspark_context_window."
+            )
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:

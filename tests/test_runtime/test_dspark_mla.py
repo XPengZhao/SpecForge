@@ -27,6 +27,39 @@ def config(kind='mla'):
 
 
 class TestMLA(unittest.TestCase):
+    def test_swa_mask_and_roundtrip(self):
+        from specforge.algorithms.common.dflash_family_model import create_dflash_sdpa_mask
+
+        c=config();c.dspark_context_window=128
+        m=DSparkDraftModel(c).eval()
+        anchors=torch.tensor([[150, 10]])
+        keep=torch.tensor([[True, False]])
+        mask=create_dflash_sdpa_mask(anchors,keep,160,3,'cpu',context_window=m.context_window)
+        self.assertEqual(mask[0,0,0,:160].sum().item(),127)
+        self.assertFalse(mask[0,0,0,22])
+        self.assertTrue(mask[0,0,0,23])
+        self.assertTrue(mask[0,0,0,149])
+        self.assertFalse(mask[0,0,0,150])
+        self.assertTrue(mask[0,0,:3,160:163].all())
+        self.assertFalse(mask[0,0,:3,163:].any())
+        self.assertFalse(mask[0,0,3:].any())
+        # All valid queries must be insensitive to context outside the window.
+        mask=mask[:,:,:3,:163]
+        mask=torch.zeros_like(mask,dtype=torch.float32).masked_fill(~mask,float('-inf'))
+        ctx=torch.randn(1,160,32);noise=torch.randn(1,3,32)
+        kw=dict(position_ids=torch.cat((torch.arange(160),torch.arange(150,153))).unsqueeze(0),
+                noise_embedding=noise,target_hidden=ctx,attention_mask=mask)
+        expected=m(**kw)
+        changed=ctx.clone();changed[:,:23]+=100
+        torch.testing.assert_close(m(**{**kw,'target_hidden':changed}),expected)
+        with self.assertRaisesRegex(ValueError,'explicit block/context mask'):
+            m(**{**kw,'attention_mask':None})
+        with tempfile.TemporaryDirectory() as root:
+            m.save_pretrained(root)
+            restored=DSparkDraftModel.from_pretrained(root,attn_implementation='eager').eval()
+            self.assertEqual(restored.context_window,128)
+            torch.testing.assert_close(restored(**kw),expected)
+
     def test_explicit_reference_and_sdpa_gradients(self):
         torch.manual_seed(4)
         c=config(); m=DSparkMLAAttention(c,0,DEFAULT_DFLASH_KERNELS)
