@@ -14,6 +14,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
     eager_attention_forward,
     rotate_half,
+    repeat_kv,
 )
 from typing_extensions import Tuple, Unpack
 
@@ -38,6 +39,30 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def context_only_eager_attention(module, q, k, v, attention_mask, dropout=0.0,
+                                 scaling=None, **kwargs):
+    """Dense reference that defines an empty attention row as zero output."""
+    k = repeat_kv(k, module.num_key_value_groups)
+    v = repeat_kv(v, module.num_key_value_groups)
+    scores = (q @ k.transpose(-1, -2)) * scaling
+    if attention_mask.dtype == torch.bool:
+        allowed = attention_mask
+        scores = scores.masked_fill(~allowed, float("-inf"))
+    else:
+        allowed = torch.isfinite(attention_mask) & (
+            attention_mask > torch.finfo(attention_mask.dtype).min
+        )
+        scores = scores + attention_mask
+    has_context = allowed.any(dim=-1, keepdim=True)
+    # Avoid softmax(-inf, ..., -inf) and its NaN backward, without
+    # exposing any extra K/V: empty rows' probabilities are exactly zero.
+    scores = torch.where(has_context, scores, torch.zeros_like(scores))
+    weights = scores.float().softmax(dim=-1).to(q.dtype)
+    weights = torch.where(has_context, weights, torch.zeros_like(weights))
+    weights = torch.nn.functional.dropout(weights, p=dropout, training=module.training)
+    return (weights @ v).transpose(1, 2).contiguous(), weights
 
 
 class Qwen3DFlashAttention(nn.Module):
@@ -122,6 +147,8 @@ class Qwen3DFlashAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         attn_fn: Callable = eager_attention_forward
+        if getattr(self.config, "dspark_block_attention", "bidirectional") == "context_only":
+            attn_fn = context_only_eager_attention
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         attn_output, attn_weights = attn_fn(
@@ -370,6 +397,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        if getattr(self.config, "dspark_block_attention", "bidirectional") == "context_only" and attention_mask is None:
+            raise ValueError("Block attention ablations require an explicit attention mask; unmasked generation is unsupported")
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

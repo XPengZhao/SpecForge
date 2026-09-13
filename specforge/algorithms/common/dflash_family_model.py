@@ -53,7 +53,10 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     context_window=None,
+    block_attention="bidirectional",
 ):
+    if block_attention not in ("bidirectional", "context_only"):
+        raise ValueError(f"Unknown block_attention: {block_attention}")
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -80,6 +83,9 @@ def create_dflash_sdpa_mask(
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
 
+    if block_attention == "context_only":
+        mask_draft = torch.zeros_like(mask_draft)
+
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
     final_mask = (mask_context | mask_draft) & valid_block
@@ -93,6 +99,7 @@ def create_dflash_block_mask(
     block_size: int,
     device: torch.device,
     context_window: Optional[int] = None,
+    block_attention: str = "bidirectional",
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -101,10 +108,13 @@ def create_dflash_block_mask(
 
     Rules:
       1. Each block sees the configured context window strictly before its anchor.
-      2. Intra-block attention is bidirectional.
+      2. Intra-block attention is bidirectional or disabled (context-only).
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
     """
+
+    if block_attention not in ("bidirectional", "context_only"):
+        raise ValueError(f"Unknown block_attention: {block_attention}")
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
@@ -122,6 +132,9 @@ def create_dflash_block_mask(
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
+
+        if block_attention == "context_only":
+            mask_draft = torch.zeros_like(mask_draft)
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
@@ -317,6 +330,7 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
+                block_attention=getattr(self.draft_model.config, "dspark_block_attention", "bidirectional"),
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
@@ -326,6 +340,7 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
+                block_attention=getattr(self.draft_model.config, "dspark_block_attention", "bidirectional"),
             )
 
         output_hidden = self.draft_model(

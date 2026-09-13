@@ -286,6 +286,8 @@ class DSparkDraftModel(DFlashDraftModel):
     expected_projector_type = "dspark"
 
     def __init__(self, config) -> None:
+        if getattr(config, "dspark_block_attention", "bidirectional") not in ("bidirectional", "context_only"):
+            raise ValueError("dspark_block_attention must be bidirectional or context_only")
         dflash_config = getattr(config, "dflash_config", None) or {}
         projector_type = dflash_config.get("projector_type")
         if projector_type is None:
