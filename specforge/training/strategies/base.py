@@ -525,6 +525,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 f"{name}_loss": float(getattr(loss_model, f"dspark_{name}_loss_alpha"))
                 for name in components
             }
+            weights["tau_loss"] = float(getattr(loss_model, "dspark_tau_loss_alpha", 0.0))
             weights["confidence_loss"] = float(loss_model.dspark_confidence_head_alpha)
             weights["opd_loss"] = float(loss_model.dspark_opd_loss_alpha)
             weights = {name: weight for name, weight in weights.items() if weight and name in sums}

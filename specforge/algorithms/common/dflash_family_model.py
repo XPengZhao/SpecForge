@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.algorithms.common.dspark_metrics import acceptance_stats
+from specforge.algorithms.common.dspark_metrics import acceptance_stats, tau_loss_terms
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -748,6 +748,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_kl_loss_alpha: float = 1.0,
         dspark_confidence_head_alpha: float = 1.0,
+        dspark_tau_loss_alpha: float = 0.0,
         dspark_opd_loss_alpha: float = 0.0,
         dspark_opd_forward_weight: float = 1.0,
         dspark_opd_rejected_weight: float = 1.0,
@@ -799,6 +800,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_kl_loss_alpha = float(dspark_kl_loss_alpha)
+        if not math.isfinite(dspark_tau_loss_alpha) or dspark_tau_loss_alpha < 0:
+            raise ValueError("dspark_tau_loss_alpha must be finite and >= 0")
+        self.dspark_tau_loss_alpha = float(dspark_tau_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
         self.dspark_opd_loss_alpha = float(dspark_opd_loss_alpha)
         self.dspark_opd_forward_weight = float(dspark_opd_forward_weight)
@@ -1234,6 +1238,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             tl_p is not None
             and (
                 (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
+                or self.dspark_tau_loss_alpha > 0
                 or cconf_p is not None
                 or not self.training
             )
@@ -1287,6 +1292,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_metric_sums = {}
         eval_metric_denoms = {}
         accept_rates = []
+        tau_accept_rates = []
         use_confidence_loss = (
             confidence_pred is not None and self.dspark_confidence_head_alpha > 0
         )
@@ -1294,6 +1300,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             self.dspark_loss_mode == "kl"
             or self.dspark_l1_loss_alpha > 0
             or use_confidence_loss
+            or self.dspark_tau_loss_alpha > 0
             or not self.training
         )
         if (
@@ -1302,6 +1309,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 self.dspark_loss_mode == "kl"
                 or self.dspark_l1_loss_alpha > 0
                 or use_confidence_loss
+                or self.dspark_tau_loss_alpha > 0
             )
         ):
             raise ValueError(
@@ -1338,6 +1346,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 ce_p, l1_p, kl_p, conf_err_p = self._pos_loss(
                     dl_p, tl_p, tids_p, cconf_p
                 )
+
+            if self.dspark_tau_loss_alpha > 0:
+                tau_accept_rates.append((1.0 - 0.5 * l1_p).clamp(0.0, 1.0))
 
             ce_position_sum = (ce_p * wmask_p).sum()
             position_denom = wmask_p.sum()
@@ -1416,6 +1427,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 self.dspark_kl_loss_alpha * kl_loss_sum
                 + self.dspark_confidence_head_alpha * confidence_loss_sum
             )
+        if self.dspark_tau_loss_alpha > 0:
+            tau_num, tau_den = tau_loss_terms(torch.stack(tau_accept_rates, dim=-1), eval_mask)
+            eval_metric_sums["tau_loss"] = tau_num.detach()
+            eval_metric_denoms["tau_loss"] = tau_den.detach()
+
         global_stats = torch.stack(
             (
                 ce_loss_den.detach(),
@@ -1426,6 +1442,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 confidence_abs_error_sum.detach(),
                 *(value.detach() for value in position_sums),
                 *(value.detach() for value in position_denoms),
+                *([tau_den.detach()] if self.dspark_tau_loss_alpha > 0 else []),
             )
         )
         world_size = 1
@@ -1441,6 +1458,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         # FSDP averages gradients across ranks. Scale each rank's local
         # numerator so the resulting gradient is sum(N_r) / sum(D_r).
         loss = objective_sum * world_size / global_denominator
+        if self.dspark_tau_loss_alpha > 0:
+            loss = loss + self.dspark_tau_loss_alpha * tau_num * world_size / global_stats[-1].clamp_min(1.0)
         position_offset = 6
         global_position_sums = global_stats[
             position_offset : position_offset + self.block_size
@@ -1654,6 +1673,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     "confidence_loss": self.dspark_confidence_head_alpha,
                     "opd_loss": self.dspark_opd_loss_alpha,
                 }
+            objective_weights["tau_loss"] = self.dspark_tau_loss_alpha
             metrics["eval_objective_weights"] = {
                 name: weight
                 for name, weight in objective_weights.items()

@@ -110,6 +110,10 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    tau_alpha = float(getattr(training_model, "dspark_tau_loss_alpha", 0.0))
+    if tau_alpha > 0:
+        contract["dspark_tau_loss_alpha"] = tau_alpha
+        contract["dspark_tau_objective_version"] = "mean_valid_block_prefix_deficit_v1"
     return contract
 
 

@@ -441,6 +441,7 @@ def build_dspark_model(
         lambda common: OnlineDSparkModel(
             **common,
             dspark_loss_mode=cfg.training.dspark_loss_mode,
+            dspark_tau_loss_alpha=cfg.training.dspark_tau_loss_alpha,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_kl_loss_alpha=cfg.training.dspark_kl_loss_alpha,

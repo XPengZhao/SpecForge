@@ -510,6 +510,7 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_kl_loss_alpha: float = Field(default=1.0, ge=0.0)
+    dspark_tau_loss_alpha: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     dspark_confidence_head_alpha: float = 1.0
     dspark_opd_loss_alpha: float = Field(default=0.0, ge=0.0)
     dspark_opd_forward_weight: float = Field(default=1.0, ge=0.0)

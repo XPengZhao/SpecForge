@@ -1,0 +1,43 @@
+# DeepSpec dspark_qwen3_4b baseline: 4 GPUs, global batch 512.
+model:
+  target_model_path: Qwen/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-dspark.json
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: /public/workspace/dspark/cache/deepspec/qwen3_4b_target_cache
+  max_length: 4096
+  dataloader_num_workers: 4
+
+training:
+  strategy: dspark
+  attention_backend: flex_attention
+  fsdp_sharding: NO_SHARD
+  batch_size: 1
+  accumulation_steps: 128
+  num_epochs: 10
+  # Match the reference 10-epoch schedule (1,339,875 samples, batch 512).
+  total_steps: 26160
+  max_steps: 26160
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  dspark_loss_mode: original
+  dspark_tau_loss_alpha: 0.1
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 2616
+  log_interval: 10
+  seed: 42
+
+run_id: qwen3-4b-dspark-tau-offline
+output_dir: outputs/qwen3-4b-dspark-tau-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
