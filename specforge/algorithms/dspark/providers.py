@@ -110,6 +110,8 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    if not getattr(draft_model.config, "dspark_anchor_token_input", True):
+        contract["dspark_anchor_token_input"] = False
     return contract
 
 

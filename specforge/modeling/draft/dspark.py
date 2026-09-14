@@ -286,6 +286,8 @@ class DSparkDraftModel(DFlashDraftModel):
     expected_projector_type = "dspark"
 
     def __init__(self, config) -> None:
+        if not isinstance(getattr(config, "dspark_anchor_token_input", True), bool):
+            raise ValueError("dspark_anchor_token_input must be a boolean")
         dflash_config = getattr(config, "dflash_config", None) or {}
         projector_type = dflash_config.get("projector_type")
         if projector_type is None:

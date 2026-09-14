@@ -437,7 +437,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+            noise_ids = block_output_ids
+            if not getattr(self.config, "dspark_anchor_token_input", True):
+                noise_ids = torch.full_like(block_output_ids, self.mask_token_id)
+            noise_embedding = target.model.embed_tokens(noise_ids)
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,

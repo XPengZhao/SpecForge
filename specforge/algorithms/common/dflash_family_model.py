@@ -230,6 +230,8 @@ class OnlineDFlashModel(nn.Module):
         noise_ids = torch.full(
             (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
         )
+        if not getattr(getattr(self.draft_model, "config", None), "dspark_anchor_token_input", True):
+            return self.embed_tokens(noise_ids)
 
         block_starts = torch.arange(n, device=device) * bs
         block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
