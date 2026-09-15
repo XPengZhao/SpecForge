@@ -47,6 +47,7 @@ class DeepSpecCacheReader:
             raise ValueError("Invalid DeepSpec hidden_size or target_layer_ids")
         if not isinstance(m.get("target_model_name_or_path"), str) or not m["target_model_name_or_path"]:
             raise ValueError("DeepSpec target_model_name_or_path is required")
+        self.selected_layers = list(self.layers)
         self.num_samples = int(m["num_samples"])
         if self.num_samples <= 0:
             raise ValueError("DeepSpec cache is empty")
@@ -63,9 +64,18 @@ class DeepSpecCacheReader:
                 raise ValueError("DeepSpec shard ids must be contiguous and paths inside cache")
             self.shards.append((str(path), path.stat().st_size))
 
+    def select_layers(self, target_layer_ids):
+        layers = list(target_layer_ids)
+        if (not layers or any(type(x) is not int for x in layers)
+                or sorted(set(layers)) != layers
+                or any(x not in self.layers for x in layers)):
+            raise ValueError("Requested target layers must be an ordered nonempty subset of DeepSpec cache layers")
+        self.selected_layers = layers
+
     def validate_model(self, *, hidden_size, target_layer_ids, target_model_path):
-        if int(hidden_size) != self.hidden_size or list(target_layer_ids) != self.layers:
-            raise ValueError("DeepSpec cache hidden size / target layer order does not match draft")
+        if int(hidden_size) != self.hidden_size:
+            raise ValueError("DeepSpec cache hidden size does not match draft")
+        self.select_layers(target_layer_ids)
         actual = self.manifest["target_model_name_or_path"]
         if str(target_model_path).rstrip("/") != actual.rstrip("/"):
             raise ValueError(
@@ -75,6 +85,11 @@ class DeepSpecCacheReader:
 
     def __iter__(self):
         width = len(self.layers) * self.hidden_size
+        selected_width = len(self.selected_layers) * self.hidden_size
+        selection = {}
+        if self.selected_layers != self.layers:
+            selection = {"aux_storage_width": width, "aux_layer_hidden_size": self.hidden_size,
+                         "aux_layer_indices": [self.layers.index(x) for x in self.selected_layers]}
         keys = {name: name for name in FEATURE_KEYS}
         specs_by_length = {}
         with self.index_path.open("rb") as index:
@@ -98,7 +113,7 @@ class DeepSpecCacheReader:
                     specs = {
                         "input_ids": FeatureSpec("input_ids", (n,), "int64"),
                         "loss_mask": FeatureSpec("loss_mask", (n,), "uint8"),
-                        "aux_hidden_state": FeatureSpec("aux_hidden_state", (n, width), "bfloat16"),
+                        "aux_hidden_state": FeatureSpec("aux_hidden_state", (n, selected_width), "bfloat16"),
                         "hidden_state": FeatureSpec("hidden_state", (n, self.hidden_size), "bfloat16"),
                         TOKEN_ALIGNED_MASK: FeatureSpec(TOKEN_ALIGNED_MASK, (), "bool"),
                     }
@@ -108,10 +123,10 @@ class DeepSpecCacheReader:
                     source_task_id=None, feature_store_uri=f"deepspec://{path}",
                     feature_keys=keys, feature_specs=specs, strategy="dspark",
                     target_model_version=self.manifest["target_model_name_or_path"],
-                    num_tokens=n, estimated_bytes=n * (9 + 2 * (width + self.hidden_size)) + 1,
+                    num_tokens=n, estimated_bytes=n * (9 + 2 * (selected_width + self.hidden_size)) + 1,
                     metadata={"format": "deepspec_v2", "target_repr": self.target_repr,
                               "ttt_length": self.ttt_length, "max_len": self.max_len,
-                              "file_index": i, "offsets": offsets},
+                              "file_index": i, "offsets": offsets, **selection},
                 )
 
     def read(self, limit=None):
@@ -133,14 +148,22 @@ def read_deepspec_features(ref, names):
                 continue
             spec = ref.feature_specs[name]
             dtype = storage_dtypes[name]
+            shape = spec.shape
+            selecting = name == "aux_hidden_state" and "aux_layer_indices" in ref.metadata
+            if selecting:
+                shape = (spec.shape[0], ref.metadata["aux_storage_width"])
             count = 1
-            for size in spec.shape:
+            for size in shape:
                 count *= size
             nbytes = count * torch.empty((), dtype=dtype).element_size()
             stream.seek(field_offsets[name])
             data = bytearray(stream.read(nbytes))
             if len(data) != nbytes:
                 raise ValueError(f"Truncated DeepSpec shard: {path}, field {name}")
-            tensor = torch.frombuffer(data, dtype=dtype).reshape(spec.shape)
+            tensor = torch.frombuffer(data, dtype=dtype).reshape(shape)
+            if selecting:
+                hidden = ref.metadata["aux_layer_hidden_size"]
+                tensor = tensor.reshape(shape[0], -1, hidden)[:, ref.metadata["aux_layer_indices"], :]
+                tensor = tensor.reshape(spec.shape).contiguous()
             result[name] = tensor.long() if name == "input_ids" else tensor
     return result

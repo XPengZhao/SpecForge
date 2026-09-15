@@ -18,7 +18,7 @@ from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict, ref_to_dict
 
 
-def write_fixture(root):
+def write_fixture(root, layers=(1, 3)):
     """Independent encoder following DeepSpec's <QIIQQQQQ record protocol."""
     expected = []
     records = []
@@ -26,7 +26,8 @@ def write_fixture(root):
         ids = torch.arange(length, dtype=torch.int32) + i * 10
         mask = torch.ones(length, dtype=torch.uint8)
         mask[0] = 0
-        aux = torch.arange(length * 8, dtype=torch.float32).reshape(length, 8).bfloat16()
+        width = 4 * len(layers)
+        aux = torch.arange(length * width, dtype=torch.float32).reshape(length, width).bfloat16()
         last = -aux[:, :4].contiguous()
         fields = (ids, torch.ones_like(mask), mask, aux, last)
         data, offsets = bytearray(), []
@@ -39,7 +40,7 @@ def write_fixture(root):
                              aux_hidden_state=aux, hidden_state=last))
     (root / 'samples.idx').write_bytes(b''.join(records))
     manifest = dict(version=2, num_samples=2, num_shards=2, hidden_size=4,
-                    target_layer_ids=[1, 3], target_model_name_or_path='Qwen/Qwen3-4B',
+                    target_layer_ids=list(layers), target_model_name_or_path='Qwen/Qwen3-4B',
                     hidden_dtype='bfloat16', token_dtype='int32', mask_dtype='uint8',
                     index_record_size=56,
                     shards=[dict(shard_id=i, file_name=f'shard-{i:05d}.bin') for i in range(2)])
@@ -140,6 +141,57 @@ class TestDeepSpecCache(unittest.TestCase):
                 reader.validate_model(**args, target_model_path='Qwen/Qwen3-4B')
         with self.assertRaises(ValueError):
             reader.validate_model(hidden_size=4, target_layer_ids=[1, 3], target_model_path='other')
+
+    def test_five_layer_cache_subset_roundtrip_and_loader(self):
+        from types import SimpleNamespace
+        from specforge.launch import _read_offline_refs, _make_offline_eval_data_factory
+        from unittest.mock import patch
+        self.expected = write_fixture(self.root, layers=(1, 9, 17, 25, 33))
+        before = {p.name: p.read_bytes() for p in self.root.iterdir()}
+        model = SimpleNamespace(draft_model=SimpleNamespace(target_layer_ids=[1, 17, 33]))
+        provider = SimpleNamespace(build_reader=build_offline_dspark_reader)
+        refs = _read_offline_refs(provider, str(self.root), run_id='subset',
+                                  ttt_length=7, max_len=4, model=model)
+        refs = [ref_from_dict(json.loads(json.dumps(ref_to_dict(ref)))) for ref in refs]
+        store = LocalFeatureStore()
+        for i, ref in enumerate(refs):
+            self.assertEqual(tuple(ref.feature_specs['aux_hidden_state'].shape), (min(4, 5-i*2), 12))
+            raw, handle = store.get(ref)
+            store.release(handle)
+            expected = self.expected[i]
+            selected = expected['aux_hidden_state'][:4].reshape(-1, 5, 4)[:, [0, 2, 4]].reshape(-1, 12)
+            torch.testing.assert_close(raw['aux_hidden_state'], selected, rtol=0, atol=0)
+            for key in ('input_ids', 'loss_mask', 'hidden_state'):
+                torch.testing.assert_close(raw[key], expected[key][:4], rtol=0, atol=0)
+            # Native writes contain the selected tensors and remain independently readable.
+            native = LocalFeatureStore(dump_dir=str(self.root / 'native'))
+            written = native.put(raw, sample_id=ref.sample_id, metadata={'run_id': 'subset', 'strategy': 'dspark',
+                                               'num_tokens': ref.num_tokens})
+            reread, handle = native.get(written)
+            native.release(handle)
+            torch.testing.assert_close(reread['aux_hidden_state'], selected, rtol=0, atol=0)
+        for workers in (0, 2):
+            loader = FeatureDataLoader(store, refs=refs, batch_size=2, strategy='dspark',
+                num_workers=workers, drop_last=False,
+                per_sample_transform=lambda raw: normalize_offline_dspark_sample(raw, 4),
+                collate_fn=build_dspark_collator())
+            batch = next(iter(loader)).tensors
+            self.assertEqual(tuple(batch['hidden_states'].shape), (2, 4, 12))
+            self.assertEqual(tuple(batch['target_last_hidden_states'].shape), (2, 4, 4))
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir() if p.is_file()})
+        reader = self.reader()
+        for invalid in ([], [1, 1], [33, 1], [1, 2], [True]):
+            with self.assertRaises(ValueError):
+                reader.select_layers(invalid)
+        # Eval uses the same reader selection path as training.
+        algorithm = SimpleNamespace(name='dspark', providers=SimpleNamespace(offline_for=lambda _: provider))
+        with patch('specforge.launch._offline_io', return_value=(build_dspark_collator(),
+                lambda raw: normalize_offline_dspark_sample(raw, 4))), patch(
+                'specforge.launch._shard_offline_refs', side_effect=lambda refs, **kw: refs):
+            factory = _make_offline_eval_data_factory(algorithm=algorithm, modality='text',
+                hidden_states_path=str(self.root), run_id='test', batch_size=2, max_len=4,
+                ttt_length=7, use_usp_preprocess=False, dataloader_num_workers=0, model=model)
+            self.assertEqual(tuple(next(iter(factory())).tensors['hidden_states'].shape), (2, 4, 12))
 
     def test_bad_manifest_index_and_shard(self):
         path = self.root / 'manifest.json'
