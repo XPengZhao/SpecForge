@@ -478,7 +478,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        opd_kwargs = {
+        extra_kwargs = {
             key: t[key].to(device)
             for key in (
                 "opd_anchor_positions",
@@ -486,6 +486,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 "opd_target_logprobs",
                 "opd_accepted_lengths",
                 "opd_candidate_mask",
+                "ngram_embedding",
             )
             if key in t
         }
@@ -494,7 +495,7 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
             target_last_hidden_states=t["target_last_hidden_states"].to(device),
-            **opd_kwargs,
+            **extra_kwargs,
         )
         metrics = {
             "accuracy": accuracy.detach(),

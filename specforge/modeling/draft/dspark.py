@@ -21,6 +21,25 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(batch_size, seq_len)
 
 
+class NgramMaskEmbedding(nn.Module):
+    """Shared projection and zero-initialized, position-specific residual gates."""
+    def __init__(self, hidden_size, block_size, eps):
+        super().__init__()
+        self.block_size = block_size
+        self.norm = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.gate = nn.Parameter(torch.zeros(block_size - 1))
+
+    def forward(self, noise_embedding, context):
+        batch, anchors, width = context.shape
+        if noise_embedding.shape != (batch, anchors * self.block_size, width):
+            raise ValueError('Ngram context shape does not match draft blocks')
+        delta = self.proj(self.norm(context.to(noise_embedding.dtype)))
+        blocks = noise_embedding.reshape(batch, anchors, self.block_size, width)
+        masks = blocks[:, :, 1:] + delta[:, :, None, :] * self.gate[None, None, :, None]
+        return torch.cat((blocks[:, :, :1], masks), dim=2).reshape_as(noise_embedding)
+
+
 class AcceptRatePredictor(nn.Module):
     """Predict target/draft distribution acceptance probability per draft step."""
 
@@ -297,7 +316,21 @@ class DSparkDraftModel(DFlashDraftModel):
             )
         super().__init__(config)
 
+    def forward(self, position_ids, attention_mask=None, noise_embedding=None,
+                target_hidden=None, past_key_values=None, use_cache=False,
+                ngram_context=None, **kwargs):
+        if self.ngram_mask_enabled:
+            if ngram_context is None:
+                raise ValueError('Ngram MASK draft requires anchor-1 ngram_context')
+            noise_embedding = self.ngram_mask(noise_embedding, ngram_context)
+        return super().forward(position_ids=position_ids, attention_mask=attention_mask,
+                               noise_embedding=noise_embedding, target_hidden=target_hidden,
+                               past_key_values=past_key_values, use_cache=use_cache, **kwargs)
+
     def _init_draft_head(self, config, dflash_config: dict) -> None:
+        self.ngram_mask_enabled = bool(dflash_config.get('ngram_mask', False))
+        if self.ngram_mask_enabled:
+            self.ngram_mask = NgramMaskEmbedding(config.hidden_size, config.block_size, config.rms_norm_eps)
         self.markov_head = build_markov_head(config, dflash_config)
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(

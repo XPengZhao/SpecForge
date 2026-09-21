@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
+from contextlib import nullcontext
 from itertools import islice
 from pathlib import Path
 
@@ -47,6 +48,7 @@ class DeepSpecCacheReader:
             raise ValueError("Invalid DeepSpec hidden_size or target_layer_ids")
         if not isinstance(m.get("target_model_name_or_path"), str) or not m["target_model_name_or_path"]:
             raise ValueError("DeepSpec target_model_name_or_path is required")
+        self.ngram = None
         self.num_samples = int(m["num_samples"])
         if self.num_samples <= 0:
             raise ValueError("DeepSpec cache is empty")
@@ -62,6 +64,11 @@ class DeepSpecCacheReader:
             if shard["shard_id"] != i or not path.is_relative_to(self.root):
                 raise ValueError("DeepSpec shard ids must be contiguous and paths inside cache")
             self.shards.append((str(path), path.stat().st_size))
+
+    def enable_ngram(self):
+        from .ngram_sidecar import NgramSidecar, KEY
+        self.ngram = NgramSidecar(self.root, self.manifest)
+        self.feature_keys = FEATURE_KEYS + (KEY,)
 
     def validate_model(self, *, hidden_size, target_layer_ids, target_model_path, target_config=None):
         if int(hidden_size) != self.hidden_size or list(target_layer_ids) != self.layers:
@@ -101,9 +108,11 @@ class DeepSpecCacheReader:
 
     def __iter__(self):
         width = len(self.layers) * self.hidden_size
-        keys = {name: name for name in FEATURE_KEYS}
+        keys = {name: name for name in self.feature_keys}
         specs_by_length = {}
-        with self.index_path.open("rb") as index:
+        with self.index_path.open("rb") as index, (
+            self.ngram.index.open("rb") if self.ngram else nullcontext()
+        ) as side_index:
             for i in range(self.num_samples):
                 record = index.read(INDEX_RECORD.size)
                 if len(record) != INDEX_RECORD.size:
@@ -118,6 +127,9 @@ class DeepSpecCacheReader:
                     raise ValueError(f"DeepSpec sample {i} extends beyond shard")
                 if any(offsets[j] + sizes[j] > offsets[j + 1] for j in range(4)):
                     raise ValueError(f"Overlapping DeepSpec fields in sample {i}")
+                extra = {}
+                if self.ngram:
+                    extra['ngram'] = self.ngram.next_sample(side_index, i, length)
                 n = min(length, self.max_len)
                 specs = specs_by_length.get(n)
                 if specs is None:
@@ -128,16 +140,18 @@ class DeepSpecCacheReader:
                         "hidden_state": FeatureSpec("hidden_state", (n, self.hidden_size), "bfloat16"),
                         TOKEN_ALIGNED_MASK: FeatureSpec(TOKEN_ALIGNED_MASK, (), "bool"),
                     }
+                    if self.ngram:
+                        specs['ngram_embedding'] = FeatureSpec('ngram_embedding', (n, self.ngram.width), 'bfloat16')
                     specs_by_length[n] = specs
                 yield SampleRef(
                     sample_id=f"{self.run_id}:{i:08d}", run_id=self.run_id,
                     source_task_id=None, feature_store_uri=f"deepspec://{path}",
                     feature_keys=keys, feature_specs=specs, strategy="dspark",
                     target_model_version=self.manifest["target_model_name_or_path"],
-                    num_tokens=n, estimated_bytes=n * (9 + 2 * (width + self.hidden_size)) + 1,
+                    num_tokens=n, estimated_bytes=n * (9 + 2 * (width + self.hidden_size + (self.ngram.width if self.ngram else 0))) + 1,
                     metadata={"format": "deepspec_v2", "target_repr": self.target_repr,
                               "ttt_length": self.ttt_length, "max_len": self.max_len,
-                              "file_index": i, "offsets": offsets},
+                              "file_index": i, "offsets": offsets, **extra},
                 )
 
     def read(self, limit=None):
@@ -156,6 +170,16 @@ def read_deepspec_features(ref, names):
         for name in names:
             if name == TOKEN_ALIGNED_MASK:
                 result[name] = torch.tensor(True)
+                continue
+            if name == 'ngram_embedding':
+                location = ref.metadata['ngram']
+                shape = ref.feature_specs[name].shape
+                with open(location['path'], 'rb') as side:
+                    side.seek(location['offset'])
+                    data = bytearray(side.read(shape[0] * shape[1] * 2))
+                if len(data) != shape[0] * shape[1] * 2:
+                    raise ValueError('Truncated ngram payload')
+                result[name] = torch.frombuffer(data, dtype=torch.bfloat16).reshape(shape)
                 continue
             spec = ref.feature_specs[name]
             dtype = storage_dtypes[name]

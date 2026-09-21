@@ -248,6 +248,17 @@ def _distributed_sampler_indices(size, *, dp_rank, dp_size, seed, epoch, shuffle
     return indices[dp_rank:total_size:dp_size]
 
 
+def _read_offline_refs(provider, path, *, model=None, **kwargs):
+    reader = provider.build_reader(path, **kwargs)
+    draft = getattr(model, 'draft_model', None)
+    if getattr(draft, 'ngram_mask_enabled', False):
+        from specforge.runtime.data_plane.deepspec_cache import DeepSpecCacheReader
+        if not isinstance(reader, DeepSpecCacheReader):
+            raise ValueError('Ngram MASK requires a DeepSpec cache with raw ngram sidecar')
+        reader.enable_ngram()
+    return reader.read()
+
+
 def _make_offline_eval_data_factory(
     *,
     algorithm: AlgorithmRegistration,
@@ -259,6 +270,7 @@ def _make_offline_eval_data_factory(
     ttt_length: int,
     use_usp_preprocess: bool,
     dataloader_num_workers: int,
+    model=None,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
     provider = algorithm.providers.offline_for(modality)
@@ -270,12 +282,12 @@ def _make_offline_eval_data_factory(
         use_usp_preprocess=use_usp_preprocess,
     )
     eval_run_id = f"{run_id}-eval"
-    refs = provider.build_reader(
-        hidden_states_path,
+    refs = _read_offline_refs(
+        provider, hidden_states_path, model=model,
         run_id=eval_run_id,
         ttt_length=ttt_length,
         max_len=max_len,
-    ).read()
+    )
     refs = _shard_offline_refs(
         refs, use_usp_preprocess=use_usp_preprocess, shuffle=False
     )
@@ -577,9 +589,10 @@ def build_offline_runtime(
         metadata_store=NoOpMetadataStore(),
         enable_sample_queue=False,
     )
-    source_refs = provider.build_reader(
-        hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
-    ).read()
+    source_refs = _read_offline_refs(
+        provider, hidden_states_path, model=draft_model,
+        run_id=run_id, ttt_length=ttt_length, max_len=max_len
+    )
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
@@ -598,6 +611,7 @@ def build_offline_runtime(
                 "pass either eval_hidden_states_path or eval_data_factory, not both"
             )
         eval_data_factory = _make_offline_eval_data_factory(
+            model=draft_model,
             algorithm=algorithm,
             modality=modality,
             hidden_states_path=eval_hidden_states_path,
@@ -728,6 +742,7 @@ def build_disagg_offline_runtime(
                 "pass either eval_hidden_states_path or eval_data_factory, not both"
             )
         eval_data_factory = _make_offline_eval_data_factory(
+            model=draft_model,
             algorithm=algorithm,
             modality=modality,
             hidden_states_path=eval_hidden_states_path,

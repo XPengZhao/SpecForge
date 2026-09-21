@@ -63,3 +63,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m specforge.cli train \
 
 TensorBoard 写入正式训练输出目录的 `runs/`。短跑降低了 anchor 数，不能据此保证正式训练显存充足。
 本适配覆盖离线训练；Qwen3.8 target 与 draft 的在线推理集成需单独实现和验证。
+
+MASK 增强消融见 [pre-anchor ngram 训练说明](qwen38-dspark-ngram-mask.md)。

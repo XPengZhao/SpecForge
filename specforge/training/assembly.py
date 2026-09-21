@@ -167,6 +167,13 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
 
     provider = algorithm.providers.model
     draft_config, draft_model = _load_draft(cfg, algorithm)
+    if getattr(draft_model, 'ngram_mask_enabled', False):
+        if cfg.mode != 'offline' or cfg.deployment.mode != 'local_colocated' or algorithm.name != 'dspark':
+            raise ValueError('Ngram MASK currently supports local_colocated offline DSpark only')
+        from specforge.runtime.data_plane.deepspec_cache import DeepSpecCacheReader
+        for path in (cfg.data.hidden_states_path, cfg.data.eval_hidden_states_path):
+            if path:
+                DeepSpecCacheReader(path).enable_ngram()
     needs_input_tools = provider.needs_input_tools(cfg, draft_model)
     input_tools = _load_input_tools(cfg, algorithm) if needs_input_tools else None
     target_config_loader = AutoConfig.from_pretrained

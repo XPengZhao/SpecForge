@@ -285,6 +285,7 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
+        ngram_embedding: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -328,11 +329,22 @@ class OnlineDFlashModel(nn.Module):
                 context_window=getattr(self.draft_model, "context_window", None),
             )
 
+        extra = {}
+        if getattr(self.draft_model, 'ngram_mask_enabled', False):
+            if ngram_embedding is None or ngram_embedding.shape != (*input_ids.shape, noise_embedding.size(-1)):
+                raise ValueError('Ngram MASK requires token-aligned [batch, sequence, hidden] features')
+            # Host lookup overlaps the target step: the newly produced anchor
+            # is excluded. Never wrap anchor zero around to the sequence tail.
+            indices = (anchor_positions - 1).clamp_min(0)
+            context = ngram_embedding.gather(1, indices[..., None].expand(-1, -1, ngram_embedding.size(-1)))
+            valid = block_keep_mask & (anchor_positions > 0)
+            extra['ngram_context'] = torch.where(valid[..., None], context, torch.zeros_like(context))
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **extra,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
@@ -1531,6 +1543,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         opd_target_logprobs: Optional[torch.Tensor] = None,
         opd_accepted_lengths: Optional[torch.Tensor] = None,
         opd_candidate_mask: Optional[torch.Tensor] = None,
+        ngram_embedding: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1578,6 +1591,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_mask=loss_mask,
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
+            ngram_embedding=ngram_embedding,
         )
 
         logits = self.lm_head(output_hidden)

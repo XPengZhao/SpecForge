@@ -140,6 +140,13 @@ def normalize_offline_dspark_sample(raw, max_len: int, dspark_supervision="respo
         "hidden_states": hidden_states,
         "target_last_hidden_states": target_last_hidden_states,
     }
+    if 'ngram_embedding' in raw:
+        if not raw.get('loss_mask_is_token_aligned', False):
+            raise ValueError('Ngram MASK requires token-aligned cache features')
+        ngram = normalize_hidden_state('ngram_embedding')
+        if ngram.shape != target_last_hidden_states.shape:
+            raise ValueError('Ngram and target hidden shapes must match after truncation')
+        normalized['ngram_embedding'] = ngram
     present_opd_keys = [key for key in DSPARK_OPD_KEYS if key in raw]
     if present_opd_keys and len(present_opd_keys) != len(DSPARK_OPD_KEYS):
         missing = sorted(set(DSPARK_OPD_KEYS) - set(present_opd_keys))
@@ -224,6 +231,10 @@ def build_dspark_collator():
             if features and all(key in features[0] for key in DSPARK_OPD_KEYS)
             else ()
         )
+        has_ngram = ['ngram_embedding' in f for f in features]
+        if any(has_ngram) and not all(has_ngram):
+            raise ValueError('Mixed samples with/without ngram features')
+        ngram_keys = ('ngram_embedding',) if all(has_ngram) and features else ()
         batch = pad_and_concatenate_features(
             features,
             sequence_axes={
@@ -231,13 +242,14 @@ def build_dspark_collator():
                 "loss_mask": 1,
                 "hidden_states": 1,
                 "target_last_hidden_states": 1,
+                "ngram_embedding": 1,
             },
             required_keys=(
                 "input_ids",
                 "loss_mask",
                 "hidden_states",
                 "target_last_hidden_states",
-            ),
+            ) + ngram_keys,
         )
         if optional_keys:
             import torch
