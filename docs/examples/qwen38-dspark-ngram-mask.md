@@ -4,8 +4,9 @@
 raw ngram 特征 g[a-1]，不包含新 anchor；a=0 或无效 block 时注入零。
 
 输入为 `[E(anchor), E(MASK)+delta_1, ..., E(MASK)+delta_6]`，其中
-`delta_j = gate_j * Linear(RMSNorm(g[a-1]))`。共享投影无 bias，Norm 无可训练参数，
-六个标量 gate 从零初始化。首位置 embedding、aux、attention mask、Markov head 和 loss 不变。
+`delta_j = tanh(gate_j) * RMSNorm(Linear(g[a-1]))`，不额外乘缩放系数 s。
+共享投影无 bias，投影后的 RMSNorm 无可训练缩放参数，
+六个标量 gate 从零初始化，tanh 将有效 gate 限制在 (-1, 1)。首位置 embedding、aux、attention mask、Markov head 和 loss 不变。
 新增可训练参数 `2560 × 2560 + 6 = 6,553,606`。零 gate 的首步投影梯度为零；gate 更新后投影开始学习。
 零 gate 在相同原有权重下保持 baseline 输出；新模块会影响随机数消耗，不能要求独立随机初始化的两个 run 逐位一致。
 
@@ -39,3 +40,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m specforge.cli train \
 
 本地验证覆盖 sidecar 读取、线程预取、截断/padding、a-1 边界、零 gate 等价性、gate/投影梯度及权重加载。
 真实 CUDA/FSDP 短跑和吞吐仍需在服务器验证；增加 ngram 读取和投影会引入额外成本。
+
+本版改变了归一化位置和 gate 语义。与旧版 pre-norm/free-gate 比较时，应使用新的 run/output 目录从头训练，不能将旧 checkpoint 当作同语义 resume。参数形状虽相同，前向行为不同。

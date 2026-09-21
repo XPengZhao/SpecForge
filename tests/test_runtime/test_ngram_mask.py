@@ -162,3 +162,25 @@ def test_strategy_forwards_ngram_feature():
     out=DSparkTrainStrategy(m).forward_loss(TrainBatch(sample_ids=['a'],strategy='dspark',tensors=tensors))
     out.loss.backward()
     assert m.draft_model.ngram_mask.gate.grad is not None
+
+
+def test_postnorm_tanh_without_extra_scale():
+    module = NgramMaskEmbedding(4, 7, 1e-6)
+    with torch.no_grad():
+        module.proj.weight.copy_(torch.diag(torch.tensor([1., 2., 4., 8.])))
+        module.gate.copy_(torch.tensor([-10., -1., 0., .2, 1., 10.]))
+    context = torch.tensor([[[2., -1., 3., .5]]])
+    noise = torch.randn(1, 7, 4)
+    projected = module.proj(context)
+    expected_delta = projected / (projected.square().mean(-1, keepdim=True) + 1e-6).sqrt()
+    expected = noise.clone().reshape(1,1,7,4)
+    expected[:,:,1:] += module.gate.tanh()[None,None,:,None] * expected_delta[:,:,None,:]
+    result = module(noise, context)
+    torch.testing.assert_close(result, expected.reshape_as(noise))
+    delta_rms = (result[:,1:] - noise[:,1:]).square().mean(-1).sqrt()
+    assert (delta_rms <= 1.000001).all()
+    torch.testing.assert_close(module(noise, torch.zeros_like(context)), noise, rtol=0, atol=0)
+    # Scaling the projection should no longer scale the injected residual.
+    with torch.no_grad():
+        module.proj.weight.mul_(100)
+    torch.testing.assert_close(module(noise, context), result, rtol=1e-5, atol=1e-6)

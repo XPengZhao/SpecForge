@@ -22,7 +22,7 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 
 
 class NgramMaskEmbedding(nn.Module):
-    """Shared projection and zero-initialized, position-specific residual gates."""
+    """Post-normalized projection with zero-initialized, bounded residual gates."""
     def __init__(self, hidden_size, block_size, eps):
         super().__init__()
         self.block_size = block_size
@@ -34,9 +34,9 @@ class NgramMaskEmbedding(nn.Module):
         batch, anchors, width = context.shape
         if noise_embedding.shape != (batch, anchors * self.block_size, width):
             raise ValueError('Ngram context shape does not match draft blocks')
-        delta = self.proj(self.norm(context.to(noise_embedding.dtype)))
+        delta = self.norm(self.proj(context.to(noise_embedding.dtype)))
         blocks = noise_embedding.reshape(batch, anchors, self.block_size, width)
-        masks = blocks[:, :, 1:] + delta[:, :, None, :] * self.gate[None, None, :, None]
+        masks = blocks[:, :, 1:] + delta[:, :, None, :] * self.gate.tanh()[None, None, :, None]
         return torch.cat((blocks[:, :, :1], masks), dim=2).reshape_as(noise_embedding)
 
 
