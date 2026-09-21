@@ -346,6 +346,8 @@ def _build_dflash_family_model(
     draft_model: Any,
     tokenizer: Any,
     model_factory: Callable[[Dict[str, Any]], Any],
+    *,
+    target_config=None,
 ) -> AlgorithmModelParts:
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
@@ -366,6 +368,7 @@ def _build_dflash_family_model(
         device=_device().type,
         dtype=_torch_dtype(cfg),
         trust_remote_code=cfg.model.trust_remote_code,
+        config=target_config,
     )
     common = {
         "draft_model": draft_model,
@@ -457,6 +460,7 @@ def build_dspark_model(
             dspark_opd_loss_max_clamp=cfg.training.dspark_opd_loss_max_clamp,
             recompute_loss=cfg.training.recompute_loss,
         ),
+        target_config=_target_config,
     )
 
 

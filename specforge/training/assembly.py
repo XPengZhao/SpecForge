@@ -169,7 +169,11 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     draft_config, draft_model = _load_draft(cfg, algorithm)
     needs_input_tools = provider.needs_input_tools(cfg, draft_model)
     input_tools = _load_input_tools(cfg, algorithm) if needs_input_tools else None
-    target_config = AutoConfig.from_pretrained(
+    target_config_loader = AutoConfig.from_pretrained
+    if cfg.mode == "offline" and algorithm.name == "dspark":
+        from specforge.modeling.target.offline_config import load_offline_target_config
+        target_config_loader = load_offline_target_config
+    target_config = target_config_loader(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
@@ -188,7 +192,15 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
                     hidden_size=draft_config.hidden_size,
                     target_layer_ids=draft_model.target_layer_ids,
                     target_model_path=cfg.model.target_model_path,
+                    target_config=target_config,
                 )
+    if getattr(target_config, "model_type", None) == "qwen4_exp":
+        if cfg.mode != "offline" or algorithm.name != "dspark":
+            raise ValueError("Qwen3.8 currently supports offline DSpark training only")
+        if not cfg.data.hidden_states_path or not is_deepspec_cache(cfg.data.hidden_states_path):
+            raise ValueError("Qwen3.8 requires a finalized DeepSpec cache with capture metadata")
+        if draft_config.hidden_size != text_config.hidden_size or draft_config.vocab_size != text_config.vocab_size:
+            raise ValueError("Qwen3.8 draft hidden/vocabulary dimensions do not match target")
     target_hidden_size = int(text_config.hidden_size)
     target_vocab_size = int(text_config.vocab_size)
     draft_vocab_size = int(

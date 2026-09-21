@@ -55,6 +55,9 @@ method/topology matrix and the
 online/offline launch workflows. Unsupported combinations are rejected during
 config validation or run assembly instead of falling back to an older trainer.
 
+For Qwen3.8-Flash-Next cached features, see the
+[three-aux-layer offline DSpark guide](./docs/examples/qwen38-dspark-offline.md).
+
 
 ## 🚀 Accelerate with SpecBundle
 

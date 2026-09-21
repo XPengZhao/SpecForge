@@ -48,12 +48,14 @@ class TargetEmbeddingsAndHead(nn.Module):
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
+        config=None,
     ) -> "TargetEmbeddingsAndHead":
 
         # 1. Load Config
-        config = AutoConfig.from_pretrained(
-            model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
-        )
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model_path, cache_dir=cache_dir, trust_remote_code=trust_remote_code
+            )
         instance = cls(config)
 
         if embed_key is None:

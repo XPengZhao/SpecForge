@@ -63,7 +63,7 @@ class DeepSpecCacheReader:
                 raise ValueError("DeepSpec shard ids must be contiguous and paths inside cache")
             self.shards.append((str(path), path.stat().st_size))
 
-    def validate_model(self, *, hidden_size, target_layer_ids, target_model_path):
+    def validate_model(self, *, hidden_size, target_layer_ids, target_model_path, target_config=None):
         if int(hidden_size) != self.hidden_size or list(target_layer_ids) != self.layers:
             raise ValueError("DeepSpec cache hidden size / target layer order does not match draft")
         actual = self.manifest["target_model_name_or_path"]
@@ -72,6 +72,32 @@ class DeepSpecCacheReader:
                 f"DeepSpec cache target is {actual!r}, training target is {target_model_path!r}; "
                 "use the same target checkpoint identifier as capture"
             )
+
+        if getattr(target_config, "model_type", None) == "qwen4_exp":
+            self.validate_qwen38(target_config.to_dict())
+
+    def validate_qwen38(self, target_config):
+        """Reject raw HC tensors or pre-mixer supervision, even if widths fit."""
+        text = target_config.get('text_config', {})
+        if (target_config.get('model_type') != 'qwen4_exp'
+                or text.get('hidden_size') != 2560 or text.get('hc_count') != 4
+                or text.get('num_hidden_layers') != 48):
+            raise ValueError('Expected Qwen3.8-Flash-Next: 48 layers, hidden 2560, hc_count 4')
+        if self.hidden_size != 2560 or self.layers != [45, 46, 47]:
+            raise ValueError('Qwen3.8 aux-only baseline requires layers [45, 46, 47] at width 2560 each')
+        expected = dict(aux_reduction='post_layer_hc_mean_fp32_to_bfloat16',
+                        target_final_feature='last_hidden_state_after_hyper_connection_mixer',
+                        hc_count=4, capture_scope='full_sequence',
+                        loss_mask_scope='assistant_response', enable_thinking=False)
+        for key, value in expected.items():
+            if self.manifest.get(key) != value:
+                raise ValueError(f'Qwen3.8 cache {key}: expected {value!r}, got {self.manifest.get(key)!r}')
+        cached = self.manifest.get('target_config', {})
+        if cached.get('model_type') != 'qwen4_exp':
+            raise ValueError('Cache was not captured from a qwen4_exp target')
+        for key in ('hidden_size', 'vocab_size', 'num_hidden_layers', 'hc_count'):
+            if cached.get('text_config', {}).get(key) != text.get(key):
+                raise ValueError(f'Qwen3.8 cache/target config mismatch: {key}')
 
     def __iter__(self):
         width = len(self.layers) * self.hidden_size
