@@ -187,6 +187,19 @@ def _make_dspark_model(
         _fixed_anchor_sampler(anchors, keep_mask), model
     )
     model._create_noise_embed = types.MethodType(_fixed_noise_embed, model)
+    if isinstance(lm_head, _DualFixedHead):
+        # These loss-reference fixtures assign arbitrary logits to block slots,
+        # including conflicting values for the same target position. Supply
+        # them as indexed probabilities; real projection/dedup is tested with
+        # a Linear head in test_dspark_target_dedup.py.
+        def fixed_probs(self, target_hidden, indices):
+            if target_hidden is None:
+                return None
+            logits = self.lm_head.target_logits
+            probs = logits.float().softmax(-1).reshape(-1, logits.size(-1))
+            inverse = torch.arange(indices.numel(), device=indices.device).reshape_as(indices)
+            return probs, inverse
+        model._unique_target_probs = types.MethodType(fixed_probs, model)
     return model
 
 

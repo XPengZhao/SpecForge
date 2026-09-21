@@ -953,6 +953,29 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ).view(bsz, num_anchors, block_size, H)
         return self.lm_head(aligned_target_hidden)
 
+    @torch.no_grad()
+    def _unique_target_probs(self, target_hidden, safe_label_indices):
+        """Project each (sample, target position) once; retain FP32 probabilities.
+
+        Keep only a compact inverse index for the blocks. Expanding all block
+        probabilities here would undo the memory benefit of deduplication.
+        """
+        if target_hidden is None:
+            return None
+        batch, sequence, width = target_hidden.shape
+        positions = (safe_label_indices - 1).clamp(min=0)
+        rows = positions + torch.arange(batch, device=positions.device)[:, None, None] * sequence
+        unique_rows, inverse = torch.unique(rows.reshape(-1), sorted=True, return_inverse=True)
+        hidden = target_hidden.reshape(batch * sequence, width).index_select(0, unique_rows)
+        # Bound temporary FP32 logits independently of sequence/anchor count.
+        probs = None
+        for start in range(0, hidden.size(0), 1024):
+            chunk = self.lm_head(hidden[start:start + 1024]).float().softmax(dim=-1)
+            if probs is None:
+                probs = chunk.new_empty((hidden.size(0), chunk.size(-1)))
+            probs[start:start + chunk.size(0)].copy_(chunk)
+        return probs, inverse.reshape_as(safe_label_indices)
+
     def _select_opd_blocks(
         self,
         *,
@@ -1210,6 +1233,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         tl_p: Optional[torch.Tensor],   # (bsz, num_anchors, vocab) or None
         tids_p: torch.Tensor,     # (bsz, num_anchors) long
         cconf_p: Optional[torch.Tensor],  # (bsz, num_anchors) or None
+        target_is_probs: bool = False,
     ):
         """Per-position DSpark losses. Designed to run under
         ``torch.utils.checkpoint`` so the (bsz, num_anchors, vocab) fp32
@@ -1241,13 +1265,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if needs_l1:
             l1 = (
                 torch.softmax(dl_p.float(), dim=-1)
-                - torch.softmax(tl_p.float(), dim=-1)
+                - (tl_p if target_is_probs else torch.softmax(tl_p.float(), dim=-1))
             ).abs().sum(dim=-1)  # (bsz, num_anchors)
         else:
             l1 = zeros
 
         if self.dspark_loss_mode == "kl" and tl_p is not None:
-            teacher_probs = torch.softmax(tl_p.float(), dim=-1)
+            teacher_probs = tl_p if target_is_probs else torch.softmax(tl_p.float(), dim=-1)
             student_log_probs = F.log_softmax(dl_p.float(), dim=-1)
             kl = F.kl_div(
                 student_log_probs,
@@ -1274,7 +1298,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_mask: torch.Tensor,
         confidence_pred: Optional[torch.Tensor],
         aligned_target_logits: Optional[torch.Tensor],
+        unique_target_probs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        has_target = aligned_target_logits is not None or unique_target_probs is not None
         loss_weight_mask = self._dspark_loss_weight_mask(eval_mask)
         ce_loss_den = loss_weight_mask.sum()
         ce_loss_sum = loss_weight_mask.new_zeros(())
@@ -1297,7 +1323,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             or not self.training
         )
         if (
-            aligned_target_logits is None
+            not has_target
             and (
                 self.dspark_loss_mode == "kl"
                 or self.dspark_l1_loss_alpha > 0
@@ -1314,11 +1340,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             dl_p = draft_logits[:, :, position, :]
             # Only compute the target distribution when it's actually needed
             # (L1, KL, or confidence); otherwise skip softmax entirely.
-            tl_p = (
-                None
-                if aligned_target_logits is None or not needs_target_distribution
-                else aligned_target_logits[:, :, position, :]
-            )
+            target_p = None
+            if unique_target_probs is not None:
+                probs, inverse = unique_target_probs
+                target_p = probs.index_select(0, inverse[:, :, position].reshape(-1)).reshape(
+                    *inverse.shape[:2], probs.size(-1)
+                )
+            elif aligned_target_logits is not None:
+                target_p = aligned_target_logits[:, :, position, :]
+            tl_p = target_p if needs_target_distribution else None
             tids_p = target_ids[:, :, position]
             cconf_p = (
                 None if not use_confidence_loss else confidence_pred[..., position]
@@ -1332,11 +1362,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     tl_p,
                     tids_p,
                     cconf_p,
+                    unique_target_probs is not None,
                     use_reentrant=False,
                 )
             else:
                 ce_p, l1_p, kl_p, conf_err_p = self._pos_loss(
-                    dl_p, tl_p, tids_p, cconf_p
+                    dl_p, tl_p, tids_p, cconf_p, unique_target_probs is not None
                 )
 
             ce_position_sum = (ce_p * wmask_p).sum()
@@ -1363,7 +1394,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             else:
                 kl_position_sum = kl_p.new_zeros(())
 
-            if aligned_target_logits is not None:
+            if has_target:
                 with torch.no_grad():
                     # Reuse the loss's L1 when available; KL/CE-only runs
                     # still need actual distribution overlap for this metric.
@@ -1376,7 +1407,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     else:
                         metric_l1 = (
                             dl_p.float().softmax(dim=-1)
-                            - aligned_target_logits[:, :, position, :].float().softmax(dim=-1)
+                            - (target_p if unique_target_probs is not None else target_p.float().softmax(dim=-1))
                         ).abs().sum(dim=-1)
                     accept_rates.append((1.0 - 0.5 * metric_l1).clamp(0.0, 1.0))
 
@@ -1477,7 +1508,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         }
         eval_metric_sums["ce_loss"] = ce_loss_sum.detach()
         eval_metric_denoms["ce_loss"] = ce_loss_den.detach()
-        if aligned_target_logits is not None and needs_target_distribution:
+        if has_target and needs_target_distribution:
             eval_metric_sums["l1_loss"] = l1_loss_sum.detach()
             eval_metric_denoms["l1_loss"] = ce_loss_den.detach()
             eval_metric_sums["kl_loss"] = kl_loss_sum.detach()
@@ -1599,16 +1630,25 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 output_hidden_4d,
                 prev_token_ids=prev_token_ids,
             )
-        aligned_target_logits = self._aligned_target_logits(
-            target_last_hidden_states,
-            safe_label_indices,
-        )
+        # OPD consumes target log-probabilities through its existing logits path.
+        # Standard offline/online DSpark reuses unique target probabilities.
+        unique_target_probs = None
+        aligned_target_logits = None
+        if selected_opd is not None:
+            aligned_target_logits = self._aligned_target_logits(
+                target_last_hidden_states, safe_label_indices,
+            )
+        else:
+            unique_target_probs = self._unique_target_probs(
+                target_last_hidden_states, safe_label_indices,
+            )
         loss, metrics = self._compute_dspark_loss(
             draft_logits=draft_logits,
             target_ids=target_ids,
             eval_mask=eval_mask,
             confidence_pred=confidence_pred,
             aligned_target_logits=aligned_target_logits,
+            unique_target_probs=unique_target_probs,
         )
         if selected_opd is not None:
             (
