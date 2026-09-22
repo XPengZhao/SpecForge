@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -19,6 +19,17 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     flat_logits = logits.reshape(-1, vocab_size) / temperature
     probs = torch.softmax(flat_logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(batch_size, seq_len)
+
+
+class _ZeroInitLinear(nn.Linear):
+    """Linear whose construction and HF post-init consume no RNG."""
+
+    _dspark_zero_init = True
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
 
 class AcceptRatePredictor(nn.Module):
@@ -48,6 +59,14 @@ class VanillaMarkovHead(nn.Module):
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
 
+    def get_markov_states(
+        self,
+        token_ids: torch.Tensor,
+        ngram_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del ngram_states
+        return self.get_prev_embeddings(token_ids)
+
     def project_bias(self, latent_states: torch.Tensor) -> torch.Tensor:
         return self.markov_w2(latent_states)
 
@@ -55,9 +74,10 @@ class VanillaMarkovHead(nn.Module):
         self,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del hidden_states
-        return self.project_bias(self.get_prev_embeddings(token_ids))
+        return self.project_bias(self.get_markov_states(token_ids, ngram_states))
 
     def apply_step_logits(
         self,
@@ -65,8 +85,9 @@ class VanillaMarkovHead(nn.Module):
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return logits + self.compute_step_bias(token_ids, hidden_states)
+        return logits + self.compute_step_bias(token_ids, hidden_states, ngram_states)
 
     def apply_block_logits(
         self,
@@ -74,10 +95,13 @@ class VanillaMarkovHead(nn.Module):
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if base_logits.size(-2) == 0:
             return base_logits
-        return base_logits + self.compute_step_bias(token_ids, hidden_states)
+        return base_logits + self.compute_step_bias(
+            token_ids, hidden_states, ngram_states
+        )
 
     def sample_block_tokens(
         self,
@@ -117,6 +141,94 @@ class VanillaMarkovHead(nn.Module):
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
 
 
+class NgramMarkovHead(VanillaMarkovHead):
+    """Add a causal Engram feature to the low-rank Markov state."""
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        rms_norm_eps: float,
+    ):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.markov_head_type = "ngram"
+        self.ngram_hidden_size = int(hidden_size)
+        self.ngram_norm = nn.RMSNorm(
+            self.ngram_hidden_size,
+            eps=float(rms_norm_eps),
+            elementwise_affine=False,
+        )
+        self.ngram_proj = _ZeroInitLinear(
+            self.ngram_hidden_size,
+            self.markov_rank,
+            bias=False,
+        )
+        # At initialization this head is exactly the vanilla Markov head. Unlike
+        # a zero scalar gate, the projection receives gradients immediately.
+        nn.init.zeros_(self.ngram_proj.weight)
+
+    def get_markov_states(
+        self,
+        token_ids: torch.Tensor,
+        ngram_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if ngram_states is None:
+            raise ValueError("ngram Markov head requires causal ngram_states")
+        expected = (*token_ids.shape, self.ngram_hidden_size)
+        if ngram_states.shape != expected:
+            raise ValueError(
+                "ngram_states must align with previous token IDs: "
+                f"expected {expected}, got {tuple(ngram_states.shape)}"
+            )
+        unigram = self.get_prev_embeddings(token_ids)
+        ngram = self.ngram_proj(self.ngram_norm(ngram_states.to(unigram.dtype)))
+        return unigram + ngram
+
+    def sample_block_tokens(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        prefix_token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        ngram_lookup: Callable[[torch.Tensor], torch.Tensor],
+        temperature: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sequentially sample while recomputing Engram from generated prefixes.
+
+        ``ngram_lookup(prefix)`` must return the raw Engram feature for the last
+        token in each prefix. This keeps inference causal and avoids using the
+        teacher-forced cache after the generated path diverges.
+        """
+        if prefix_token_ids.ndim != 2 or prefix_token_ids.size(0) != base_logits.size(
+            0
+        ):
+            raise ValueError("prefix_token_ids must be [batch, prefix_length]")
+        sampled_tokens = []
+        corrected_logits = []
+        prefix = prefix_token_ids.long()
+        for step_idx in range(base_logits.size(-2)):
+            step_hidden = None if hidden_states is None else hidden_states[:, step_idx]
+            ngram_state = ngram_lookup(prefix)
+            step_logits = self.apply_step_logits(
+                base_logits[:, step_idx],
+                token_ids=prefix[:, -1],
+                hidden_states=step_hidden,
+                ngram_states=ngram_state,
+            )
+            corrected_logits.append(step_logits.unsqueeze(1))
+            next_token_ids = _sample(
+                step_logits.unsqueeze(1), temperature=temperature
+            ).squeeze(1)
+            sampled_tokens.append(next_token_ids)
+            prefix = torch.cat((prefix, next_token_ids.unsqueeze(1)), dim=1)
+        if not sampled_tokens:
+            empty = prefix.new_empty(prefix.size(0), 0)
+            return empty, base_logits
+        return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
+
+
 class GatedMarkovHead(VanillaMarkovHead):
     def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
         super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
@@ -138,7 +250,9 @@ class GatedMarkovHead(VanillaMarkovHead):
         self,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        del ngram_states
         prev_embeddings = self.get_prev_embeddings(token_ids)
         gate = self.compute_gate(token_ids, hidden_states).to(prev_embeddings.dtype)
         return self.project_bias(gate * prev_embeddings)
@@ -170,7 +284,9 @@ class RNNMarkovHead(VanillaMarkovHead):
         self,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        del ngram_states
         if hidden_states is None:
             raise ValueError("rnn Markov head requires hidden_states")
         prev_embeddings = self.get_prev_embeddings(token_ids)
@@ -184,7 +300,9 @@ class RNNMarkovHead(VanillaMarkovHead):
         *,
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        del ngram_states
         if hidden_states is None:
             raise ValueError("rnn Markov head requires hidden_states")
         block_size = base_logits.size(-2)
@@ -264,6 +382,13 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
             vocab_size=config.vocab_size,
             markov_rank=markov_rank,
         )
+    if markov_head_type == "ngram":
+        return NgramMarkovHead(
+            vocab_size=config.vocab_size,
+            markov_rank=markov_rank,
+            hidden_size=config.hidden_size,
+            rms_norm_eps=config.rms_norm_eps,
+        )
     if markov_head_type == "gated":
         return GatedMarkovHead(
             vocab_size=config.vocab_size,
@@ -285,6 +410,12 @@ class DSparkDraftModel(DFlashDraftModel):
 
     expected_projector_type = "dspark"
 
+    def _init_weights(self, module: nn.Module) -> None:
+        if getattr(module, "_dspark_zero_init", False):
+            module.reset_parameters()
+            return
+        super()._init_weights(module)
+
     def __init__(self, config) -> None:
         dflash_config = getattr(config, "dflash_config", None) or {}
         projector_type = dflash_config.get("projector_type")
@@ -296,9 +427,15 @@ class DSparkDraftModel(DFlashDraftModel):
                 "DSparkDraftModel requires " "dflash_config.projector_type='dspark'."
             )
         super().__init__(config)
+        # Qwen3PreTrainedModel.post_init() runs inside the parent constructor
+        # after _init_draft_head(), so enforce the exact-baseline initialization
+        # after that generic initializer has completed.
+        if self.ngram_markov_enabled:
+            nn.init.zeros_(self.markov_head.ngram_proj.weight)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)
+        self.ngram_markov_enabled = isinstance(self.markov_head, NgramMarkovHead)
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
             dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
@@ -325,6 +462,7 @@ class DSparkDraftModel(DFlashDraftModel):
         prev_token_ids: Optional[torch.Tensor] = None,
         prev_token_embeddings: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del prev_token_embeddings
         if self.markov_head is None:
@@ -335,6 +473,7 @@ class DSparkDraftModel(DFlashDraftModel):
             base_logits,
             token_ids=prev_token_ids,
             hidden_states=hidden_states,
+            ngram_states=ngram_states,
         )
 
     def predict_confidence(
@@ -342,6 +481,7 @@ class DSparkDraftModel(DFlashDraftModel):
         hidden_states: torch.Tensor,
         *,
         prev_token_ids: Optional[torch.Tensor] = None,
+        ngram_states: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self.confidence_head is None:
             return None
@@ -349,9 +489,9 @@ class DSparkDraftModel(DFlashDraftModel):
             assert self.markov_head is not None
             if prev_token_ids is None:
                 raise ValueError("prev_token_ids is required for Markov confidence")
-            prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
-                hidden_states.dtype
-            )
+            prev_embeddings = self.markov_head.get_markov_states(
+                prev_token_ids, ngram_states
+            ).to(hidden_states.dtype)
             hidden_states = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return self.confidence_head(hidden_states).float()
 
@@ -360,6 +500,7 @@ __all__ = [
     "AcceptRatePredictor",
     "DSparkDraftModel",
     "GatedMarkovHead",
+    "NgramMarkovHead",
     "RNNMarkovHead",
     "VanillaMarkovHead",
     "build_markov_head",

@@ -92,9 +92,13 @@ def normalize_offline_dspark_sample(raw, max_len: int, dspark_supervision="respo
         raise ValueError(f"Unknown DSpark supervision: {dspark_supervision}")
     if dspark_supervision == "full_sequence":
         if not raw.get("loss_mask_is_token_aligned", False):
-            raise ValueError("Full-sequence DSpark requires a token-aligned, unpadded cache (DeepSpec v2)")
+            raise ValueError(
+                "Full-sequence DSpark requires a token-aligned, unpadded cache (DeepSpec v2)"
+            )
         if any(key in raw for key in DSPARK_OPD_KEYS):
-            raise ValueError("Full-sequence DSpark does not support fixed OPD response anchors")
+            raise ValueError(
+                "Full-sequence DSpark does not support fixed OPD response anchors"
+            )
         # Before collation: only real cached tokens become supervised.
         # The collator still pads loss_mask with zeros.
         loss_mask.fill_(1)
@@ -140,10 +144,21 @@ def normalize_offline_dspark_sample(raw, max_len: int, dspark_supervision="respo
         "hidden_states": hidden_states,
         "target_last_hidden_states": target_last_hidden_states,
     }
+    if "ngram_embedding" in raw:
+        if not raw.get("loss_mask_is_token_aligned", False):
+            raise ValueError("Ngram Markov requires token-aligned cache features")
+        ngram = normalize_hidden_state("ngram_embedding")
+        if ngram.shape != target_last_hidden_states.shape:
+            raise ValueError(
+                "Ngram and target hidden shapes must match after truncation"
+            )
+        normalized["ngram_embedding"] = ngram
     present_opd_keys = [key for key in DSPARK_OPD_KEYS if key in raw]
     if present_opd_keys and len(present_opd_keys) != len(DSPARK_OPD_KEYS):
         missing = sorted(set(DSPARK_OPD_KEYS) - set(present_opd_keys))
-        raise ValueError(f"offline DSpark sample has incomplete OPD features: {missing}")
+        raise ValueError(
+            f"offline DSpark sample has incomplete OPD features: {missing}"
+        )
     if present_opd_keys:
         anchors = raw["opd_anchor_positions"]
         valid = (anchors >= 0) & (anchors < max_len - 1)
@@ -152,9 +167,7 @@ def normalize_offline_dspark_sample(raw, max_len: int, dspark_supervision="respo
                 "opd_anchor_positions": anchors[valid].unsqueeze(0),
                 "opd_draft_token_ids": raw["opd_draft_token_ids"][valid].unsqueeze(0),
                 "opd_target_logprobs": raw["opd_target_logprobs"][valid].unsqueeze(0),
-                "opd_accepted_lengths": raw["opd_accepted_lengths"][valid].unsqueeze(
-                    0
-                ),
+                "opd_accepted_lengths": raw["opd_accepted_lengths"][valid].unsqueeze(0),
                 "opd_candidate_mask": raw["opd_candidate_mask"][valid].unsqueeze(0),
             }
         )
@@ -170,12 +183,16 @@ def build_offline_dspark_reader(
 ):
     from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
     from specforge.runtime.data_plane.deepspec_cache import (
-        DeepSpecCacheReader, is_deepspec_cache,
+        DeepSpecCacheReader,
+        is_deepspec_cache,
     )
 
     if is_deepspec_cache(hidden_states_path):
         return DeepSpecCacheReader(
-            hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len,
+            hidden_states_path,
+            run_id=run_id,
+            ttt_length=ttt_length,
+            max_len=max_len,
         )
 
     return OfflineManifestReader(
@@ -195,9 +212,12 @@ def build_offline_dspark_reader(
     )
 
 
-def build_offline_dspark_normalizer(max_len, dspark_supervision="response", **_topology):
+def build_offline_dspark_normalizer(
+    max_len, dspark_supervision="response", **_topology
+):
     return partial(
-        normalize_offline_dspark_sample, max_len=max_len,
+        normalize_offline_dspark_sample,
+        max_len=max_len,
         dspark_supervision=dspark_supervision,
     )
 
@@ -224,6 +244,10 @@ def build_dspark_collator():
             if features and all(key in features[0] for key in DSPARK_OPD_KEYS)
             else ()
         )
+        has_ngram = ["ngram_embedding" in f for f in features]
+        if any(has_ngram) and not all(has_ngram):
+            raise ValueError("Mixed samples with/without ngram features")
+        ngram_keys = ("ngram_embedding",) if all(has_ngram) and features else ()
         batch = pad_and_concatenate_features(
             features,
             sequence_axes={
@@ -231,24 +255,24 @@ def build_dspark_collator():
                 "loss_mask": 1,
                 "hidden_states": 1,
                 "target_last_hidden_states": 1,
+                "ngram_embedding": 1,
             },
             required_keys=(
                 "input_ids",
                 "loss_mask",
                 "hidden_states",
                 "target_last_hidden_states",
-            ),
+            )
+            + ngram_keys,
         )
         if optional_keys:
             import torch
 
             max_blocks = max(
-                int(feature["opd_anchor_positions"].shape[1])
-                for feature in features
+                int(feature["opd_anchor_positions"].shape[1]) for feature in features
             )
             max_candidates = max(
-                int(feature["opd_draft_token_ids"].shape[2])
-                for feature in features
+                int(feature["opd_draft_token_ids"].shape[2]) for feature in features
             )
             for key in optional_keys:
                 values = []

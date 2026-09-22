@@ -842,7 +842,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         masked_indices = torch.where(
             valid,
             indices,
-            torch.full(indices.shape, seq_len + 1, dtype=indices.dtype, device=indices.device),
+            torch.full(
+                indices.shape, seq_len + 1, dtype=indices.dtype, device=indices.device
+            ),
         )
         if not self.training:
             sorted_valid = masked_indices.sort(dim=1).values
@@ -864,7 +866,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(
-            valid, random_vals, torch.full(random_vals.shape, 2.0, dtype=random_vals.dtype, device=device)
+            valid,
+            random_vals,
+            torch.full(random_vals.shape, 2.0, dtype=random_vals.dtype, device=device),
         )
         _, sorted_idx = random_vals.sort(dim=1)
         gathered = torch.gather(masked_indices, 1, sorted_idx)
@@ -964,16 +968,23 @@ class OnlineDSparkModel(OnlineDFlashModel):
             return None
         batch, sequence, width = target_hidden.shape
         positions = (safe_label_indices - 1).clamp(min=0)
-        rows = positions + torch.arange(batch, device=positions.device)[:, None, None] * sequence
-        unique_rows, inverse = torch.unique(rows.reshape(-1), sorted=True, return_inverse=True)
-        hidden = target_hidden.reshape(batch * sequence, width).index_select(0, unique_rows)
+        rows = (
+            positions
+            + torch.arange(batch, device=positions.device)[:, None, None] * sequence
+        )
+        unique_rows, inverse = torch.unique(
+            rows.reshape(-1), sorted=True, return_inverse=True
+        )
+        hidden = target_hidden.reshape(batch * sequence, width).index_select(
+            0, unique_rows
+        )
         # Bound temporary FP32 logits independently of sequence/anchor count.
         probs = None
         for start in range(0, hidden.size(0), 1024):
-            chunk = self.lm_head(hidden[start:start + 1024]).float().softmax(dim=-1)
+            chunk = self.lm_head(hidden[start : start + 1024]).float().softmax(dim=-1)
             if probs is None:
                 probs = chunk.new_empty((hidden.size(0), chunk.size(-1)))
-            probs[start:start + chunk.size(0)].copy_(chunk)
+            probs[start : start + chunk.size(0)].copy_(chunk)
         return probs, inverse.reshape_as(safe_label_indices)
 
     def _select_opd_blocks(
@@ -995,9 +1006,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         width = self.num_anchors
         if self.training:
             scores = torch.rand(valid_blocks.shape, device=input_ids.device)
-            scores = torch.where(
-                valid_blocks, scores, torch.full_like(scores, 2.0)
-            )
+            scores = torch.where(valid_blocks, scores, torch.full_like(scores, 2.0))
             selected = scores.argsort(dim=1)
             if num_blocks < width:
                 selected = F.pad(selected, (0, width - num_blocks))
@@ -1140,9 +1149,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             min=-self.dspark_opd_loss_max_clamp,
             max=self.dspark_opd_loss_max_clamp,
         )
-        offsets = torch.arange(num_candidates, device=input_ids.device).view(
-            1, 1, -1
-        )
+        offsets = torch.arange(num_candidates, device=input_ids.device).view(1, 1, -1)
         # A rejected verify step contributes its accepted draft prefix plus
         # the target recovery token. A fully accepted block contributes only
         # its draft tokens; the bonus target token is outside this block.
@@ -1213,12 +1220,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         opd_loss = numerator * world_size / global_denominator
         metrics = {
             "opd_loss": global_stats[1] / global_denominator,
-            "opd_response_loss": (
-                global_stats[5] / global_stats[2].clamp_min(1.0)
-            ),
-            "opd_rejected_loss": (
-                global_stats[6] / global_stats[4].clamp_min(1.0)
-            ),
+            "opd_response_loss": (global_stats[5] / global_stats[2].clamp_min(1.0)),
+            "opd_rejected_loss": (global_stats[6] / global_stats[4].clamp_min(1.0)),
             "opd_response_tokens": global_stats[2] / world_size,
             "opd_accepted_tokens": global_stats[3] / world_size,
             "opd_rejected_tokens": global_stats[4] / world_size,
@@ -1229,9 +1232,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
     def _pos_loss(
         self,
-        dl_p: torch.Tensor,        # (bsz, num_anchors, vocab)
-        tl_p: Optional[torch.Tensor],   # (bsz, num_anchors, vocab) or None
-        tids_p: torch.Tensor,     # (bsz, num_anchors) long
+        dl_p: torch.Tensor,  # (bsz, num_anchors, vocab)
+        tl_p: Optional[torch.Tensor],  # (bsz, num_anchors, vocab) or None
+        tids_p: torch.Tensor,  # (bsz, num_anchors) long
         cconf_p: Optional[torch.Tensor],  # (bsz, num_anchors) or None
         target_is_probs: bool = False,
     ):
@@ -1254,24 +1257,27 @@ class OnlineDSparkModel(OnlineDFlashModel):
         else:
             ce = zeros
 
-        needs_l1 = (
-            tl_p is not None
-            and (
-                (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
-                or cconf_p is not None
-                or not self.training
-            )
+        needs_l1 = tl_p is not None and (
+            (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
+            or cconf_p is not None
+            or not self.training
         )
         if needs_l1:
             l1 = (
-                torch.softmax(dl_p.float(), dim=-1)
-                - (tl_p if target_is_probs else torch.softmax(tl_p.float(), dim=-1))
-            ).abs().sum(dim=-1)  # (bsz, num_anchors)
+                (
+                    torch.softmax(dl_p.float(), dim=-1)
+                    - (tl_p if target_is_probs else torch.softmax(tl_p.float(), dim=-1))
+                )
+                .abs()
+                .sum(dim=-1)
+            )  # (bsz, num_anchors)
         else:
             l1 = zeros
 
         if self.dspark_loss_mode == "kl" and tl_p is not None:
-            teacher_probs = tl_p if target_is_probs else torch.softmax(tl_p.float(), dim=-1)
+            teacher_probs = (
+                tl_p if target_is_probs else torch.softmax(tl_p.float(), dim=-1)
+            )
             student_log_probs = F.log_softmax(dl_p.float(), dim=-1)
             kl = F.kl_div(
                 student_log_probs,
@@ -1300,7 +1306,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
         aligned_target_logits: Optional[torch.Tensor],
         unique_target_probs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        has_target = aligned_target_logits is not None or unique_target_probs is not None
+        has_target = (
+            aligned_target_logits is not None or unique_target_probs is not None
+        )
         loss_weight_mask = self._dspark_loss_weight_mask(eval_mask)
         ce_loss_den = loss_weight_mask.sum()
         ce_loss_sum = loss_weight_mask.new_zeros(())
@@ -1322,13 +1330,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             or use_confidence_loss
             or not self.training
         )
-        if (
-            not has_target
-            and (
-                self.dspark_loss_mode == "kl"
-                or self.dspark_l1_loss_alpha > 0
-                or use_confidence_loss
-            )
+        if not has_target and (
+            self.dspark_loss_mode == "kl"
+            or self.dspark_l1_loss_alpha > 0
+            or use_confidence_loss
         ):
             raise ValueError(
                 "DSpark distribution/confidence loss requires target_last_hidden_states. "
@@ -1343,9 +1348,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             target_p = None
             if unique_target_probs is not None:
                 probs, inverse = unique_target_probs
-                target_p = probs.index_select(0, inverse[:, :, position].reshape(-1)).reshape(
-                    *inverse.shape[:2], probs.size(-1)
-                )
+                target_p = probs.index_select(
+                    0, inverse[:, :, position].reshape(-1)
+                ).reshape(*inverse.shape[:2], probs.size(-1))
             elif aligned_target_logits is not None:
                 target_p = aligned_target_logits[:, :, position, :]
             tl_p = target_p if needs_target_distribution else None
@@ -1373,12 +1378,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ce_position_sum = (ce_p * wmask_p).sum()
             position_denom = wmask_p.sum()
             ce_loss_sum = ce_loss_sum + ce_position_sum
-            eval_metric_sums[f"mtp_{position + 1}_ce"] = (
-                ce_position_sum.detach()
-            )
-            eval_metric_denoms[f"mtp_{position + 1}_ce"] = (
-                position_denom.detach()
-            )
+            eval_metric_sums[f"mtp_{position + 1}_ce"] = ce_position_sum.detach()
+            eval_metric_denoms[f"mtp_{position + 1}_ce"] = position_denom.detach()
 
             if tl_p is not None:
                 l1_position_sum = (l1_p * wmask_p).sum()
@@ -1399,16 +1400,27 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     # Reuse the loss's L1 when available; KL/CE-only runs
                     # still need actual distribution overlap for this metric.
                     if tl_p is not None and (
-                        (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
+                        (
+                            self.dspark_loss_mode == "original"
+                            and self.dspark_l1_loss_alpha > 0
+                        )
                         or cconf_p is not None
                         or not self.training
                     ):
                         metric_l1 = l1_p.detach()
                     else:
                         metric_l1 = (
-                            dl_p.float().softmax(dim=-1)
-                            - (target_p if unique_target_probs is not None else target_p.float().softmax(dim=-1))
-                        ).abs().sum(dim=-1)
+                            (
+                                dl_p.float().softmax(dim=-1)
+                                - (
+                                    target_p
+                                    if unique_target_probs is not None
+                                    else target_p.float().softmax(dim=-1)
+                                )
+                            )
+                            .abs()
+                            .sum(dim=-1)
+                        )
                     accept_rates.append((1.0 - 0.5 * metric_l1).clamp(0.0, 1.0))
 
             position_sum = (
@@ -1420,14 +1432,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             position_denoms.append(position_denom)
 
             if use_confidence_loss:
-                confidence_loss_sum = confidence_loss_sum + (
-                    conf_err_p * wmask_p
-                ).sum()
+                confidence_loss_sum = confidence_loss_sum + (conf_err_p * wmask_p).sum()
                 with torch.no_grad():
                     accept_p = (1.0 - 0.5 * l1_p).clamp(0.0, 1.0)
-                    confidence_abs_error_sum = confidence_abs_error_sum + (
-                        (cconf_p.float().sigmoid() - accept_p).abs() * wmask_p
-                    ).sum()
+                    confidence_abs_error_sum = (
+                        confidence_abs_error_sum
+                        + ((cconf_p.float().sigmoid() - accept_p).abs() * wmask_p).sum()
+                    )
 
         if accept_rates:
             accept_sums, accept_denoms = acceptance_stats(
@@ -1531,6 +1542,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         opd_target_logprobs: Optional[torch.Tensor] = None,
         opd_accepted_lengths: Optional[torch.Tensor] = None,
         opd_candidate_mask: Optional[torch.Tensor] = None,
+        ngram_embedding: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1553,8 +1565,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "training.dspark_opd_loss_alpha > 0 requires OPD trace features"
             )
         use_opd = self.dspark_opd_loss_alpha > 0 and has_opd_features
+        if use_opd and getattr(self.draft_model, "ngram_markov_enabled", False):
+            raise ValueError(
+                "Ngram Markov currently supports teacher-forced DSpark loss only; "
+                "OPD-generated prefixes require an online Engram lookup"
+            )
         selected_opd = None
-        if use_opd and opd_anchor_positions is not None and opd_anchor_positions.size(1):
+        if (
+            use_opd
+            and opd_anchor_positions is not None
+            and opd_anchor_positions.size(1)
+        ):
             assert opd_anchor_positions is not None
             assert opd_draft_token_ids is not None
             assert opd_target_logprobs is not None
@@ -1598,9 +1619,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 torch.zeros(
                     (bsz, num_blocks), dtype=torch.long, device=input_ids.device
                 ),
-                torch.zeros(
-                    candidate_shape, dtype=torch.bool, device=input_ids.device
-                ),
+                torch.zeros(candidate_shape, dtype=torch.bool, device=input_ids.device),
             )
         output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
         (
@@ -1618,17 +1637,42 @@ class OnlineDSparkModel(OnlineDFlashModel):
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
         )
+        prev_ngram_states = None
+        if getattr(self.draft_model, "ngram_markov_enabled", False):
+            if ngram_embedding is None:
+                raise ValueError(
+                    "Ngram Markov head requires token-aligned ngram_embedding"
+                )
+            expected = (*input_ids.shape, output_hidden.size(-1))
+            if ngram_embedding.shape != expected:
+                raise ValueError(
+                    "Ngram Markov features must have shape "
+                    f"{expected}, got {tuple(ngram_embedding.shape)}"
+                )
+            # Position i predicts token anchor+i+1, so its Markov state may use
+            # the raw Engram feature at anchor+i (the previous known token).
+            offsets = torch.arange(self.block_size, device=input_ids.device)
+            indices = anchor_positions.unsqueeze(-1) + offsets
+            indices = indices.clamp(max=input_ids.size(1) - 1)
+            expanded = ngram_embedding[:, None].expand(-1, num_blocks, -1, -1)
+            prev_ngram_states = torch.gather(
+                expanded,
+                2,
+                indices[..., None].expand(-1, -1, -1, ngram_embedding.size(-1)),
+            )
         base_logits = logits.reshape(bsz, num_blocks, self.block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
             base_logits,
             prev_token_ids=prev_token_ids,
             hidden_states=output_hidden_4d,
+            ngram_states=prev_ngram_states,
         )
         confidence_pred = None
         if self.dspark_confidence_head_alpha > 0:
             confidence_pred = self.draft_model.predict_confidence(
                 output_hidden_4d,
                 prev_token_ids=prev_token_ids,
+                ngram_states=prev_ngram_states,
             )
         # OPD consumes target log-probabilities through its existing logits path.
         # Standard offline/online DSpark reuses unique target probabilities.
@@ -1636,11 +1680,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
         aligned_target_logits = None
         if selected_opd is not None:
             aligned_target_logits = self._aligned_target_logits(
-                target_last_hidden_states, safe_label_indices,
+                target_last_hidden_states,
+                safe_label_indices,
             )
         else:
             unique_target_probs = self._unique_target_probs(
-                target_last_hidden_states, safe_label_indices,
+                target_last_hidden_states,
+                safe_label_indices,
             )
         loss, metrics = self._compute_dspark_loss(
             draft_logits=draft_logits,

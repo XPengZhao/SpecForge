@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import struct
+from contextlib import nullcontext
 from itertools import islice
 from pathlib import Path
 
@@ -13,7 +14,13 @@ from specforge.runtime.contracts import FeatureSpec, SampleRef
 
 INDEX_RECORD = struct.Struct("<QIIQQQQQ")
 TOKEN_ALIGNED_MASK = "loss_mask_is_token_aligned"
-FEATURE_KEYS = ("input_ids", "loss_mask", "aux_hidden_state", "hidden_state", TOKEN_ALIGNED_MASK)
+FEATURE_KEYS = (
+    "input_ids",
+    "loss_mask",
+    "aux_hidden_state",
+    "hidden_state",
+    TOKEN_ALIGNED_MASK,
+)
 
 
 def is_deepspec_cache(path):
@@ -34,19 +41,31 @@ class DeepSpecCacheReader:
         self.manifest = json.loads((self.root / "manifest.json").read_text())
         m = self.manifest
         for key, expected in {
-            "version": 2, "index_record_size": INDEX_RECORD.size,
-            "hidden_dtype": "bfloat16", "token_dtype": "int32", "mask_dtype": "uint8",
+            "version": 2,
+            "index_record_size": INDEX_RECORD.size,
+            "hidden_dtype": "bfloat16",
+            "token_dtype": "int32",
+            "mask_dtype": "uint8",
         }.items():
             if m.get(key) != expected:
-                raise ValueError(f"DeepSpec {key}: expected {expected!r}, got {m.get(key)!r}")
+                raise ValueError(
+                    f"DeepSpec {key}: expected {expected!r}, got {m.get(key)!r}"
+                )
         self.hidden_size = int(m["hidden_size"])
         self.layers = m["target_layer_ids"]
-        if (self.hidden_size <= 0 or not self.layers
-                or any(type(x) is not int or x < 0 for x in self.layers)
-                or sorted(set(self.layers)) != self.layers):
+        if (
+            self.hidden_size <= 0
+            or not self.layers
+            or any(type(x) is not int or x < 0 for x in self.layers)
+            or sorted(set(self.layers)) != self.layers
+        ):
             raise ValueError("Invalid DeepSpec hidden_size or target_layer_ids")
-        if not isinstance(m.get("target_model_name_or_path"), str) or not m["target_model_name_or_path"]:
+        if (
+            not isinstance(m.get("target_model_name_or_path"), str)
+            or not m["target_model_name_or_path"]
+        ):
             raise ValueError("DeepSpec target_model_name_or_path is required")
+        self.ngram = None
         self.num_samples = int(m["num_samples"])
         if self.num_samples <= 0:
             raise ValueError("DeepSpec cache is empty")
@@ -60,12 +79,27 @@ class DeepSpecCacheReader:
         for i, shard in enumerate(shards):
             path = (self.root / shard["file_name"]).resolve()
             if shard["shard_id"] != i or not path.is_relative_to(self.root):
-                raise ValueError("DeepSpec shard ids must be contiguous and paths inside cache")
+                raise ValueError(
+                    "DeepSpec shard ids must be contiguous and paths inside cache"
+                )
             self.shards.append((str(path), path.stat().st_size))
 
-    def validate_model(self, *, hidden_size, target_layer_ids, target_model_path, target_config=None):
-        if int(hidden_size) != self.hidden_size or list(target_layer_ids) != self.layers:
-            raise ValueError("DeepSpec cache hidden size / target layer order does not match draft")
+    def enable_ngram(self):
+        from .ngram_sidecar import NgramSidecar, KEY
+
+        self.ngram = NgramSidecar(self.root, self.manifest)
+        self.feature_keys = FEATURE_KEYS + (KEY,)
+
+    def validate_model(
+        self, *, hidden_size, target_layer_ids, target_model_path, target_config=None
+    ):
+        if (
+            int(hidden_size) != self.hidden_size
+            or list(target_layer_ids) != self.layers
+        ):
+            raise ValueError(
+                "DeepSpec cache hidden size / target layer order does not match draft"
+            )
         actual = self.manifest["target_model_name_or_path"]
         if str(target_model_path).rstrip("/") != actual.rstrip("/"):
             raise ValueError(
@@ -78,32 +112,48 @@ class DeepSpecCacheReader:
 
     def validate_qwen38(self, target_config):
         """Reject raw HC tensors or pre-mixer supervision, even if widths fit."""
-        text = target_config.get('text_config', {})
-        if (target_config.get('model_type') != 'qwen4_exp'
-                or text.get('hidden_size') != 2560 or text.get('hc_count') != 4
-                or text.get('num_hidden_layers') != 48):
-            raise ValueError('Expected Qwen3.8-Flash-Next: 48 layers, hidden 2560, hc_count 4')
+        text = target_config.get("text_config", {})
+        if (
+            target_config.get("model_type") != "qwen4_exp"
+            or text.get("hidden_size") != 2560
+            or text.get("hc_count") != 4
+            or text.get("num_hidden_layers") != 48
+        ):
+            raise ValueError(
+                "Expected Qwen3.8-Flash-Next: 48 layers, hidden 2560, hc_count 4"
+            )
         if self.hidden_size != 2560 or self.layers != [45, 46, 47]:
-            raise ValueError('Qwen3.8 aux-only baseline requires layers [45, 46, 47] at width 2560 each')
-        expected = dict(aux_reduction='post_layer_hc_mean_fp32_to_bfloat16',
-                        target_final_feature='last_hidden_state_after_hyper_connection_mixer',
-                        hc_count=4, capture_scope='full_sequence',
-                        loss_mask_scope='assistant_response', enable_thinking=False)
+            raise ValueError(
+                "Qwen3.8 aux-only baseline requires layers [45, 46, 47] at width 2560 each"
+            )
+        expected = dict(
+            aux_reduction="post_layer_hc_mean_fp32_to_bfloat16",
+            target_final_feature="last_hidden_state_after_hyper_connection_mixer",
+            hc_count=4,
+            capture_scope="full_sequence",
+            loss_mask_scope="assistant_response",
+            enable_thinking=False,
+        )
         for key, value in expected.items():
             if self.manifest.get(key) != value:
-                raise ValueError(f'Qwen3.8 cache {key}: expected {value!r}, got {self.manifest.get(key)!r}')
-        cached = self.manifest.get('target_config', {})
-        if cached.get('model_type') != 'qwen4_exp':
-            raise ValueError('Cache was not captured from a qwen4_exp target')
-        for key in ('hidden_size', 'vocab_size', 'num_hidden_layers', 'hc_count'):
-            if cached.get('text_config', {}).get(key) != text.get(key):
-                raise ValueError(f'Qwen3.8 cache/target config mismatch: {key}')
+                raise ValueError(
+                    f"Qwen3.8 cache {key}: expected {value!r}, got {self.manifest.get(key)!r}"
+                )
+        cached = self.manifest.get("target_config", {})
+        if cached.get("model_type") != "qwen4_exp":
+            raise ValueError("Cache was not captured from a qwen4_exp target")
+        for key in ("hidden_size", "vocab_size", "num_hidden_layers", "hc_count"):
+            if cached.get("text_config", {}).get(key) != text.get(key):
+                raise ValueError(f"Qwen3.8 cache/target config mismatch: {key}")
 
     def __iter__(self):
         width = len(self.layers) * self.hidden_size
-        keys = {name: name for name in FEATURE_KEYS}
+        keys = {name: name for name in self.feature_keys}
         specs_by_length = {}
-        with self.index_path.open("rb") as index:
+        with (
+            self.index_path.open("rb") as index,
+            self.ngram.index.open("rb") if self.ngram else nullcontext() as side_index,
+        ):
             for i in range(self.num_samples):
                 record = index.read(INDEX_RECORD.size)
                 if len(record) != INDEX_RECORD.size:
@@ -112,32 +162,71 @@ class DeepSpecCacheReader:
                 if sample_id != i or length <= 0 or shard_id >= len(self.shards):
                     raise ValueError(f"Invalid DeepSpec index record {i}")
                 path, shard_size = self.shards[shard_id]
-                sizes = (4 * length, length, length, 2 * length * width,
-                         2 * length * self.hidden_size)
-                if any(offset + size > shard_size for offset, size in zip(offsets, sizes)):
+                sizes = (
+                    4 * length,
+                    length,
+                    length,
+                    2 * length * width,
+                    2 * length * self.hidden_size,
+                )
+                if any(
+                    offset + size > shard_size for offset, size in zip(offsets, sizes)
+                ):
                     raise ValueError(f"DeepSpec sample {i} extends beyond shard")
                 if any(offsets[j] + sizes[j] > offsets[j + 1] for j in range(4)):
                     raise ValueError(f"Overlapping DeepSpec fields in sample {i}")
+                extra = {}
+                if self.ngram:
+                    extra["ngram"] = self.ngram.next_sample(side_index, i, length)
                 n = min(length, self.max_len)
                 specs = specs_by_length.get(n)
                 if specs is None:
                     specs = {
                         "input_ids": FeatureSpec("input_ids", (n,), "int64"),
                         "loss_mask": FeatureSpec("loss_mask", (n,), "uint8"),
-                        "aux_hidden_state": FeatureSpec("aux_hidden_state", (n, width), "bfloat16"),
-                        "hidden_state": FeatureSpec("hidden_state", (n, self.hidden_size), "bfloat16"),
+                        "aux_hidden_state": FeatureSpec(
+                            "aux_hidden_state", (n, width), "bfloat16"
+                        ),
+                        "hidden_state": FeatureSpec(
+                            "hidden_state", (n, self.hidden_size), "bfloat16"
+                        ),
                         TOKEN_ALIGNED_MASK: FeatureSpec(TOKEN_ALIGNED_MASK, (), "bool"),
                     }
+                    if self.ngram:
+                        specs["ngram_embedding"] = FeatureSpec(
+                            "ngram_embedding", (n, self.ngram.width), "bfloat16"
+                        )
                     specs_by_length[n] = specs
                 yield SampleRef(
-                    sample_id=f"{self.run_id}:{i:08d}", run_id=self.run_id,
-                    source_task_id=None, feature_store_uri=f"deepspec://{path}",
-                    feature_keys=keys, feature_specs=specs, strategy="dspark",
+                    sample_id=f"{self.run_id}:{i:08d}",
+                    run_id=self.run_id,
+                    source_task_id=None,
+                    feature_store_uri=f"deepspec://{path}",
+                    feature_keys=keys,
+                    feature_specs=specs,
+                    strategy="dspark",
                     target_model_version=self.manifest["target_model_name_or_path"],
-                    num_tokens=n, estimated_bytes=n * (9 + 2 * (width + self.hidden_size)) + 1,
-                    metadata={"format": "deepspec_v2", "target_repr": self.target_repr,
-                              "ttt_length": self.ttt_length, "max_len": self.max_len,
-                              "file_index": i, "offsets": offsets},
+                    num_tokens=n,
+                    estimated_bytes=n
+                    * (
+                        9
+                        + 2
+                        * (
+                            width
+                            + self.hidden_size
+                            + (self.ngram.width if self.ngram else 0)
+                        )
+                    )
+                    + 1,
+                    metadata={
+                        "format": "deepspec_v2",
+                        "target_repr": self.target_repr,
+                        "ttt_length": self.ttt_length,
+                        "max_len": self.max_len,
+                        "file_index": i,
+                        "offsets": offsets,
+                        **extra,
+                    },
                 )
 
     def read(self, limit=None):
@@ -148,14 +237,32 @@ def read_deepspec_features(ref, names):
     """Read owned tensors with independent file handles, safe for loader threads."""
     path = ref.feature_store_uri.removeprefix("deepspec://")
     offsets = ref.metadata["offsets"]
-    field_offsets = dict(zip(FEATURE_KEYS[:4], (offsets[0], offsets[2], offsets[3], offsets[4])))
-    storage_dtypes = {"input_ids": torch.int32, "loss_mask": torch.uint8,
-                      "aux_hidden_state": torch.bfloat16, "hidden_state": torch.bfloat16}
+    field_offsets = dict(
+        zip(FEATURE_KEYS[:4], (offsets[0], offsets[2], offsets[3], offsets[4]))
+    )
+    storage_dtypes = {
+        "input_ids": torch.int32,
+        "loss_mask": torch.uint8,
+        "aux_hidden_state": torch.bfloat16,
+        "hidden_state": torch.bfloat16,
+    }
     result = {}
     with open(path, "rb") as stream:
         for name in names:
             if name == TOKEN_ALIGNED_MASK:
                 result[name] = torch.tensor(True)
+                continue
+            if name == "ngram_embedding":
+                location = ref.metadata["ngram"]
+                shape = ref.feature_specs[name].shape
+                with open(location["path"], "rb") as side:
+                    side.seek(location["offset"])
+                    data = bytearray(side.read(shape[0] * shape[1] * 2))
+                if len(data) != shape[0] * shape[1] * 2:
+                    raise ValueError("Truncated ngram payload")
+                result[name] = torch.frombuffer(data, dtype=torch.bfloat16).reshape(
+                    shape
+                )
                 continue
             spec = ref.feature_specs[name]
             dtype = storage_dtypes[name]

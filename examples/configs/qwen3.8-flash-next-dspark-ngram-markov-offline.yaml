@@ -1,0 +1,41 @@
+model:
+  target_model_path: /public/llm_models/Qwen/Qwen3.8-Flash-Next
+  draft_model_config: configs/qwen3.8-flash-next-dspark-ngram-markov.json
+  torch_dtype: bfloat16
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+data:
+  hidden_states_path: /public/workspace/dspark/cache/deepspec/qwen38_flash_next
+  max_length: 4096
+  dataloader_num_workers: 4
+  dspark_supervision: response
+training:
+  strategy: dspark
+  attention_backend: flex_attention
+  fsdp_sharding: NO_SHARD
+  batch_size: 4
+  accumulation_steps: 32
+  num_epochs: 10
+  total_steps: 26040
+  max_steps: 2604
+  learning_rate: 0.0003
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  num_anchors: 512
+  loss_decay_gamma: 4.0
+  dspark_loss_mode: original
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 200
+  log_interval: 10
+  seed: 42
+run_id: qwen38-draft3-ngram-markov
+output_dir: outputs/qwen38-draft3-ngram-markov
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+tracking:
+  report_to: tensorboard

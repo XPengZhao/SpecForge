@@ -167,11 +167,26 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
 
     provider = algorithm.providers.model
     draft_config, draft_model = _load_draft(cfg, algorithm)
+    if getattr(draft_model, "ngram_markov_enabled", False):
+        if (
+            cfg.mode != "offline"
+            or cfg.deployment.mode != "local_colocated"
+            or algorithm.name != "dspark"
+        ):
+            raise ValueError(
+                "Ngram Markov currently supports local_colocated offline DSpark only"
+            )
+        from specforge.runtime.data_plane.deepspec_cache import DeepSpecCacheReader
+
+        for path in (cfg.data.hidden_states_path, cfg.data.eval_hidden_states_path):
+            if path:
+                DeepSpecCacheReader(path).enable_ngram()
     needs_input_tools = provider.needs_input_tools(cfg, draft_model)
     input_tools = _load_input_tools(cfg, algorithm) if needs_input_tools else None
     target_config_loader = AutoConfig.from_pretrained
     if cfg.mode == "offline" and algorithm.name == "dspark":
         from specforge.modeling.target.offline_config import load_offline_target_config
+
         target_config_loader = load_offline_target_config
     target_config = target_config_loader(
         cfg.model.target_model_path,
@@ -181,13 +196,16 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     text_config = _target_text_config(target_config)
     if cfg.mode == "offline":
         from specforge.runtime.data_plane.deepspec_cache import (
-            DeepSpecCacheReader, is_deepspec_cache,
+            DeepSpecCacheReader,
+            is_deepspec_cache,
         )
 
         for path in (cfg.data.hidden_states_path, cfg.data.eval_hidden_states_path):
             if path and is_deepspec_cache(path):
                 if algorithm.name != "dspark":
-                    raise ValueError("DeepSpec target caches currently require strategy=dspark")
+                    raise ValueError(
+                        "DeepSpec target caches currently require strategy=dspark"
+                    )
                 DeepSpecCacheReader(path).validate_model(
                     hidden_size=draft_config.hidden_size,
                     target_layer_ids=draft_model.target_layer_ids,
@@ -197,10 +215,19 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     if getattr(target_config, "model_type", None) == "qwen4_exp":
         if cfg.mode != "offline" or algorithm.name != "dspark":
             raise ValueError("Qwen3.8 currently supports offline DSpark training only")
-        if not cfg.data.hidden_states_path or not is_deepspec_cache(cfg.data.hidden_states_path):
-            raise ValueError("Qwen3.8 requires a finalized DeepSpec cache with capture metadata")
-        if draft_config.hidden_size != text_config.hidden_size or draft_config.vocab_size != text_config.vocab_size:
-            raise ValueError("Qwen3.8 draft hidden/vocabulary dimensions do not match target")
+        if not cfg.data.hidden_states_path or not is_deepspec_cache(
+            cfg.data.hidden_states_path
+        ):
+            raise ValueError(
+                "Qwen3.8 requires a finalized DeepSpec cache with capture metadata"
+            )
+        if (
+            draft_config.hidden_size != text_config.hidden_size
+            or draft_config.vocab_size != text_config.vocab_size
+        ):
+            raise ValueError(
+                "Qwen3.8 draft hidden/vocabulary dimensions do not match target"
+            )
     target_hidden_size = int(text_config.hidden_size)
     target_vocab_size = int(text_config.vocab_size)
     draft_vocab_size = int(
