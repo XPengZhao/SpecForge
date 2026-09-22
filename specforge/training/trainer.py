@@ -455,6 +455,15 @@ class Trainer:
         )
         if resume is not None:
             backend.load_state_dict(resume["backend"])
+            resume_lr = getattr(optimizer_factory, "resume_learning_rate", None)
+            if resume_lr is not None:
+                rebase_lr = getattr(backend.optimizer, "rebase_learning_rate", None)
+                if not callable(rebase_lr):
+                    raise RuntimeError(
+                        "training.resume_learning_rate requires an optimizer "
+                        "that supports LR schedule rebasing"
+                    )
+                rebase_lr(resume_lr)
         strategy = make_step_strategy(
             wrapped,
             target_head=target_head,

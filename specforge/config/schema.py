@@ -548,6 +548,10 @@ class TrainingConfig(StrictConfigModel):
     compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
+    #: Optional replacement peak LR after a full resume. Optimizer moments,
+    #: scheduler progress, counters, data position, and RNG are still restored;
+    #: only the saved LR curve is rescaled to this peak.
+    resume_learning_rate: Optional[float] = Field(default=None, gt=0.0)
     #: Keep optimizer/scheduler/global_step from ``resume_from``, but start the
     #: new dump at epoch 0 / sample 0. Skips dataset-size and sampler-shuffle
     #: resume checks so a replacement shard can follow a deleted offline dump.
@@ -561,6 +565,10 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.resume_learning_rate is not None and self.resume_from is None:
+            raise ValueError(
+                "training.resume_learning_rate requires training.resume_from"
+            )
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

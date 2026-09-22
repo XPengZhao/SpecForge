@@ -213,6 +213,7 @@ Common fields:
 | `training.log_interval` | `50` | Positive optimizer-step logging interval. |
 | `training.max_checkpoints` | `0` | Keep the newest N checkpoints; 0 keeps all. |
 | `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `model.draft_checkpoint_path`. |
+| `training.resume_learning_rate` | `null` | Optional new peak LR for a full resume. Preserves optimizer moments and scheduler progress while rescaling the restored LR curve. Requires `training.resume_from`. |
 | `training.resume_reset_data_position` | `false` | With `resume_from`, keep optimizer/scheduler/`global_step` but start the new offline dump at epoch 0 / sample 0. Skips `dataset_size` / `source_dataset_size` checks. Requires `resume_from`. |
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |

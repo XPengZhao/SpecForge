@@ -250,6 +250,7 @@ class _ConfiguredOptimizerFactory:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.total_steps = cfg.training.total_steps or cfg.training.max_steps
+        self.resume_learning_rate = cfg.training.resume_learning_rate
 
     def configure_total_steps(self, total_steps: int) -> None:
         if self.total_steps is None:
