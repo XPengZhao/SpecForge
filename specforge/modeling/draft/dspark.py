@@ -21,22 +21,22 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(batch_size, seq_len)
 
 
-class NgramMaskEmbedding(nn.Module):
-    """Post-normalized projection with zero-initialized, bounded residual gates."""
+class NgramMaskReplacement(nn.Module):
+    """Replace every MASK slot with a post-normalized pre-anchor Engram projection."""
+
     def __init__(self, hidden_size, block_size, eps):
         super().__init__()
         self.block_size = block_size
         self.norm = nn.RMSNorm(hidden_size, eps=eps, elementwise_affine=False)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.gate = nn.Parameter(torch.zeros(block_size - 1))
 
     def forward(self, noise_embedding, context):
         batch, anchors, width = context.shape
         if noise_embedding.shape != (batch, anchors * self.block_size, width):
             raise ValueError('Ngram context shape does not match draft blocks')
-        delta = self.norm(self.proj(context.to(noise_embedding.dtype)))
+        replacement = self.norm(self.proj(context.to(noise_embedding.dtype)))
         blocks = noise_embedding.reshape(batch, anchors, self.block_size, width)
-        masks = blocks[:, :, 1:] + delta[:, :, None, :] * self.gate.tanh()[None, None, :, None]
+        masks = replacement[:, :, None, :].expand(-1, -1, self.block_size - 1, -1)
         return torch.cat((blocks[:, :, :1], masks), dim=2).reshape_as(noise_embedding)
 
 
@@ -330,7 +330,14 @@ class DSparkDraftModel(DFlashDraftModel):
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.ngram_mask_enabled = bool(dflash_config.get('ngram_mask', False))
         if self.ngram_mask_enabled:
-            self.ngram_mask = NgramMaskEmbedding(config.hidden_size, config.block_size, config.rms_norm_eps)
+            mode = dflash_config.get('ngram_mask_mode')
+            if mode != 'replace':
+                raise ValueError(
+                    "Ngram MASK replacement requires dflash_config.ngram_mask_mode='replace'"
+                )
+            self.ngram_mask = NgramMaskReplacement(
+                config.hidden_size, config.block_size, config.rms_norm_eps
+            )
         self.markov_head = build_markov_head(config, dflash_config)
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(

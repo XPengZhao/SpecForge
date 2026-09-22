@@ -8,7 +8,7 @@ import pytest
 import torch
 from transformers import Qwen3Config
 
-from specforge.modeling.draft.dspark import DSparkDraftModel, NgramMaskEmbedding
+from specforge.modeling.draft.dspark import DSparkDraftModel, NgramMaskReplacement
 from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 from specforge.algorithms.common.dflash_family_data import normalize_offline_dspark_sample, build_dspark_collator
 from specforge.runtime.data_plane.deepspec_cache import DeepSpecCacheReader, read_deepspec_features
@@ -75,7 +75,8 @@ def tiny_config(enabled=True):
     return Qwen3Config(hidden_size=16, intermediate_size=32, num_hidden_layers=2,
         num_attention_heads=4,num_key_value_heads=2,head_dim=4,vocab_size=32,
         block_size=7,num_target_layers=48,dflash_config=dict(target_layer_ids=[45,46,47],
-            projector_type='dspark',mask_token_id=0,markov_rank=4,ngram_mask=enabled))
+            projector_type='dspark',mask_token_id=0,markov_rank=4,ngram_mask=enabled,
+            ngram_mask_mode='replace' if enabled else None))
 
 
 def training_model(enabled=True):
@@ -86,32 +87,27 @@ def training_model(enabled=True):
         block_size=7,attention_backend='sdpa',num_anchors=3,dspark_confidence_head_alpha=0)
 
 
-def test_zero_gate_baseline_and_training_gradients():
+def test_replacement_trains_projection_from_first_step():
     torch.manual_seed(10)
-    m=training_model();base=training_model(False)
-    base.load_state_dict({k:v for k,v in m.state_dict().items() if 'ngram_mask.' not in k})
+    m=training_model()
     ids=torch.randint(1,32,(1,12));aux=torch.randn(1,12,48);mask=torch.ones(1,12)
     ngram=torch.randn(1,12,16);target=torch.randn(1,12,16)
     anchors=torch.tensor([[0,2,4]]);keep=torch.ones_like(anchors,dtype=torch.bool)
-    with patch.object(m,'_sample_anchor_positions',return_value=(anchors,keep)), patch.object(base,'_sample_anchor_positions',return_value=(anchors,keep)):
-        old=base(ids,aux,mask,target)
-        new=m(ids,aux,mask,target,ngram_embedding=ngram)
-    torch.testing.assert_close(old[0],new[0],rtol=0,atol=0)
-    new[0].backward()
-    assert m.draft_model.ngram_mask.gate.grad.abs().sum()>0
-    assert not m.draft_model.ngram_mask.proj.weight.grad.any()
-    assert all(p.grad is None for p in m.lm_head.parameters())
-    m.zero_grad()
-    m.draft_model.ngram_mask.gate.data.fill_(.1)
     with patch.object(m,'_sample_anchor_positions',return_value=(anchors,keep)):
-        m(ids,aux,mask,target,ngram_embedding=ngram)[0].backward()
+        loss=m(ids,aux,mask,target,ngram_embedding=ngram)[0]
+    loss.backward()
     assert m.draft_model.ngram_mask.proj.weight.grad.abs().sum()>0
+    assert not hasattr(m.draft_model.ngram_mask, 'gate')
+    assert all(p.grad is None for p in m.lm_head.parameters())
     clone=training_model();clone.load_state_dict(m.state_dict())
-    torch.testing.assert_close(clone.draft_model.ngram_mask.gate,m.draft_model.ngram_mask.gate)
+    torch.testing.assert_close(
+        clone.draft_model.ngram_mask.proj.weight,
+        m.draft_model.ngram_mask.proj.weight,
+    )
 
 
 def test_anchor_minus_one_and_anchor_embedding_untouched():
-    m=training_model();m.draft_model.ngram_mask.gate.data.fill_(1)
+    m=training_model()
     ids=torch.randint(1,32,(1,8));aux=torch.randn(1,8,48);mask=torch.ones(1,8)
     ngram=torch.randn(1,8,16);anchors=torch.tensor([[0,3,6]]);keep=torch.tensor([[True,True,False]])
     contexts=[]
@@ -123,9 +119,21 @@ def test_anchor_minus_one_and_anchor_embedding_untouched():
     torch.testing.assert_close(before,after,rtol=0,atol=0)
     torch.testing.assert_close(contexts[0][0,1],ngram[0,2])
     assert not contexts[0][0,0].any() and not contexts[0][0,2].any()
+    embedding_inputs=[]
+    embedding_handle=m.embed_tokens.register_forward_pre_hook(
+        lambda module,args: embedding_inputs.append(args[0].detach().clone())
+    )
     noise=m._create_noise_embed(ids,anchors,keep)
+    embedding_handle.remove()
+    assert embedding_inputs[0].shape == anchors.shape
+    torch.testing.assert_close(embedding_inputs[0], ids.gather(1,anchors))
+    noise_blocks=noise.reshape(1,3,7,16)
+    assert not noise_blocks[:,:,1:].any()
+    torch.testing.assert_close(
+        noise_blocks[0,:2,0], m.embed_tokens(ids.gather(1,anchors))[0,:2]
+    )
     out=m.draft_model.ngram_mask(noise,contexts[0]).reshape(1,3,7,16)
-    torch.testing.assert_close(out[:,:,0],noise.reshape_as(out)[:,:,0],rtol=0,atol=0)
+    torch.testing.assert_close(out[:,:,0],noise_blocks[:,:,0],rtol=0,atol=0)
     with pytest.raises(ValueError,match='token-aligned'):
         m._forward_draft_blocks(ids,aux,mask,anchors,keep)
 
@@ -161,26 +169,24 @@ def test_strategy_forwards_ngram_feature():
         ngram_embedding=torch.randn(1,12,16))
     out=DSparkTrainStrategy(m).forward_loss(TrainBatch(sample_ids=['a'],strategy='dspark',tensors=tensors))
     out.loss.backward()
-    assert m.draft_model.ngram_mask.gate.grad is not None
+    assert m.draft_model.ngram_mask.proj.weight.grad is not None
 
 
-def test_postnorm_tanh_without_extra_scale():
-    module = NgramMaskEmbedding(4, 7, 1e-6)
+def test_postnorm_projection_replaces_mask_slots():
+    module = NgramMaskReplacement(4, 7, 1e-6)
     with torch.no_grad():
         module.proj.weight.copy_(torch.diag(torch.tensor([1., 2., 4., 8.])))
-        module.gate.copy_(torch.tensor([-10., -1., 0., .2, 1., 10.]))
     context = torch.tensor([[[2., -1., 3., .5]]])
     noise = torch.randn(1, 7, 4)
     projected = module.proj(context)
-    expected_delta = projected / (projected.square().mean(-1, keepdim=True) + 1e-6).sqrt()
+    replacement = projected / (projected.square().mean(-1, keepdim=True) + 1e-6).sqrt()
     expected = noise.clone().reshape(1,1,7,4)
-    expected[:,:,1:] += module.gate.tanh()[None,None,:,None] * expected_delta[:,:,None,:]
+    expected[:,:,1:] = replacement[:,:,None,:]
     result = module(noise, context)
     torch.testing.assert_close(result, expected.reshape_as(noise))
-    delta_rms = (result[:,1:] - noise[:,1:]).square().mean(-1).sqrt()
-    assert (delta_rms <= 1.000001).all()
-    torch.testing.assert_close(module(noise, torch.zeros_like(context)), noise, rtol=0, atol=0)
-    # Scaling the projection should no longer scale the injected residual.
+    torch.testing.assert_close(result[:,:1], noise[:,:1], rtol=0, atol=0)
+    assert not torch.equal(result[:,1:], noise[:,1:])
+    # Post normalization makes the replacement invariant to projection scale.
     with torch.no_grad():
         module.proj.weight.mul_(100)
     torch.testing.assert_close(module(noise, context), result, rtol=1e-5, atol=1e-6)

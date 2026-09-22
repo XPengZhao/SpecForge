@@ -22,7 +22,8 @@
     "confidence_head_alpha": 1.0,
     "enable_confidence_head": true,
     "confidence_head_with_markov": true,
-    "ngram_mask": true
+    "ngram_mask": true,
+    "ngram_mask_mode": "replace"
   },
   "dtype": "bfloat16",
   "eos_token_id": 248044,

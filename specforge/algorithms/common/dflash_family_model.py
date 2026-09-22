@@ -227,16 +227,30 @@ class OnlineDFlashModel(nn.Module):
         bs = self.block_size
         device = input_ids.device
 
-        noise_ids = torch.full(
-            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
-        )
-
-        block_starts = torch.arange(n, device=device) * bs
-        block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
-
         valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
         anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
 
+        if getattr(self.draft_model, 'ngram_mask_enabled', False):
+            # This ablation does not consume E(MASK): look up anchors only and
+            # leave the remaining slots for the Engram replacement module.
+            anchor_embeddings = self.embed_tokens(anchor_tokens)
+            anchor_embeddings = torch.where(
+                block_keep_mask[..., None],
+                anchor_embeddings,
+                torch.zeros_like(anchor_embeddings),
+            )
+            empty_slots = anchor_embeddings.new_zeros(
+                bsz, n, bs - 1, anchor_embeddings.size(-1)
+            )
+            return torch.cat(
+                (anchor_embeddings.unsqueeze(2), empty_slots), dim=2
+            ).reshape(bsz, n * bs, -1)
+
+        noise_ids = torch.full(
+            (bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device
+        )
+        block_starts = torch.arange(n, device=device) * bs
+        block_starts = block_starts.unsqueeze(0).expand(bsz, -1)
         flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
         noise_ids[flat_batch_idx, block_starts] = torch.where(
             block_keep_mask,
