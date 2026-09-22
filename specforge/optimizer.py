@@ -175,3 +175,37 @@ class BF16Optimizer:
 
     def get_learning_rate(self):
         return self.optimizer.param_groups[0]["lr"]
+
+    def rebase_learning_rate(self, peak_lr: float) -> None:
+        """Rescale a restored LR schedule to a new peak without resetting it."""
+        old_peaks = list(self.scheduler.base_lrs)
+        if not old_peaks or len(old_peaks) != len(self.optimizer.param_groups):
+            raise RuntimeError("cannot rebase scheduler with incompatible LR groups")
+
+        ratios = [float(peak_lr) / float(old) for old in old_peaks]
+        for group, ratio in zip(self.optimizer.param_groups, ratios):
+            group["lr"] = float(group["lr"]) * ratio
+            group["initial_lr"] = float(peak_lr)
+
+        self.scheduler.base_lrs = [float(peak_lr)] * len(old_peaks)
+        if getattr(self.scheduler, "_last_lr", None) is not None:
+            self.scheduler._last_lr = [
+                float(lr) * ratio
+                for lr, ratio in zip(self.scheduler._last_lr, ratios)
+            ]
+
+        after = self.scheduler.after_scheduler
+        after.base_lrs = [float(peak_lr)] * len(old_peaks)
+        if getattr(after, "_last_lr", None) is not None:
+            after._last_lr = [
+                float(lr) * ratio
+                for lr, ratio in zip(after._last_lr, ratios)
+            ]
+        if hasattr(after, "eta_min"):
+            # SpecForge currently uses one scalar eta_min for every group.
+            after.eta_min = float(after.eta_min) * ratios[0]
+
+        print_on_rank0(
+            f"Rebased restored LR schedule from peak {old_peaks[0]:.8g} "
+            f"to {float(peak_lr):.8g}; current lr={self.get_learning_rate():.8g}."
+        )
