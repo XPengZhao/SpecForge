@@ -75,7 +75,7 @@ def tiny_config(enabled=True):
             projector_type="dspark",
             mask_token_id=0,
             markov_rank=4,
-            markov_head_type="ngram" if enabled else "vanilla",
+            markov_head_type="ngram_attention" if enabled else "vanilla",
         ),
     )
 
@@ -136,7 +136,7 @@ def test_sidecar_rejects_misalignment(tmp_path, error):
         list(reader)
 
 
-def test_zero_projection_matches_vanilla_and_receives_gradient():
+def test_zero_value_projection_matches_vanilla_and_receives_gradient():
     torch.manual_seed(10)
     model = training_model()
     baseline = training_model(False)
@@ -163,14 +163,14 @@ def test_zero_projection_matches_vanilla_and_receives_gradient():
         enhanced = model(ids, aux, mask, target, ngram_embedding=ngram)
     torch.testing.assert_close(original[0], enhanced[0], rtol=0, atol=0)
     enhanced[0].backward()
-    grad = model.draft_model.markov_head.ngram_proj.weight.grad
+    grad = model.draft_model.markov_head.ngram_value_proj.weight.grad
     assert grad is not None and grad.abs().sum() > 0
 
 
 def test_training_uses_previous_token_same_position_ngram():
     model = training_model()
     with torch.no_grad():
-        model.draft_model.markov_head.ngram_proj.weight.fill_(0.01)
+        model.draft_model.markov_head.ngram_value_proj.weight.fill_(0.01)
     ids = torch.randint(1, 32, (1, 12))
     aux = torch.randn(1, 12, 48)
     mask = torch.ones(1, 12)
@@ -192,6 +192,33 @@ def test_training_uses_previous_token_same_position_ngram():
         .gather(2, expected_indices[..., None].expand(-1, -1, -1, 16))
     )
     torch.testing.assert_close(captured[0], expected)
+
+
+def test_ngram_attention_uses_hidden_query_and_signed_sqrt_gate():
+    head = NgramMarkovHead(
+        vocab_size=8,
+        markov_rank=4,
+        hidden_size=4,
+        rms_norm_eps=1e-6,
+    )
+    with torch.no_grad():
+        head.markov_w1.weight.zero_()
+        head.ngram_hidden_norm = torch.nn.Identity()
+        head.ngram_query_norm = torch.nn.Identity()
+        head.ngram_norm = torch.nn.Identity()
+        head.ngram_key_norm = torch.nn.Identity()
+        head.ngram_query_proj.weight.copy_(torch.eye(4))
+        head.ngram_key_proj.weight.copy_(torch.eye(4))
+        head.ngram_value_proj.weight.copy_(torch.eye(4))
+    ids = torch.tensor([1])
+    ngram = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    aligned = head.get_markov_states(ids, ngram, ngram)
+    opposed = head.get_markov_states(ids, ngram, -ngram)
+    expected_high = torch.sigmoid(torch.tensor(1 / 2).sqrt())
+    expected_low = torch.sigmoid(-torch.tensor(1 / 2).sqrt())
+    torch.testing.assert_close(aligned[0, 0], expected_high)
+    torch.testing.assert_close(opposed[0, 0], expected_low)
+    assert aligned[0, 0] > opposed[0, 0]
 
 
 def test_sampler_recomputes_ngram_after_each_sample():
@@ -216,7 +243,7 @@ def test_sampler_recomputes_ngram_after_each_sample():
     tokens, _ = head.sample_block_tokens(
         base_logits,
         prefix_token_ids=torch.tensor([[5, 6]]),
-        hidden_states=None,
+        hidden_states=torch.zeros(1, 2, 4),
         ngram_lookup=lookup,
     )
     assert tokens.tolist() == [[2, 3]]
