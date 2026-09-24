@@ -496,6 +496,10 @@ class TrainingConfig(StrictConfigModel):
     kl_decay: float = 1.0
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
+    #: Teacher-forced clean carry. Off keeps the baseline training forward.
+    carry_enabled: bool = False
+    #: Probability that an anchor receives a non-empty clean future suffix.
+    carry_keep_prob: float = Field(default=0.5, ge=0.0, le=1.0)
     loss_decay_gamma: Optional[float] = None
     loss_type: Literal[
         "dflash",

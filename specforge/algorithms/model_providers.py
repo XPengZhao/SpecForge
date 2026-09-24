@@ -379,6 +379,8 @@ def _build_dflash_family_model(
         "attention_backend": cfg.training.attention_backend,
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
+        "carry_enabled": cfg.training.carry_enabled,
+        "carry_keep_prob": cfg.training.carry_keep_prob,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(

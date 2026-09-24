@@ -53,10 +53,20 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     context_window=None,
+    carry_len=0,
+    carry_keep=None,
 ):
+    """Boolean SDPA mask.
+
+    KV layout is ``[context | per-block carry | draft blocks]``. ``carry_len``
+    is the padded width of each block's carry. ``carry_keep`` has shape
+    ``(batch, num_blocks, carry_len)`` and is true only for real carry rows.
+    """
     B, N = anchor_positions.shape
+    carry_len = int(carry_len or 0)
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
+    draft_offset = S + N * carry_len
+    KV_LEN = draft_offset + N * block_size
 
     q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
     kv_indices = torch.arange(KV_LEN, device=device).view(
@@ -76,13 +86,35 @@ def create_dflash_sdpa_mask(
         first_context = anchor_expanded - int(context_window) + 1
         mask_context = mask_context & (kv_indices >= first_context)
 
-    is_draft = kv_indices >= S
-    kv_block_ids = (kv_indices - S) // block_size
+    mask_carry = False
+    if carry_len > 0:
+        if carry_keep is None:
+            raise ValueError("carry_keep is required when carry_len > 0")
+        if carry_keep.shape != (B, N, carry_len):
+            raise ValueError(
+                f"carry_keep must have shape {(B, N, carry_len)}, got {tuple(carry_keep.shape)}"
+            )
+        carry_local = (kv_indices - S).clamp(min=0)
+        carry_block = torch.div(carry_local, carry_len, rounding_mode="floor")
+        carry_slot = carry_local.remainder(carry_len)
+        in_carry = (kv_indices >= S) & (kv_indices < draft_offset)
+        same_block = q_block_ids == carry_block
+        q_block = torch.arange(Q_LEN, device=device) // block_size
+        batch_index = torch.arange(B, device=device).view(B, 1, 1)
+        query_block = q_block.view(1, Q_LEN, 1).expand(B, Q_LEN, KV_LEN)
+        slot_index = carry_slot.view(1, 1, KV_LEN).expand(B, Q_LEN, KV_LEN)
+        kept = carry_keep[batch_index, query_block, slot_index]
+        mask_carry = (
+            in_carry & same_block & kept.view(B, 1, Q_LEN, KV_LEN)
+        )
+
+    is_draft = kv_indices >= draft_offset
+    kv_block_ids = (kv_indices - draft_offset) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
-    final_mask = (mask_context | mask_draft) & valid_block
+    final_mask = (mask_context | mask_carry | mask_draft) & valid_block
     return final_mask
 
 
@@ -93,20 +125,27 @@ def create_dflash_block_mask(
     block_size: int,
     device: torch.device,
     context_window: Optional[int] = None,
+    carry_len: int = 0,
+    carry_keep: Optional[torch.Tensor] = None,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
-    KV: [Context (S tokens) | Block_0 | Block_1 | ... | Block_{n-1}]
+    KV: [Context (S tokens) | per-block carry | Block_0 | ... | Block_{n-1}]
     Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
 
     Rules:
       1. Each block sees the configured context window strictly before its anchor.
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
+      2. A block may also see its own clean future carry, starting at anchor + 1.
+      3. Intra-block attention is bidirectional.
+      4. Different blocks are invisible to each other.
+      5. Invalid blocks (block_keep_mask=False) see nothing.
     """
+    carry_len = int(carry_len or 0)
+    if carry_len > 0 and carry_keep is None:
+        raise ValueError("carry_keep is required when carry_len > 0")
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
+        del h
         q_block_id = q_idx // block_size
         safe_q_block_id = q_block_id.clamp(max=N - 1)
         anchor_pos = anchor_positions[b, safe_q_block_id]
@@ -119,17 +158,30 @@ def create_dflash_block_mask(
             first_context = anchor_pos - int(context_window) + 1
             mask_context = mask_context & (kv_idx >= first_context)
 
-        is_draft = kv_idx >= S
-        kv_block_id = (kv_idx - S) // block_size
+        mask_carry = kv_idx < 0
+        if carry_len > 0:
+            in_carry = (kv_idx >= S) & (kv_idx < draft_offset)
+            carry_local = (kv_idx - S).clamp(min=0)
+            carry_block = carry_local // carry_len
+            carry_slot = (carry_local % carry_len).clamp(max=carry_len - 1)
+            mask_carry = (
+                in_carry
+                & (carry_block == q_block_id)
+                & carry_keep[b, safe_q_block_id, carry_slot]
+            )
+
+        is_draft = kv_idx >= draft_offset
+        kv_block_id = (kv_idx - draft_offset) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
-        return (mask_context | mask_draft) & is_valid_block & in_bounds
+        return (mask_context | mask_carry | mask_draft) & is_valid_block & in_bounds
 
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
+    draft_offset = S + N * carry_len
+    KV_LEN = draft_offset + N * block_size
 
     return create_block_mask(
         dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
@@ -151,6 +203,8 @@ class OnlineDFlashModel(nn.Module):
         loss_decay_gamma: Optional[float] = None,
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
+        carry_enabled: bool = False,
+        carry_keep_prob: float = 0.5,
     ):
         super().__init__()
         if loss_type not in _VALID_LOSS_TYPES:
@@ -159,6 +213,10 @@ class OnlineDFlashModel(nn.Module):
             )
         if not 0.0 <= dpace_alpha <= 1.0:
             raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha}")
+        if not 0.0 <= carry_keep_prob <= 1.0:
+            raise ValueError(
+                f"carry_keep_prob must be in [0, 1], got {carry_keep_prob}"
+            )
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
@@ -170,6 +228,8 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
+        self.carry_enabled = bool(carry_enabled)
+        self.carry_keep_prob = float(carry_keep_prob)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -246,6 +306,59 @@ class OnlineDFlashModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
+    def _sample_clean_carry(
+        self,
+        hidden_states: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        """Append teacher-forced future states after the shared context.
+
+        For anchor ``C``, the carry is ``[h_D, h_E, ...]``: hidden states
+        strictly after the anchor, never ``h_C``. Each anchor drops the whole
+        suffix with probability ``1 - carry_keep_prob``. Kept suffixes have a
+        random length in ``1 .. block_size - 1``, clipped by the sequence end.
+        Padded rows stay in the tensor and are removed by the attention mask.
+        """
+        bsz, seq_len, hidden = hidden_states.shape
+        n_blocks = anchor_positions.shape[1]
+        carry_len = self.block_size - 1
+        device = hidden_states.device
+        if (not self.carry_enabled) or carry_len <= 0 or n_blocks == 0:
+            empty_keep = torch.zeros(
+                bsz, n_blocks, 0, dtype=torch.bool, device=device
+            )
+            empty_pos = torch.zeros(bsz, 0, dtype=torch.long, device=device)
+            return hidden_states, empty_pos, 0, empty_keep
+
+        offsets = torch.arange(1, carry_len + 1, device=device)
+        positions = anchor_positions.unsqueeze(-1) + offsets
+        available = (seq_len - anchor_positions - 1).clamp(min=0, max=carry_len)
+        use_carry = (
+            torch.rand(bsz, n_blocks, device=device) < self.carry_keep_prob
+        ) & block_keep_mask & (available > 0)
+        sampled = (
+            torch.rand(bsz, n_blocks, device=device) * available.clamp(min=1)
+        ).floor().long() + 1
+        length = torch.where(
+            use_carry,
+            torch.minimum(sampled, available),
+            torch.zeros_like(sampled),
+        )
+        slot = torch.arange(carry_len, device=device).view(1, 1, carry_len)
+        carry_keep = (slot < length.unsqueeze(-1)) & (positions < seq_len)
+
+        safe_positions = positions.clamp(min=0, max=seq_len - 1)
+        flat_index = safe_positions.reshape(bsz, n_blocks * carry_len)
+        gathered = torch.gather(
+            hidden_states,
+            1,
+            flat_index.unsqueeze(-1).expand(-1, -1, hidden),
+        )
+        gathered = gathered + self.draft_model.carry_embed.to(dtype=gathered.dtype)
+        target_hidden = torch.cat([hidden_states, gathered], dim=1)
+        return target_hidden, flat_index, carry_len, carry_keep
+
     def _dpace_weight(
         self,
         prob: torch.Tensor,
@@ -302,36 +415,42 @@ class OnlineDFlashModel(nn.Module):
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )
+        target_hidden, carry_position_ids, carry_len, carry_keep = (
+            self._sample_clean_carry(hidden_states, anchor_positions, block_keep_mask)
+        )
 
         context_position_ids = (
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         )
         draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        position_chunks = [context_position_ids, draft_position_ids]
+        if carry_len > 0:
+            position_chunks = [
+                context_position_ids,
+                carry_position_ids,
+                draft_position_ids,
+            ]
+        full_position_ids = torch.cat(position_chunks, dim=1)
+        mask_kwargs = {
+            "anchor_positions": anchor_positions,
+            "block_keep_mask": block_keep_mask,
+            "S": seq_len,
+            "block_size": self.block_size,
+            "device": device,
+            "context_window": getattr(self.draft_model, "context_window", None),
+            "carry_len": carry_len,
+            "carry_keep": carry_keep if carry_len > 0 else None,
+        }
 
         if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
-                context_window=getattr(self.draft_model, "context_window", None),
-            )
+            dflash_attn_mask = create_dflash_block_mask(**mask_kwargs)
         else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
-                context_window=getattr(self.draft_model, "context_window", None),
-            )
+            dflash_attn_mask = create_dflash_sdpa_mask(**mask_kwargs)
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
-            target_hidden=hidden_states,
+            target_hidden=target_hidden,
             attention_mask=dflash_attn_mask,
         )
         return anchor_positions, block_keep_mask, output_hidden
@@ -447,6 +566,8 @@ class OnlineDominoModel(OnlineDFlashModel):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         shift_label: bool = False,
+        carry_enabled: bool = False,
+        carry_keep_prob: float = 0.5,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -458,6 +579,8 @@ class OnlineDominoModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
+            carry_enabled=carry_enabled,
+            carry_keep_prob=carry_keep_prob,
         )
         self.shift_label = shift_label
 
@@ -743,6 +866,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        carry_enabled: bool = False,
+        carry_keep_prob: float = 0.5,
         dspark_loss_mode: str = "original",
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
@@ -766,6 +891,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
+            carry_enabled=carry_enabled,
+            carry_keep_prob=carry_keep_prob,
         )
         if dspark_loss_mode not in {"original", "kl"}:
             raise ValueError("dspark_loss_mode must be 'original' or 'kl'")

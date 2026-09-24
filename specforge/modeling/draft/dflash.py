@@ -291,11 +291,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
+        feature_dim = len(self.target_layer_ids) * config.hidden_size
         self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size,
+            feature_dim,
             config.hidden_size,
             bias=False,
         )
+        # Distinguishes teacher-forced or rejected carry rows from committed
+        # context. Zero so a baseline checkpoint stays unchanged until trained.
+        self.carry_embed = nn.Parameter(torch.zeros(feature_dim))
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -307,6 +311,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+        with torch.no_grad():
+            self.carry_embed.zero_()
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
