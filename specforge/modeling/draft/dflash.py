@@ -299,6 +299,14 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
+        self.draft_memory_enabled = bool(dflash_config.get("draft_memory", False))
+        if self.draft_memory_enabled:
+            self.draft_memory_proj = nn.Linear(
+                config.hidden_size, config.hidden_size, bias=False
+            )
+            self.draft_memory_norm = kernels.make_rms_norm(
+                config.hidden_size, config.rms_norm_eps
+            )
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
         self.projector_type = dflash_config.get("projector_type", None)
@@ -307,6 +315,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def initialize_draft_memory(self):
+        """Initialize only the new adapter when warm-starting a baseline.
+
+        Warm starts can construct the model under no_init_weights, so missing
+        adapter tensors must be initialized explicitly, outside that context.
+        """
+        if self.draft_memory_enabled:
+            nn.init.normal_(
+                self.draft_memory_proj.weight, std=self.config.initializer_range
+            )
+            nn.init.ones_(self.draft_memory_norm.weight)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
@@ -368,10 +388,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        draft_memory: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
+        if draft_memory is not None:
+            if not self.draft_memory_enabled:
+                raise ValueError("draft_memory supplied to a model without the adapter")
+            memory = self.draft_memory_norm(
+                self.draft_memory_proj(draft_memory.detach())
+            )
+            target_hidden = torch.cat([target_hidden, memory], dim=1)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(

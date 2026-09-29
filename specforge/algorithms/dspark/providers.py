@@ -110,6 +110,12 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    if getattr(draft_model, "draft_memory_enabled", False):
+        contract.update(
+            dspark_draft_memory_version="final_hidden_prediction_position_all_layers_v1",
+            dspark_draft_memory_keep_prob=training_model.draft_memory_keep_prob,
+            dspark_draft_memory_head_chunk_size=training_model.draft_memory_head_chunk_size,
+        )
     return contract
 
 
@@ -121,6 +127,18 @@ def build_draft(config, draft_config):
 
 def apply_draft_overrides(config, draft_config):
     architectures = set(getattr(draft_config, "architectures", None) or ())
+    memory_enabled = config.training.dspark_draft_memory
+    method_config = dict(getattr(draft_config, "dflash_config", None) or {})
+    if memory_enabled:
+        if architectures != {DRAFT_ARCHITECTURE}:
+            raise ValueError("draft memory currently supports only DSparkDraftModel")
+        if method_config.get("markov_head_type", "vanilla") not in {"vanilla", "gated"}:
+            raise ValueError("draft memory supports vanilla/gated first-order Markov heads")
+        method_config["draft_memory"] = True
+        method_config["draft_memory_version"] = "final_hidden_prediction_position_all_layers_v1"
+        draft_config.dflash_config = method_config
+    elif method_config.get("draft_memory", False):
+        raise ValueError("memory draft config requires training.dspark_draft_memory=true")
     nested_architectures = {
         DEEPSEEK_V4_DRAFT_ARCHITECTURE,
         GLM52_DRAFT_ARCHITECTURE,

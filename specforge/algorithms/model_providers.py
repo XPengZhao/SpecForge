@@ -437,12 +437,24 @@ def build_dspark_model(
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
+    model_class = OnlineDSparkModel
+    memory_kwargs = {}
+    if cfg.training.dspark_draft_memory:
+        from specforge.algorithms.common.dspark_memory import OnlineDSparkMemoryModel
+
+        model_class = OnlineDSparkMemoryModel
+        memory_kwargs = {
+            "draft_memory_keep_prob": cfg.training.dspark_draft_memory_keep_prob,
+            "draft_memory_head_chunk_size": cfg.training.dspark_draft_memory_head_chunk_size,
+        }
+
     return _build_dflash_family_model(
         cfg,
         draft_model,
         tokenizer,
-        lambda common: OnlineDSparkModel(
+        lambda common: model_class(
             **common,
+            **memory_kwargs,
             dspark_loss_mode=cfg.training.dspark_loss_mode,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,

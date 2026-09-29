@@ -53,10 +53,13 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     context_window=None,
+    memory_keep=None,
 ):
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
+    memory_len = 0 if memory_keep is None else memory_keep.shape[-1]
+    draft_start = S + N * memory_len
+    KV_LEN = draft_start + N * block_size
 
     q_indices = torch.arange(Q_LEN, device=device).view(1, 1, -1, 1)  # (1, 1, Q_LEN, 1)
     kv_indices = torch.arange(KV_LEN, device=device).view(
@@ -76,13 +79,22 @@ def create_dflash_sdpa_mask(
         first_context = anchor_expanded - int(context_window) + 1
         mask_context = mask_context & (kv_indices >= first_context)
 
-    is_draft = kv_indices >= S
-    kv_block_ids = (kv_indices - S) // block_size
+    mask_memory = False
+    if memory_len:
+        local = (kv_indices - S).clamp(min=0)
+        memory_block = local // memory_len
+        slot = local % memory_len
+        kept = memory_keep[:, torch.arange(Q_LEN, device=device) // block_size, :]
+        kept = kept[:, :, slot.reshape(-1)].unsqueeze(1)
+        mask_memory = (kv_indices >= S) & (kv_indices < draft_start)
+        mask_memory = mask_memory & (q_block_ids == memory_block) & kept
+    is_draft = kv_indices >= draft_start
+    kv_block_ids = (kv_indices - draft_start) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
-    final_mask = (mask_context | mask_draft) & valid_block
+    final_mask = (mask_context | mask_memory | mask_draft) & valid_block
     return final_mask
 
 
@@ -93,10 +105,11 @@ def create_dflash_block_mask(
     block_size: int,
     device: torch.device,
     context_window: Optional[int] = None,
+    memory_keep: Optional[torch.Tensor] = None,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
-    KV: [Context (S tokens) | Block_0 | Block_1 | ... | Block_{n-1}]
+    KV: [Context | per-anchor memory | draft blocks]
     Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
 
     Rules:
@@ -104,6 +117,7 @@ def create_dflash_block_mask(
       2. Intra-block attention is bidirectional.
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
+      5. Each block can read only its own valid memory rows, without a causal mask.
     """
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
@@ -119,17 +133,27 @@ def create_dflash_block_mask(
             first_context = anchor_pos - int(context_window) + 1
             mask_context = mask_context & (kv_idx >= first_context)
 
-        is_draft = kv_idx >= S
-        kv_block_id = (kv_idx - S) // block_size
+        mask_memory = kv_idx < 0
+        if memory_len:
+            local = (kv_idx - S).clamp(min=0)
+            mask_memory = (
+                (kv_idx >= S) & (kv_idx < draft_start)
+                & (local // memory_len == q_block_id)
+                & memory_keep[b, safe_q_block_id, local % memory_len]
+            )
+        is_draft = kv_idx >= draft_start
+        kv_block_id = (kv_idx - draft_start) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
-        return (mask_context | mask_draft) & is_valid_block & in_bounds
+        return (mask_context | mask_memory | mask_draft) & is_valid_block & in_bounds
 
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
-    KV_LEN = S + N * block_size
+    memory_len = 0 if memory_keep is None else memory_keep.shape[-1]
+    draft_start = S + N * memory_len
+    KV_LEN = draft_start + N * block_size
 
     return create_block_mask(
         dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
@@ -285,6 +309,9 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
+        draft_memory: Optional[torch.Tensor] = None,
+        memory_positions: Optional[torch.Tensor] = None,
+        memory_keep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -307,7 +334,16 @@ class OnlineDFlashModel(nn.Module):
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         )
         draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        position_parts = [context_position_ids, draft_position_ids]
+        memory_kwargs = {}
+        if draft_memory is not None:
+            if memory_positions is None or memory_keep is None:
+                raise ValueError("draft memory needs positions and a validity mask")
+            position_parts.insert(1, memory_positions.reshape(bsz, -1))
+            memory_kwargs["draft_memory"] = draft_memory.reshape(
+                bsz, -1, draft_memory.size(-1)
+            )
+        full_position_ids = torch.cat(position_parts, dim=1)
 
         if self.attention_backend == "flex_attention":
             dflash_attn_mask = create_dflash_block_mask(
@@ -317,6 +353,7 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
+                memory_keep=memory_keep,
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
@@ -326,6 +363,7 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
+                memory_keep=memory_keep,
             )
 
         output_hidden = self.draft_model(
@@ -333,6 +371,7 @@ class OnlineDFlashModel(nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **memory_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 

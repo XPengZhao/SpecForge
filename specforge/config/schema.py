@@ -507,6 +507,10 @@ class TrainingConfig(StrictConfigModel):
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_loss_mode: Literal["original", "kl"] = "original"
+    #: Two-pass reference-rejection training; no target backbone rollout.
+    dspark_draft_memory: bool = False
+    dspark_draft_memory_keep_prob: float = Field(default=1.0, ge=0.0, le=1.0)
+    dspark_draft_memory_head_chunk_size: int = Field(default=128, gt=0)
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_kl_loss_alpha: float = Field(default=1.0, ge=0.0)
@@ -697,6 +701,12 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.dspark_draft_memory:
+            if mode != "offline" or self.training.strategy != "dspark":
+                raise ValueError("draft memory requires offline DSpark training")
+            if self.training.dspark_opd_loss_alpha:
+                raise ValueError("draft memory cannot be combined with OPD traces")
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

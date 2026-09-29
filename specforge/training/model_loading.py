@@ -474,6 +474,13 @@ def warm_start_draft_model(
     allowed_missing = set()
     if allow_missing_embedding:
         allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
+    # Baseline -> memory is an explicit weights-only architecture extension.
+    # Permit an entirely absent adapter, but never silently repair a partial one.
+    if getattr(model, "draft_memory_enabled", False):
+        memory_keys = {"draft_memory_proj.weight", "draft_memory_norm.weight"}
+        if not memory_keys.intersection(state):
+            model.initialize_draft_memory()
+            allowed_missing.update(memory_keys)
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(
