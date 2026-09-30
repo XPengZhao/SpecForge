@@ -93,12 +93,32 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    reranker = (getattr(draft_model.config, "dflash_config", None) or {}).get(
+        "prefix_reranker"
+    )
+    if reranker is not None:
+        contract["dspark_prefix_reranker"] = dict(reranker)
+        contract["dspark_prefix_reranker_objective"] = (
+            "joint_dspark_plus_target_argmax_topk_ce_v2"
+        )
     return contract
 
 
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
+    reranker = (getattr(draft_config, "dflash_config", None) or {}).get(
+        "prefix_reranker"
+    )
+    if reranker is not None:
+        if list(getattr(draft_config, "architectures", None) or []) != [
+            DRAFT_ARCHITECTURE
+        ]:
+            raise ValueError("prefix reranker currently requires DSparkDraftModel")
+        if config.training.dspark_loss_mode != "original":
+            raise ValueError("joint prefix reranker currently requires original DSpark loss")
+        if config.training.dspark_ce_loss_alpha <= 0 and config.training.dspark_l1_loss_alpha <= 0:
+            raise ValueError("joint prefix reranker requires a baseline CE or L1 loss")
     return build_registered_draft(config, draft_config)
 
 

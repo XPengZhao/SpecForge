@@ -1193,6 +1193,73 @@ class OnlineDSparkModel(OnlineDFlashModel):
             prev_token_ids=prev_token_ids,
             hidden_states=output_hidden_4d,
         )
+        reranker = getattr(self.draft_model, "prefix_reranker", None)
+        if reranker is not None:
+            from .prefix_reranker_loss import prefix_reranker_loss
+
+            if target_last_hidden_states is None:
+                raise ValueError("prefix reranker requires target_last_hidden_states")
+            # The original objective is essential from scratch: a target absent
+            # from top-k must still train the backbone/Markov proposal distribution.
+            target_probs = self._unique_target_probs(
+                target_last_hidden_states, safe_label_indices,
+            )
+            teacher_ids = target_probs[0].argmax(-1)[target_probs[1]]
+            confidence = None
+            if self.dspark_confidence_head_alpha > 0:
+                confidence = self.draft_model.predict_confidence(
+                    output_hidden_4d, prev_token_ids=prev_token_ids,
+                )
+            base_loss, base_stats = self._compute_dspark_loss(
+                draft_logits=draft_logits, target_ids=target_ids,
+                eval_mask=eval_mask, confidence_pred=confidence,
+                unique_target_probs=target_probs,
+            )
+            scores, candidates = reranker(
+                draft_logits,
+                output_hidden_4d,
+                prev_token_ids,
+                self.draft_model.markov_head,
+            )
+            # Gather only [B,N,L,K], not the full [B,N,L,V] teacher distribution.
+            with torch.no_grad():
+                candidate_target_probs = target_probs[0][
+                    target_probs[1].unsqueeze(-1), candidates
+                ]
+            rank_loss, accuracy, metrics = prefix_reranker_loss(
+                scores,
+                candidates,
+                draft_logits.argmax(-1),
+                teacher_ids,
+                target_ids,
+                eval_mask,
+                self._dspark_loss_weight_mask(eval_mask),
+                training=self.training,
+                candidate_target_probs=candidate_target_probs,
+            )
+            if self.training:
+                stats = metrics["log_window"]
+                sums, denoms, weights = stats["sums"], stats["denoms"], stats["weights"]
+            else:
+                sums = metrics["eval_metric_sums"]
+                denoms = metrics["eval_metric_denoms"]
+                weights = metrics["eval_objective_weights"]
+            for name, value in base_stats["sums"].items():
+                if name == "tau_probabilistic" or name.startswith("accept_rate@"):
+                    # Matching validity masks give identical denominators.
+                    # Subtract sums before count-weighted window/DP aggregation;
+                    # log only the gain, not another pre-rerank curve.
+                    gain_name = (
+                        "rerank_tau_gain" if name == "tau_probabilistic"
+                        else name.replace("accept_rate@", "rerank_accept_rate_gain@")
+                    )
+                    sums[gain_name] = sums[name] - value
+                    denoms[gain_name] = denoms[name]
+                else:
+                    sums[name] = value
+                    denoms[name] = base_stats["denoms"][name]
+            weights.update(base_stats["weights"])
+            return base_loss + rank_loss, accuracy, metrics
         confidence_pred = None
         if self.dspark_confidence_head_alpha > 0:
             confidence_pred = self.draft_model.predict_confidence(

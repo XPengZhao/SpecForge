@@ -297,8 +297,26 @@ class DSparkDraftModel(DFlashDraftModel):
             )
         super().__init__(config)
 
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if getattr(module, "_prefix_reranker_zero_init", False):
+            nn.init.zeros_(module.weight)
+
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)
+        self.prefix_reranker = None
+        reranker_config = dflash_config.get("prefix_reranker")
+        if reranker_config is not None:
+            from .prefix_reranker import PrefixReranker
+
+            if type(self.markov_head) is not VanillaMarkovHead:
+                raise ValueError("prefix reranker requires a vanilla Markov head")
+            self.prefix_reranker = PrefixReranker(
+                config.hidden_size,
+                self.markov_head.markov_rank,
+                config.block_size,
+                **reranker_config,
+            )
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
             dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
@@ -317,6 +335,49 @@ class DSparkDraftModel(DFlashDraftModel):
             if self.confidence_head_with_markov:
                 input_dim += self.markov_head.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+
+    def initialize_missing_warm_start_parameters(self, missing_keys):
+        """Only a wholly absent new head is allowed when starting from baseline."""
+        if self.prefix_reranker is None:
+            return set()
+        head_keys = {"prefix_reranker." + k for k in self.prefix_reranker.state_dict()}
+        if head_keys.issubset(missing_keys):
+            self.prefix_reranker.reset_parameters()
+            return head_keys
+        return set()
+
+    def sample_prefix_reranked_tokens(
+        self, base_logits, hidden_states, anchor_ids, *, temperature=0.0
+    ):
+        """Greedy reference sampler; KV is local to this call, never cross-round."""
+        if self.prefix_reranker is None:
+            raise ValueError("prefix reranker is not enabled")
+        return self.prefix_reranker.sample(
+            base_logits,
+            hidden_states,
+            anchor_ids,
+            self.markov_head,
+            temperature=temperature,
+        )
+
+    def _sample_draft_tokens(self, target, draft_hidden, block_output_ids):
+        if self.prefix_reranker is None:
+            return super()._sample_draft_tokens(target, draft_hidden, block_output_ids)
+        # DSpark query 0 (the anchor embedding) predicts the first next token.
+        length = block_output_ids.shape[-1] - 1
+        hidden = draft_hidden[:, :length]
+        return self.sample_prefix_reranked_tokens(
+            target.lm_head(hidden), hidden, block_output_ids[:, 0]
+        )
+
+    def spec_generate(
+        self, target, input_ids, max_new_tokens, stop_token_ids, temperature
+    ):
+        if self.prefix_reranker is not None and temperature != 0:
+            raise ValueError("prefix reranker currently supports greedy sampling only")
+        return super().spec_generate(
+            target, input_ids, max_new_tokens, stop_token_ids, temperature
+        )
 
     def apply_logits_head(
         self,
