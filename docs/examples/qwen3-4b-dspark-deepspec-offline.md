@@ -33,6 +33,12 @@ The marker travels with native FeatureStore writes and `.ckpt` dumps, so
 reading these back preserves the same supervision. There is no new DeepSpec
 binary writer: original shards are always read-only.
 
+DeepSpec reads allocate independent tensor buffers, so the loader skips its
+full-feature clone for these reads. Borrowed/shared storage keeps its existing
+clone protection. The normalizer still copies the loss mask before modifying
+supervision. Teacher supervision uses deduplicated FP32 probabilities throughout
+the training loss; the older dense-logits path is kept only as a test reference.
+
 ## Four-GPU baseline
 
 The supplied recipe uses five draft layers, target layers `[1,9,17,25,33]`,

@@ -10,8 +10,8 @@
 
 Leases refs (consume-once queue or re-iterable ref list), applies the injected
 per-sample transform and collate, and yields ``TrainBatch``es — no model
-knowledge. clone-on-fetch (default) clones tensors out of the store and releases
-the handle immediately, so prefetch can never race a release.
+knowledge. clone-on-fetch (default) isolates borrowed tensors before releasing
+the handle. DeepSpec reads already own independent buffers and skip this clone.
 """
 
 from __future__ import annotations
@@ -191,7 +191,11 @@ class FeatureDataLoader:
     def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
         tensors, handle = self.store.get(ref, device=self.device)
         try:
-            if self.clone_on_fetch:
+            # DeepSpec reads own their buffers; borrowed/shared reads still
+            # need isolation before the store lease is released.
+            if self.clone_on_fetch and not ref.feature_store_uri.startswith(
+                "deepspec://"
+            ):
                 tensors = {k: v.clone() for k, v in tensors.items()}
         finally:
             # ``get`` has already registered a read lease. Clone/device or

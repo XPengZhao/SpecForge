@@ -4,6 +4,18 @@ import torch
 from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
 
+def aligned_target_logits(model, target_hidden, safe_label_indices):
+    """Dense teacher projection retained only as a test reference."""
+    indices = (safe_label_indices - 1).clamp(min=0)
+    batch, anchors, block_size = indices.shape
+    width = target_hidden.size(-1)
+    hidden = torch.gather(
+        target_hidden, 1,
+        indices.reshape(batch, anchors * block_size).unsqueeze(-1).expand(-1, -1, width),
+    ).view(batch, anchors, block_size, width)
+    return model.lm_head(hidden)
+
+
 def model(mode='original', confidence=True, recompute=False):
     m = OnlineDSparkModel.__new__(OnlineDSparkModel)
     torch.nn.Module.__init__(m)
@@ -50,18 +62,22 @@ def test_loss_metrics_and_gradients(mode, confidence, recompute, training):
     mask[1, 1] = False
     logits = torch.randn(2, 4, 7, 19, requires_grad=True)
     conf = torch.randn(2, 4, 7, requires_grad=True) if confidence else None
-    baseline = m._aligned_target_logits(hidden, labels)
+    baseline = aligned_target_logits(m, hidden, labels)
     unique = m._unique_target_probs(hidden, labels)
     assert not unique[0].requires_grad
     assert unique[0].shape[0] < labels.numel()
     torch.testing.assert_close(unique[0][unique[1]], baseline.float().softmax(-1))
     kwargs = dict(draft_logits=logits, target_ids=target_ids, eval_mask=mask, confidence_pred=conf)
-    old_loss, old_metrics = m._compute_dspark_loss(**kwargs, aligned_target_logits=baseline)
-    new_loss, new_metrics = m._compute_dspark_loss(**kwargs, aligned_target_logits=None, unique_target_probs=unique)
-    assert_tree(old_loss, new_loss)
-    assert_tree(old_metrics, new_metrics)
+    dense_probs = baseline.float().softmax(-1).reshape(-1, baseline.size(-1))
+    dense_inverse = torch.arange(labels.numel()).reshape_as(labels)
+    dense_loss, dense_metrics = m._compute_dspark_loss(
+        **kwargs, unique_target_probs=(dense_probs, dense_inverse),
+    )
+    new_loss, new_metrics = m._compute_dspark_loss(**kwargs, unique_target_probs=unique)
+    assert_tree(dense_loss, new_loss)
+    assert_tree(dense_metrics, new_metrics)
     inputs = (logits, conf) if conf is not None else (logits,)
-    old_grad = torch.autograd.grad(old_loss, inputs, retain_graph=True)
+    old_grad = torch.autograd.grad(dense_loss, inputs, retain_graph=True)
     new_grad = torch.autograd.grad(new_loss, inputs)
     for a, b in zip(old_grad, new_grad):
         assert_tree(a, b)
@@ -88,7 +104,7 @@ def test_bfloat16_distribution():
     hidden = torch.randn(2, 16, 8).bfloat16()
     labels = torch.tensor([[[1,2,3,4,5,6,7],[2,3,4,5,6,7,8]]]*2)
     probs, inverse = m._unique_target_probs(hidden, labels)
-    expected = m._aligned_target_logits(hidden, labels).float().softmax(-1)
+    expected = aligned_target_logits(m, hidden, labels).float().softmax(-1)
     assert probs.dtype == torch.float32
     torch.testing.assert_close(probs[inverse], expected, atol=1e-4, rtol=1e-3)
 
@@ -101,7 +117,8 @@ def test_forward_routes_through_unique_projection():
     m = _make_dspark_model(logits, anchors, keep, lm_head=head,
                           dspark_l1_loss_alpha=.9, dspark_confidence_head_alpha=0)
     target = torch.randn_like(hidden)
-    with patch.object(m, '_aligned_target_logits', side_effect=AssertionError('legacy path')):
+    with patch.object(m, '_unique_target_probs', wraps=m._unique_target_probs) as project:
         loss, acc, metrics = m(ids, hidden, mask, target)
+    project.assert_called_once()
     assert torch.isfinite(loss) and torch.isfinite(acc)
     assert 'tau_probabilistic' in metrics['log_window']['sums']

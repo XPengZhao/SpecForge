@@ -134,6 +134,17 @@ class _BlockingStore:
 
 
 class TestFeatureDataLoader(unittest.TestCase):
+    def test_memory_materialization_still_isolates_borrowed_tensors(self):
+        raw = {"x": torch.arange(6).reshape(1, 6)}
+        expected = raw["x"].clone()
+        store = LocalFeatureStore()
+        ref = store.put(raw, sample_id="borrowed", metadata={"num_tokens": 6})
+        loader = FeatureDataLoader(store, refs=[ref])
+        materialized = loader._materialize(ref)
+        materialized["x"].zero_()
+        torch.testing.assert_close(raw["x"], expected, rtol=0, atol=0)
+        self.assertEqual(store.health()["active_leases"], 0)
+
     def _write_offline_files(self, d, n=4, seq=8, h=4, aux=12):
         for i in range(n):
             torch.save(

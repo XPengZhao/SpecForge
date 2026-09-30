@@ -5,6 +5,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -48,6 +49,26 @@ def write_fixture(root):
 
 
 class TestDeepSpecCache(unittest.TestCase):
+    def test_materialization_keeps_owned_buffers_without_cloning(self):
+        store = LocalFeatureStore()
+        ref = self.reader().read(limit=1)[0]
+        loader = FeatureDataLoader(store, refs=[ref], strategy='dspark')
+        before = {p.name: p.read_bytes() for p in self.root.iterdir()}
+        # The reader has already allocated independent buffers. No full-feature
+        # clone is needed before releasing the file lease.
+        with mock.patch.object(
+            torch.Tensor, 'clone', side_effect=AssertionError('extra clone'),
+        ):
+            first = loader._materialize(ref)
+        first['aux_hidden_state'].zero_()
+        first['hidden_state'].zero_()
+        first['loss_mask'].fill_(0)
+        second = loader._materialize(ref)
+        for key, expected in self.expected[0].items():
+            torch.testing.assert_close(second[key], expected, rtol=0, atol=0)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
+        self.assertEqual(store.health()['active_leases'], 0)
+
     def test_full_sequence_supervision_before_padding(self):
         store = LocalFeatureStore()
         samples = []

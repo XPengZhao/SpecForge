@@ -68,7 +68,7 @@ class DistributedLossModel(torch.nn.Module):
     def forward(self, targets, mask):
         return self.objective._compute_dspark_loss(
             draft_logits=self.logits, target_ids=targets, eval_mask=mask,
-            confidence_pred=None, aligned_target_logits=None,
+            confidence_pred=None,
         )
 
 
