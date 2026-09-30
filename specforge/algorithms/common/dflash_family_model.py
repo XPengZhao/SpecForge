@@ -1,7 +1,6 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
-import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -748,12 +747,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_kl_loss_alpha: float = 1.0,
         dspark_confidence_head_alpha: float = 1.0,
-        dspark_opd_loss_alpha: float = 0.0,
-        dspark_opd_forward_weight: float = 1.0,
-        dspark_opd_rejected_weight: float = 1.0,
-        dspark_opd_rejected_position_decay: float = 0.8,
-        dspark_opd_logprob_min_clamp: float = -80.0,
-        dspark_opd_loss_max_clamp: float = 10.0,
         recompute_loss: bool = False,
     ):
         super().__init__(
@@ -777,37 +770,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError("dspark_kl_loss_alpha must be >= 0")
         if dspark_confidence_head_alpha < 0:
             raise ValueError("dspark_confidence_head_alpha must be >= 0")
-        if dspark_opd_loss_alpha < 0:
-            raise ValueError("dspark_opd_loss_alpha must be >= 0")
-        if dspark_opd_forward_weight < 0 or dspark_opd_rejected_weight < 0:
-            raise ValueError("DSpark OPD stream weights must be >= 0")
-        if (
-            dspark_opd_loss_alpha > 0
-            and dspark_opd_forward_weight == 0
-            and dspark_opd_rejected_weight == 0
-        ):
-            raise ValueError("at least one DSpark OPD stream weight must be positive")
-        if not 0 < dspark_opd_rejected_position_decay <= 1:
-            raise ValueError("DSpark OPD rejected position decay must be in (0, 1]")
-        if dspark_opd_logprob_min_clamp > 0:
-            raise ValueError("DSpark OPD logprob minimum clamp must be <= 0")
-        if dspark_opd_loss_max_clamp <= 0:
-            raise ValueError("DSpark OPD loss maximum clamp must be > 0")
-
         self.loss_type = "dspark"
         self.dspark_loss_mode = str(dspark_loss_mode)
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_kl_loss_alpha = float(dspark_kl_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
-        self.dspark_opd_loss_alpha = float(dspark_opd_loss_alpha)
-        self.dspark_opd_forward_weight = float(dspark_opd_forward_weight)
-        self.dspark_opd_rejected_weight = float(dspark_opd_rejected_weight)
-        self.dspark_opd_rejected_position_decay = float(
-            dspark_opd_rejected_position_decay
-        )
-        self.dspark_opd_logprob_min_clamp = float(dspark_opd_logprob_min_clamp)
-        self.dspark_opd_loss_max_clamp = float(dspark_opd_loss_max_clamp)
         self.recompute_loss = bool(recompute_loss)
 
     def _build_anchor_candidate_mask(
@@ -975,257 +943,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 probs = chunk.new_empty((hidden.size(0), chunk.size(-1)))
             probs[start:start + chunk.size(0)].copy_(chunk)
         return probs, inverse.reshape_as(safe_label_indices)
-
-    def _select_opd_blocks(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        anchor_positions: torch.Tensor,
-        draft_token_ids: torch.Tensor,
-        target_logprobs: torch.Tensor,
-        accepted_lengths: torch.Tensor,
-        candidate_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, ...]:
-        num_blocks = anchor_positions.size(1)
-        if num_blocks == 0:
-            raise ValueError("DSpark OPD sample contains no speculative blocks")
-        valid_blocks = candidate_mask.any(dim=-1)
-        valid_blocks &= anchor_positions >= 0
-        valid_blocks &= anchor_positions < input_ids.size(1) - 1
-        width = self.num_anchors
-        if self.training:
-            scores = torch.rand(valid_blocks.shape, device=input_ids.device)
-            scores = torch.where(
-                valid_blocks, scores, torch.full_like(scores, 2.0)
-            )
-            selected = scores.argsort(dim=1)
-            if num_blocks < width:
-                selected = F.pad(selected, (0, width - num_blocks))
-            selected = selected[:, :width]
-            block_keep_mask = torch.gather(valid_blocks, 1, selected)
-            if num_blocks < width:
-                block_keep_mask[:, num_blocks:] = False
-        else:
-            valid_counts = valid_blocks.sum(dim=1)
-            indices = torch.arange(num_blocks, device=input_ids.device)
-            indices = indices.unsqueeze(0).expand_as(valid_blocks)
-            masked_anchor_positions = torch.where(
-                valid_blocks,
-                anchor_positions,
-                torch.full_like(anchor_positions, input_ids.size(1)),
-            )
-            sorted_valid = torch.gather(
-                indices,
-                1,
-                masked_anchor_positions.argsort(dim=1),
-            )
-            slots = torch.arange(width, device=input_ids.device).unsqueeze(0)
-            slots = slots.expand(valid_blocks.size(0), -1)
-            kept_counts = valid_counts.clamp(max=width)
-            source_indices = torch.round(
-                slots.float()
-                * (valid_counts.clamp_min(1).unsqueeze(1) - 1).float()
-                / (kept_counts.clamp_min(2).unsqueeze(1) - 1).float()
-            ).long()
-            source_indices = torch.minimum(
-                source_indices,
-                valid_counts.clamp_min(1).unsqueeze(1) - 1,
-            ).clamp(max=num_blocks - 1)
-            selected = torch.gather(sorted_valid, 1, source_indices)
-            block_keep_mask = slots < kept_counts.unsqueeze(1)
-            selected = torch.where(
-                block_keep_mask, selected, torch.zeros_like(selected)
-            )
-
-        def gather_blocks(value: torch.Tensor) -> torch.Tensor:
-            index = selected
-            while index.dim() < value.dim():
-                index = index.unsqueeze(-1)
-            index = index.expand(-1, -1, *value.shape[2:])
-            return torch.gather(value, 1, index)
-
-        return (
-            gather_blocks(anchor_positions),
-            block_keep_mask,
-            gather_blocks(draft_token_ids),
-            gather_blocks(target_logprobs),
-            gather_blocks(accepted_lengths),
-            gather_blocks(candidate_mask),
-        )
-
-    def _compute_opd_loss(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        base_logits: torch.Tensor,
-        draft_logits: torch.Tensor,
-        target_ids: torch.Tensor,
-        eval_mask: torch.Tensor,
-        aligned_target_logits: Optional[torch.Tensor],
-        output_hidden_4d: torch.Tensor,
-        anchor_positions: torch.Tensor,
-        block_keep_mask: torch.Tensor,
-        draft_token_ids: torch.Tensor,
-        target_logprobs: torch.Tensor,
-        accepted_lengths: torch.Tensor,
-        candidate_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if aligned_target_logits is None:
-            raise ValueError("DSpark OPD response loss requires target logits")
-
-        response_student_logprobs = F.log_softmax(
-            draft_logits.float(),
-            dim=-1,
-        )
-        response_student_logprobs = torch.gather(
-            response_student_logprobs,
-            -1,
-            target_ids.unsqueeze(-1),
-        ).squeeze(-1)
-        response_target_logprobs = F.log_softmax(
-            aligned_target_logits.float(),
-            dim=-1,
-        )
-        response_target_logprobs = torch.gather(
-            response_target_logprobs,
-            -1,
-            target_ids.unsqueeze(-1),
-        ).squeeze(-1)
-
-        min_logprob = self.dspark_opd_logprob_min_clamp
-        max_logprob = math.log1p(-torch.finfo(torch.float32).eps)
-        response_student_logprobs = response_student_logprobs.clamp(
-            min=min_logprob,
-            max=max_logprob,
-        )
-        response_target_logprobs = response_target_logprobs.clamp(
-            min=min_logprob,
-            max=max_logprob,
-        )
-        response_target_probs = response_target_logprobs.exp()
-        response_losses = response_target_probs * (
-            response_target_logprobs - response_student_logprobs
-        )
-        response_losses += (1.0 - response_target_probs) * (
-            torch.log1p(-response_target_probs)
-            - torch.log1p(-response_student_logprobs.exp())
-        )
-        num_candidates = min(draft_token_ids.size(-1), self.block_size)
-        draft_token_ids = draft_token_ids[..., :num_candidates]
-        target_logprobs = target_logprobs[..., :num_candidates].float()
-        candidate_mask = candidate_mask[..., :num_candidates].bool()
-        candidate_mask &= block_keep_mask.unsqueeze(-1)
-        invalid_token_ids = candidate_mask & (
-            (draft_token_ids < 0) | (draft_token_ids >= base_logits.size(-1))
-        )
-        if bool(invalid_token_ids.any()):
-            invalid_id = int(draft_token_ids[invalid_token_ids][0].item())
-            raise ValueError(
-                f"DSpark OPD draft token ID {invalid_id} is outside the vocabulary"
-            )
-        if not bool(torch.isfinite(target_logprobs[candidate_mask]).all()):
-            raise ValueError("DSpark OPD target logprobs must be finite")
-        if bool((target_logprobs[candidate_mask] > 1e-6).any()):
-            raise ValueError("DSpark OPD target logprobs must be <= 0")
-        draft_token_ids = torch.where(
-            candidate_mask,
-            draft_token_ids,
-            torch.zeros_like(draft_token_ids),
-        )
-        candidate_counts = candidate_mask.sum(dim=-1)
-        accepted_lengths = accepted_lengths.clamp(min=0)
-        accepted_lengths = torch.minimum(accepted_lengths, candidate_counts)
-
-        response_losses = response_losses[..., :num_candidates].clamp(
-            min=-self.dspark_opd_loss_max_clamp,
-            max=self.dspark_opd_loss_max_clamp,
-        )
-        offsets = torch.arange(num_candidates, device=input_ids.device).view(
-            1, 1, -1
-        )
-        # A rejected verify step contributes its accepted draft prefix plus
-        # the target recovery token. A fully accepted block contributes only
-        # its draft tokens; the bonus target token is outside this block.
-        response_lengths = accepted_lengths + (accepted_lengths < candidate_counts)
-        response_mask = eval_mask[..., :num_candidates].bool()
-        response_mask &= offsets < response_lengths.unsqueeze(-1)
-
-        anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
-        prev_token_ids = torch.cat(
-            [anchor_token_ids.unsqueeze(-1), draft_token_ids[..., :-1]],
-            dim=-1,
-        )
-        opd_logits = base_logits[..., :num_candidates, :]
-        opd_logits = self.draft_model.apply_logits_head(
-            opd_logits,
-            prev_token_ids=prev_token_ids,
-            hidden_states=output_hidden_4d[..., :num_candidates, :],
-        )
-        student_logprobs = F.log_softmax(opd_logits.float(), dim=-1)
-        student_logprobs = torch.gather(
-            student_logprobs,
-            -1,
-            draft_token_ids.unsqueeze(-1),
-        ).squeeze(-1)
-
-        accepted_mask = candidate_mask & (offsets < accepted_lengths.unsqueeze(-1))
-        rejected_mask = candidate_mask & (offsets >= accepted_lengths.unsqueeze(-1))
-
-        log_ratio = (target_logprobs - student_logprobs).clamp(min=-20, max=20)
-        rejected_losses = (log_ratio.exp() - log_ratio - 1.0).clamp(
-            min=-self.dspark_opd_loss_max_clamp,
-            max=self.dspark_opd_loss_max_clamp,
-        )
-        # Draft-OPD decays by absolute candidate position within the block.
-        rejected_weights = self.dspark_opd_rejected_position_decay ** offsets.float()
-        rejected_weights = rejected_weights * rejected_mask
-
-        response_count = response_mask.sum().to(torch.float32)
-        accepted_count = accepted_mask.sum().to(torch.float32)
-        rejected_count = rejected_mask.sum().to(torch.float32)
-        response_sum = (response_losses * response_mask).sum()
-        rejected_sum = (rejected_losses * rejected_mask).sum()
-        rejected_weighted_sum = (rejected_losses * rejected_weights).sum()
-        denominator = (
-            self.dspark_opd_forward_weight * response_count
-            + self.dspark_opd_rejected_weight * rejected_weights.sum()
-        )
-        numerator = self.dspark_opd_forward_weight * response_sum
-        numerator += self.dspark_opd_rejected_weight * rejected_weighted_sum
-
-        global_stats = torch.stack(
-            (
-                denominator.detach(),
-                numerator.detach(),
-                response_count.detach(),
-                accepted_count.detach(),
-                rejected_count.detach(),
-                response_sum.detach(),
-                rejected_sum.detach(),
-            )
-        )
-        world_size = 1
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(global_stats)
-            world_size = torch.distributed.get_world_size()
-        global_denominator = global_stats[0].clamp_min(1.0)
-        # FSDP averages gradients, so compensate after using the global denominator.
-        opd_loss = numerator * world_size / global_denominator
-        metrics = {
-            "opd_loss": global_stats[1] / global_denominator,
-            "opd_response_loss": (
-                global_stats[5] / global_stats[2].clamp_min(1.0)
-            ),
-            "opd_rejected_loss": (
-                global_stats[6] / global_stats[4].clamp_min(1.0)
-            ),
-            "opd_response_tokens": global_stats[2] / world_size,
-            "opd_accepted_tokens": global_stats[3] / world_size,
-            "opd_rejected_tokens": global_stats[4] / world_size,
-            "_eval_opd_loss_sum": numerator.detach(),
-            "_eval_opd_loss_denom": denominator.detach(),
-        }
-        return opd_loss, metrics
 
     def _pos_loss(
         self,
@@ -1526,11 +1243,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
-        opd_anchor_positions: Optional[torch.Tensor] = None,
-        opd_draft_token_ids: Optional[torch.Tensor] = None,
-        opd_target_logprobs: Optional[torch.Tensor] = None,
-        opd_accepted_lengths: Optional[torch.Tensor] = None,
-        opd_candidate_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -1538,70 +1250,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "flex_attention is not available on this device; use sdpa/eager."
             )
         bsz = input_ids.shape[0]
-        opd_values = (
-            opd_anchor_positions,
-            opd_draft_token_ids,
-            opd_target_logprobs,
-            opd_accepted_lengths,
-            opd_candidate_mask,
-        )
-        has_opd_features = all(value is not None for value in opd_values)
-        if any(value is not None for value in opd_values) and not has_opd_features:
-            raise ValueError("DSpark OPD requires all opd_* tensors")
-        if self.training and self.dspark_opd_loss_alpha > 0 and not has_opd_features:
-            raise ValueError(
-                "training.dspark_opd_loss_alpha > 0 requires OPD trace features"
-            )
-        use_opd = self.dspark_opd_loss_alpha > 0 and has_opd_features
-        selected_opd = None
-        if use_opd and opd_anchor_positions is not None and opd_anchor_positions.size(1):
-            assert opd_anchor_positions is not None
-            assert opd_draft_token_ids is not None
-            assert opd_target_logprobs is not None
-            assert opd_accepted_lengths is not None
-            assert opd_candidate_mask is not None
-            selected_opd = self._select_opd_blocks(
-                input_ids=input_ids,
-                anchor_positions=opd_anchor_positions,
-                draft_token_ids=opd_draft_token_ids,
-                target_logprobs=opd_target_logprobs,
-                accepted_lengths=opd_accepted_lengths,
-                candidate_mask=opd_candidate_mask,
-            )
-            anchor_positions, block_keep_mask = selected_opd[:2]
-        else:
-            anchor_positions = None
-            block_keep_mask = None
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
         )
 
         logits = self.lm_head(output_hidden)
         num_blocks = anchor_positions.size(1)
-        if use_opd and selected_opd is None:
-            # Keep every FSDP rank on the same collective sequence when a
-            # rank-local sample has no OPD blocks after truncation.
-            candidate_shape = (bsz, num_blocks, self.block_size)
-            selected_opd = (
-                anchor_positions,
-                block_keep_mask,
-                torch.zeros(
-                    candidate_shape, dtype=input_ids.dtype, device=input_ids.device
-                ),
-                torch.zeros(
-                    candidate_shape, dtype=torch.float32, device=input_ids.device
-                ),
-                torch.zeros(
-                    (bsz, num_blocks), dtype=torch.long, device=input_ids.device
-                ),
-                torch.zeros(
-                    candidate_shape, dtype=torch.bool, device=input_ids.device
-                ),
-            )
         output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
         (
             target_ids,
@@ -1630,69 +1286,28 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 output_hidden_4d,
                 prev_token_ids=prev_token_ids,
             )
-        # OPD consumes target log-probabilities through its existing logits path.
-        # Standard offline/online DSpark reuses unique target probabilities.
-        unique_target_probs = None
-        aligned_target_logits = None
-        if selected_opd is not None:
-            aligned_target_logits = self._aligned_target_logits(
-                target_last_hidden_states, safe_label_indices,
-            )
-        else:
-            unique_target_probs = self._unique_target_probs(
-                target_last_hidden_states, safe_label_indices,
-            )
+        unique_target_probs = self._unique_target_probs(
+            target_last_hidden_states, safe_label_indices,
+        )
         loss, metrics = self._compute_dspark_loss(
             draft_logits=draft_logits,
             target_ids=target_ids,
             eval_mask=eval_mask,
             confidence_pred=confidence_pred,
-            aligned_target_logits=aligned_target_logits,
+            aligned_target_logits=None,
             unique_target_probs=unique_target_probs,
         )
-        if selected_opd is not None:
-            (
-                _,
-                _,
-                selected_draft_token_ids,
-                selected_target_logprobs,
-                selected_accepted_lengths,
-                selected_candidate_mask,
-            ) = selected_opd
-            opd_loss, opd_metrics = self._compute_opd_loss(
-                input_ids=input_ids,
-                base_logits=base_logits,
-                draft_logits=draft_logits,
-                target_ids=target_ids,
-                eval_mask=eval_mask,
-                aligned_target_logits=aligned_target_logits,
-                output_hidden_4d=output_hidden_4d,
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                draft_token_ids=selected_draft_token_ids,
-                target_logprobs=selected_target_logprobs,
-                accepted_lengths=selected_accepted_lengths,
-                candidate_mask=selected_candidate_mask,
-            )
-            opd_loss_sum = opd_metrics.pop("_eval_opd_loss_sum")
-            opd_loss_denom = opd_metrics.pop("_eval_opd_loss_denom")
-            loss = loss + self.dspark_opd_loss_alpha * opd_loss
-            metrics.update(opd_metrics)
-            metrics["eval_metric_sums"]["opd_loss"] = opd_loss_sum
-            metrics["eval_metric_denoms"]["opd_loss"] = opd_loss_denom
         if not self.training:
             if self.dspark_loss_mode == "kl":
                 objective_weights = {
                     "kl_loss": self.dspark_kl_loss_alpha,
                     "confidence_loss": self.dspark_confidence_head_alpha,
-                    "opd_loss": self.dspark_opd_loss_alpha,
                 }
             else:
                 objective_weights = {
                     "ce_loss": self.dspark_ce_loss_alpha,
                     "l1_loss": self.dspark_l1_loss_alpha,
                     "confidence_loss": self.dspark_confidence_head_alpha,
-                    "opd_loss": self.dspark_opd_loss_alpha,
                 }
             metrics["eval_objective_weights"] = {
                 name: weight

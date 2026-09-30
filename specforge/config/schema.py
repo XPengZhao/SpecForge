@@ -511,16 +511,6 @@ class TrainingConfig(StrictConfigModel):
     dspark_l1_loss_alpha: float = 0.9
     dspark_kl_loss_alpha: float = Field(default=1.0, ge=0.0)
     dspark_confidence_head_alpha: float = 1.0
-    dspark_opd_loss_alpha: float = Field(default=0.0, ge=0.0)
-    dspark_opd_forward_weight: float = Field(default=1.0, ge=0.0)
-    dspark_opd_rejected_weight: float = Field(default=1.0, ge=0.0)
-    dspark_opd_rejected_position_decay: float = Field(
-        default=0.8,
-        gt=0.0,
-        le=1.0,
-    )
-    dspark_opd_logprob_min_clamp: float = Field(default=-80.0, le=0.0)
-    dspark_opd_loss_max_clamp: float = Field(default=10.0, gt=0.0)
     #: Recompute the per-position DSpark loss (CE + L1 + confidence) under
     #: gradient checkpointing in backward to cut the loss-step memory peak.
     #: ``true`` saves ~2.6 GiB at 512x5x129280; ``false`` (default) disables

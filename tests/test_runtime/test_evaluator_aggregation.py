@@ -219,22 +219,22 @@ class TestEvaluatorAggregation(unittest.TestCase):
                     100.0,
                     0.5,
                     2,
-                    sums={"ce_loss": 2.0, "opd_loss": 3.0},
-                    denoms={"ce_loss": 2.0, "opd_loss": 1.0},
-                    objective_weights={"ce_loss": 0.3, "opd_loss": 1.0},
+                    sums={"ce_loss": 2.0, "confidence_loss": 3.0},
+                    denoms={"ce_loss": 2.0, "confidence_loss": 1.0},
+                    objective_weights={"ce_loss": 0.3, "confidence_loss": 1.0},
                 ),
                 _scalar_out_with_eval_metrics(
                     1.0,
                     0.5,
                     20,
-                    sums={"ce_loss": 6.0, "opd_loss": 3.0},
-                    denoms={"ce_loss": 3.0, "opd_loss": 3.0},
-                    objective_weights={"ce_loss": 0.3, "opd_loss": 1.0},
+                    sums={"ce_loss": 6.0, "confidence_loss": 3.0},
+                    denoms={"ce_loss": 3.0, "confidence_loss": 3.0},
+                    objective_weights={"ce_loss": 0.3, "confidence_loss": 1.0},
                 ),
             ]
         )
         self.assertAlmostEqual(metrics["eval/ce_loss"], 8.0 / 5.0)
-        self.assertAlmostEqual(metrics["eval/opd_loss"], 6.0 / 4.0)
+        self.assertAlmostEqual(metrics["eval/confidence_loss"], 6.0 / 4.0)
         self.assertAlmostEqual(
             metrics["eval/avg_loss"], 0.3 * 8.0 / 5.0 + 6.0 / 4.0
         )

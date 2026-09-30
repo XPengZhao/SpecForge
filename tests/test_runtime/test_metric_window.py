@@ -24,7 +24,6 @@ class DDPLoggingModel(torch.nn.Module):
     dspark_l1_loss_alpha = .8
     dspark_kl_loss_alpha = 1.2
     dspark_confidence_head_alpha = .7
-    dspark_opd_loss_alpha = .2
 
     def __init__(self, mode):
         super().__init__()
@@ -33,7 +32,7 @@ class DDPLoggingModel(torch.nn.Module):
 
     def forward(self, **kwargs):
         sums = {name: torch.tensor(2.) for name in
-                ('ce_loss', 'l1_loss', 'kl_loss', 'confidence_loss', 'opd_loss',
+                ('ce_loss', 'l1_loss', 'kl_loss', 'confidence_loss',
                  'mtp_1_ce', 'mtp_1_kl')}
         denoms = {name: torch.tensor(1.) for name in sums}
         return self.w * (dist.get_rank() + 1), torch.tensor(.5), {
@@ -58,7 +57,7 @@ def distributed_worker(rank, root):
             weights = out.metrics['log_window']['weights']
             expected = ({'ce_loss': .3, 'l1_loss': .8} if mode == 'original'
                         else {'kl_loss': 1.2})
-            assert weights == {**expected, 'confidence_loss': .7, 'opd_loss': .2}
+            assert weights == {**expected, 'confidence_loss': .7}
             out.loss.backward()
             # A bypassed DDP forward would leave rank-local gradients 1 or 2.
             torch.testing.assert_close(model.w.grad, torch.tensor(1.5))
@@ -128,7 +127,6 @@ class TestMetricWindow(unittest.TestCase):
             dspark_ce_loss_alpha = .1
             dspark_l1_loss_alpha = .9
             dspark_confidence_head_alpha = 1.
-            dspark_opd_loss_alpha = 0.
 
             def __init__(self):
                 super().__init__(); self.w = torch.nn.Parameter(torch.ones(()))

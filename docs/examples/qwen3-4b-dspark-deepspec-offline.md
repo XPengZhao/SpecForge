@@ -99,7 +99,7 @@ The default `data.dspark_supervision=response` preserves the cached response
 mask. Set `data.dspark_supervision=full_sequence` to supervise all real tokens
 in each cached sequence, including prompt and chat-template tokens. This option
 currently requires offline DSpark with token-aligned, unpadded DeepSpec v2
-features (or their native roundtrip) and does not support fixed OPD anchors.
+features (or their native roundtrip).
 The cache is reused without rewriting or recapturing hidden states.
 
 The mask is expanded before batch collation, so padding and out-of-range labels

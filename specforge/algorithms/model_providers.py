@@ -448,16 +448,6 @@ def build_dspark_model(
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             dspark_kl_loss_alpha=cfg.training.dspark_kl_loss_alpha,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
-            dspark_opd_loss_alpha=cfg.training.dspark_opd_loss_alpha,
-            dspark_opd_forward_weight=cfg.training.dspark_opd_forward_weight,
-            dspark_opd_rejected_weight=cfg.training.dspark_opd_rejected_weight,
-            dspark_opd_rejected_position_decay=(
-                cfg.training.dspark_opd_rejected_position_decay
-            ),
-            dspark_opd_logprob_min_clamp=(
-                cfg.training.dspark_opd_logprob_min_clamp
-            ),
-            dspark_opd_loss_max_clamp=cfg.training.dspark_opd_loss_max_clamp,
             recompute_loss=cfg.training.recompute_loss,
         ),
         target_config=_target_config,

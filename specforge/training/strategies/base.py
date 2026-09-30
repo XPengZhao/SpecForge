@@ -478,23 +478,11 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
-        opd_kwargs = {
-            key: t[key].to(device)
-            for key in (
-                "opd_anchor_positions",
-                "opd_draft_token_ids",
-                "opd_target_logprobs",
-                "opd_accepted_lengths",
-                "opd_candidate_mask",
-            )
-            if key in t
-        }
         loss, accuracy, model_metrics = self.dspark_model(
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
             target_last_hidden_states=t["target_last_hidden_states"].to(device),
-            **opd_kwargs,
         )
         metrics = {
             "accuracy": accuracy.detach(),
@@ -526,7 +514,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
                 for name in components
             }
             weights["confidence_loss"] = float(loss_model.dspark_confidence_head_alpha)
-            weights["opd_loss"] = float(loss_model.dspark_opd_loss_alpha)
             weights = {name: weight for name, weight in weights.items() if weight and name in sums}
             position_component = "kl" if loss_mode == "kl" else "ce"
             for name in list(sums):
@@ -552,12 +539,6 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             *loss_metric_names,
             "confidence_loss",
             "confidence_abs_error",
-            "opd_loss",
-            "opd_response_loss",
-            "opd_rejected_loss",
-            "opd_response_tokens",
-            "opd_accepted_tokens",
-            "opd_rejected_tokens",
         ):
             if name in model_metrics:
                 metrics[name] = model_metrics[name]
