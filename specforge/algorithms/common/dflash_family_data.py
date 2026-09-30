@@ -10,44 +10,41 @@ NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
 
 
+def _normalize_hidden_state(value, *, max_len: int, label: str):
+    """Accept one cached sequence, with or without its singleton batch axis."""
+    if value.dim() == 3 and value.shape[0] == 1:
+        value = value.squeeze(0)
+    if value.dim() != 2:
+        raise ValueError(
+            f"{label} must have shape [seq, width] or [1, seq, width], "
+            f"got {tuple(value.shape)}"
+        )
+    return value[:max_len].unsqueeze(0)
+
+
+def _validate_sequence_lengths(features, *, label: str):
+    lengths = {key: value.shape[1] for key, value in features.items()}
+    if len(set(lengths.values())) != 1:
+        details = ", ".join(f"{key}={length}" for key, length in lengths.items())
+        raise ValueError(
+            f"{label} features have mismatched sequence lengths after "
+            f"truncation: {details}"
+        )
+
+
 def normalize_offline_sample(raw, max_len: int):
     """Normalize raw DFlash/Domino capture tensors without target projection."""
-
-    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
-    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
-    hidden_states = raw["hidden_states"]
-    if hidden_states.dim() == 3:
-        if hidden_states.shape[0] != 1:
-            raise ValueError(
-                "offline DFlash-family hidden_states must have shape "
-                "[seq, width] or [1, seq, width], got "
-                f"{tuple(hidden_states.shape)}"
-            )
-        hidden_states = hidden_states.squeeze(0)
-    if hidden_states.dim() != 2:
-        raise ValueError(
-            "offline DFlash-family hidden_states must have shape "
-            "[seq, width] or [1, seq, width], got "
-            f"{tuple(hidden_states.shape)}"
-        )
-    hidden_states = hidden_states[:max_len].unsqueeze(0)
-    lengths = {
-        input_ids.shape[1],
-        loss_mask.shape[1],
-        hidden_states.shape[1],
+    normalized = {
+        "input_ids": raw["input_ids"][:max_len].unsqueeze(0),
+        "loss_mask": raw["loss_mask"][:max_len].unsqueeze(0),
+        "hidden_states": _normalize_hidden_state(
+            raw["hidden_states"],
+            max_len=max_len,
+            label="offline DFlash-family hidden_states",
+        ),
     }
-    if len(lengths) != 1:
-        raise ValueError(
-            "offline DFlash-family features have mismatched sequence lengths "
-            f"after truncation: input_ids={input_ids.shape[1]}, "
-            f"loss_mask={loss_mask.shape[1]}, "
-            f"hidden_states={hidden_states.shape[1]}"
-        )
-    return {
-        "input_ids": input_ids,
-        "loss_mask": loss_mask,
-        "hidden_states": hidden_states,
-    }
+    _validate_sequence_lengths(normalized, label="offline DFlash-family")
+    return normalized
 
 
 def build_offline_reader(
@@ -92,45 +89,21 @@ def normalize_offline_dspark_sample(raw, max_len: int, dspark_supervision="respo
     if loss_mask.numel() > 0 and not raw.get("loss_mask_is_token_aligned", False):
         loss_mask[0, -1] = 0
 
-    def normalize_hidden_state(key):
-        value = raw[key]
-        if value.dim() == 3:
-            if value.shape[0] != 1:
-                raise ValueError(
-                    f"offline DSpark {key} must have shape [seq, width] or "
-                    f"[1, seq, width], got {tuple(value.shape)}"
-                )
-            value = value.squeeze(0)
-        if value.dim() != 2:
-            raise ValueError(
-                f"offline DSpark {key} must have shape [seq, width] or "
-                f"[1, seq, width], got {tuple(value.shape)}"
-            )
-        return value[:max_len].unsqueeze(0)
-
-    hidden_states = normalize_hidden_state("aux_hidden_state")
-    target_last_hidden_states = normalize_hidden_state("hidden_state")
-    lengths = {
-        input_ids.shape[1],
-        loss_mask.shape[1],
-        hidden_states.shape[1],
-        target_last_hidden_states.shape[1],
-    }
-    if len(lengths) != 1:
-        raise ValueError(
-            "offline DSpark features have mismatched sequence lengths after "
-            f"truncation: input_ids={input_ids.shape[1]}, "
-            f"loss_mask={loss_mask.shape[1]}, "
-            f"hidden_states={hidden_states.shape[1]}, "
-            "target_last_hidden_states="
-            f"{target_last_hidden_states.shape[1]}"
-        )
     normalized = {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
-        "hidden_states": hidden_states,
-        "target_last_hidden_states": target_last_hidden_states,
+        "hidden_states": _normalize_hidden_state(
+            raw["aux_hidden_state"],
+            max_len=max_len,
+            label="offline DSpark aux_hidden_state",
+        ),
+        "target_last_hidden_states": _normalize_hidden_state(
+            raw["hidden_state"],
+            max_len=max_len,
+            label="offline DSpark hidden_state",
+        ),
     }
+    _validate_sequence_lengths(normalized, label="offline DSpark")
     return normalized
 
 

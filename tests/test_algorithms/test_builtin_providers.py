@@ -5,7 +5,8 @@ import sys
 import unittest
 from dataclasses import fields
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import (
@@ -27,6 +28,40 @@ BUILTINS = ("dflash", "domino", "dspark", "eagle3", "peagle")
 class BuiltinProviderContractTest(unittest.TestCase):
     def setUp(self):
         self.registry = builtin_algorithm_registry()
+
+    def test_dspark_rejects_missing_confidence_head_before_loading_target(self):
+        from specforge.algorithms.model_providers import build_dspark_model
+
+        cfg = SimpleNamespace(
+            training=SimpleNamespace(dspark_confidence_head_alpha=1.0)
+        )
+        draft = SimpleNamespace(confidence_head=None)
+        with patch(
+            "specforge.algorithms.model_providers._build_dflash_family_model"
+        ) as build:
+            with self.assertRaisesRegex(ValueError, "requires a draft confidence head"):
+                build_dspark_model(cfg, draft, None, None, None)
+            build.assert_not_called()
+
+    def test_dspark_confidence_head_and_weight_can_be_disabled_together(self):
+        from specforge.algorithms.model_providers import build_dspark_model
+
+        module_name = "specforge.algorithms.common.dflash_family_model"
+        module = ModuleType(module_name)
+        module.OnlineDSparkModel = Mock()
+        for alpha, head in ((0.0, None), (1.0, object())):
+            cfg = SimpleNamespace(
+                training=SimpleNamespace(dspark_confidence_head_alpha=alpha)
+            )
+            with self.subTest(alpha=alpha), patch.dict(sys.modules, {module_name: module}):
+                with patch(
+                    "specforge.algorithms.model_providers._build_dflash_family_model"
+                ) as build:
+                    result = build_dspark_model(
+                        cfg, SimpleNamespace(confidence_head=head), None, None, None
+                    )
+                    self.assertIs(result, build.return_value)
+                    build.assert_called_once()
 
     def test_five_builtins_are_explicit_and_instance_owned(self):
         self.assertEqual(BUILTINS, self.registry.names)

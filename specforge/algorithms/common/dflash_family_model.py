@@ -12,12 +12,11 @@ from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.algorithms.common.dspark_metrics import acceptance_stats
 
 try:
-    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+    from torch.nn.attention.flex_attention import create_block_mask
 
     FLEX_ATTENTION_AVAILABLE = True
 except ImportError:
     FLEX_ATTENTION_AVAILABLE = False
-    BlockMask = None
     create_block_mask = None
 
 # NPU workaround: flex_attention is not available on Ascend NPU.
@@ -169,10 +168,6 @@ class OnlineDFlashModel(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
-
-        self._cached_block_mask: Optional[BlockMask] = None
-        self._cached_seq_len: Optional[int] = None
-        self._cached_bsz: Optional[int] = None
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -730,7 +725,7 @@ class OnlineDominoModel(OnlineDFlashModel):
 
 
 class OnlineDSparkModel(OnlineDFlashModel):
-    """DSpark online training wrapper over DFlash block-parallel components."""
+    """DSpark wrapper; objective arguments come from validated TrainingConfig."""
 
     def __init__(
         self,
@@ -760,23 +755,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
         )
-        if dspark_loss_mode not in {"original", "kl"}:
-            raise ValueError("dspark_loss_mode must be 'original' or 'kl'")
-        if dspark_ce_loss_alpha < 0:
-            raise ValueError("dspark_ce_loss_alpha must be >= 0")
-        if dspark_l1_loss_alpha < 0:
-            raise ValueError("dspark_l1_loss_alpha must be >= 0")
-        if dspark_kl_loss_alpha < 0:
-            raise ValueError("dspark_kl_loss_alpha must be >= 0")
-        if dspark_confidence_head_alpha < 0:
-            raise ValueError("dspark_confidence_head_alpha must be >= 0")
         self.loss_type = "dspark"
-        self.dspark_loss_mode = str(dspark_loss_mode)
-        self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
-        self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
-        self.dspark_kl_loss_alpha = float(dspark_kl_loss_alpha)
-        self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
-        self.recompute_loss = bool(recompute_loss)
+        self.dspark_loss_mode = dspark_loss_mode
+        self.dspark_ce_loss_alpha = dspark_ce_loss_alpha
+        self.dspark_l1_loss_alpha = dspark_l1_loss_alpha
+        self.dspark_kl_loss_alpha = dspark_kl_loss_alpha
+        self.dspark_confidence_head_alpha = dspark_confidence_head_alpha
+        self.recompute_loss = recompute_loss
 
     def _build_anchor_candidate_mask(
         self,

@@ -435,6 +435,14 @@ def build_dspark_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    if (
+        cfg.training.dspark_confidence_head_alpha > 0
+        and draft_model.confidence_head is None
+    ):
+        raise ValueError(
+            "dspark_confidence_head_alpha > 0 requires a draft confidence head; "
+            "enable it in the draft config or set dspark_confidence_head_alpha=0"
+        )
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
     return _build_dflash_family_model(

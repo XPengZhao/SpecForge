@@ -507,10 +507,10 @@ class TrainingConfig(StrictConfigModel):
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_loss_mode: Literal["original", "kl"] = "original"
-    dspark_ce_loss_alpha: float = 0.1
-    dspark_l1_loss_alpha: float = 0.9
+    dspark_ce_loss_alpha: float = Field(default=0.1, ge=0.0)
+    dspark_l1_loss_alpha: float = Field(default=0.9, ge=0.0)
     dspark_kl_loss_alpha: float = Field(default=1.0, ge=0.0)
-    dspark_confidence_head_alpha: float = 1.0
+    dspark_confidence_head_alpha: float = Field(default=1.0, ge=0.0)
     #: Recompute the per-position DSpark loss (CE + L1 + confidence) under
     #: gradient checkpointing in backward to cut the loss-step memory peak.
     #: ``true`` saves ~2.6 GiB at 512x5x129280; ``false`` (default) disables

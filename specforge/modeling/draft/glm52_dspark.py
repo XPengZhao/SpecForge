@@ -287,6 +287,10 @@ class Glm52DSparkDraftModel(GlmMoeDsaPreTrainedModel):
     def final_stage(self) -> Glm52DSparkStage:
         return self.mtp[-1]
 
+    @property
+    def confidence_head(self) -> AcceptRatePredictor:
+        return self.final_stage.confidence_head
+
     def forward(
         self,
         position_ids: torch.LongTensor,

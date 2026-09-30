@@ -1039,6 +1039,10 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
     def final_stage(self) -> DeepseekV4DSparkStage:
         return self.mtp[-1]
 
+    @property
+    def confidence_head(self) -> AcceptRatePredictor:
+        return self.final_stage.confidence_head
+
     def fsdp_replicated_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return trainable FP32 parameters excluded from BF16 FSDP casting."""
         return tuple(

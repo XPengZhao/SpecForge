@@ -40,6 +40,13 @@ block size 7, 512 anchors, CE/L1/confidence coefficients `0.1/0.9/1.0`,
 loss decay gamma 4, maximum length 4096, and a global batch of
 `4 GPUs × 1 sample × 128 accumulation steps = 512`.
 
+The training config validates the loss mode and nonnegative objective weights
+before model construction. A positive confidence weight requires a draft
+confidence head; to disable that head, also set
+`training.dspark_confidence_head_alpha=0`. Tensor shapes and sequence lengths
+are checked at the offline data boundary. Cache alignment, supervision masks,
+and checkpoint compatibility checks remain in place.
+
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 specforge train \
   -c examples/configs/qwen3-4b-dspark-deepspec-offline.yaml \

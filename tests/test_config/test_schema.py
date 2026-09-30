@@ -76,6 +76,26 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_dspark_objective_parameters_are_validated_at_config_entry(self):
+        fields = (
+            "dspark_ce_loss_alpha",
+            "dspark_l1_loss_alpha",
+            "dspark_kl_loss_alpha",
+            "dspark_confidence_head_alpha",
+        )
+        payload = copy.deepcopy(MINIMAL)
+        payload["training"] = {"strategy": "dspark", **dict.fromkeys(fields, 0)}
+        cfg = Config.model_validate(payload)
+        for field in fields:
+            self.assertEqual(getattr(cfg.training, field), 0)
+            invalid = copy.deepcopy(payload)
+            invalid["training"][field] = -0.1
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                Config.model_validate(invalid)
+        payload["training"]["dspark_loss_mode"] = "unknown"
+        with self.assertRaises(ValidationError):
+            Config.model_validate(payload)
+
     def test_offline_shuffle_is_typed_and_defaults_on(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertTrue(default.data.offline_shuffle)
