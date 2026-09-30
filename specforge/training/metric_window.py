@@ -54,12 +54,17 @@ class MetricWindow:
             dist.broadcast(local_mean, src=0)
         size = len(names)
         values = stats[:size] / stats[size:].clamp_min(1e-6)
-        result = dict(zip(names, values.cpu().tolist()))
-        result['loss'] = local_mean.item()
+        extras = [local_mean.reshape(())]
+        if 'acc' in self.sums:
+            extras.append(stats[size + names.index('acc')])
+        # Transfer the complete summary once, including loss and token count.
+        exported = torch.cat((values, torch.stack(extras))).cpu().tolist()
+        result = dict(zip(names, exported[:size]))
+        result['loss'] = exported[size]
         result['loss_weighted'] = sum(w * result[n] for n, w in self.weights.items())
         result['log_micro_batches'] = self.count  # per rank, not global samples
         if 'acc' in result:
-            result['accuracy_denom'] = stats[size + names.index('acc')].item()
+            result['accuracy_denom'] = exported[size + 1]
         for i in range(2, 1000):
             current, previous = f'mtp_{i}_loss', f'mtp_{i-1}_loss'
             if current not in result or previous not in result:

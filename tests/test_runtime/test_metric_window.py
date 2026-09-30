@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -33,11 +34,42 @@ class DDPLoggingModel(torch.nn.Module):
     def forward(self, **kwargs):
         sums = {name: torch.tensor(2.) for name in
                 ('ce_loss', 'l1_loss', 'kl_loss', 'confidence_loss',
-                 'mtp_1_ce', 'mtp_1_kl')}
+                 'mtp_1_loss')}
         denoms = {name: torch.tensor(1.) for name in sums}
-        return self.w * (dist.get_rank() + 1), torch.tensor(.5), {
-            'eval_metric_sums': sums, 'eval_metric_denoms': denoms,
-        }
+        weights = ({'ce_loss': .3, 'l1_loss': .8} if self.dspark_loss_mode == 'original'
+                   else {'kl_loss': 1.2})
+        weights['confidence_loss'] = .7
+        metrics = ({'log_window': dict(sums=sums, denoms=denoms, weights=weights)}
+                   if self.training else {
+                       'eval_metric_sums': sums, 'eval_metric_denoms': denoms,
+                       'eval_objective_weights': weights,
+                   })
+        return self.w * (dist.get_rank() + 1), torch.tensor(.5), metrics
+
+
+class DistributedLossModel(torch.nn.Module):
+    """Exercise the real DSpark normalization with a small trainable proposal."""
+
+    def __init__(self):
+        super().__init__()
+        from tests.test_utils.test_dflash_losses import OnlineDSparkModel
+
+        self.logits = torch.nn.Parameter(torch.arange(12.).reshape(1, 2, 2, 3) / 10)
+        self.objective = OnlineDSparkModel.__new__(OnlineDSparkModel)
+        torch.nn.Module.__init__(self.objective)
+        self.objective.block_size = 2
+        self.objective.loss_decay_gamma = None
+        self.objective.dspark_loss_mode = 'original'
+        self.objective.dspark_ce_loss_alpha = 1.
+        self.objective.dspark_l1_loss_alpha = 0.
+        self.objective.dspark_confidence_head_alpha = 0.
+        self.objective.recompute_loss = False
+
+    def forward(self, targets, mask):
+        return self.objective._compute_dspark_loss(
+            draft_logits=self.logits, target_ids=targets, eval_mask=mask,
+            confidence_pred=None, aligned_target_logits=None,
+        )
 
 
 def distributed_worker(rank, root):
@@ -67,6 +99,34 @@ def distributed_worker(rank, root):
             wrapped.eval()
             with torch.no_grad():
                 assert 'log_window' not in strategy.forward_loss(batch).metrics
+
+        for first_rank_count in (0, 1):
+            model = DistributedLossModel()
+            wrapped = torch.nn.parallel.DistributedDataParallel(model)
+            masks = [torch.arange(4).reshape(1, 2, 2) < count
+                     for count in (first_rank_count, 3)]
+            targets = [(torch.arange(4).reshape(1, 2, 2) + r) % 3 for r in range(2)]
+            with mock.patch('torch.distributed.all_reduce', wraps=dist.all_reduce) as reduce:
+                loss, stats = wrapped(targets[rank], masks[rank])
+                assert reduce.call_count == 1
+                assert reduce.call_args.args[0].numel() == 1
+            torch.testing.assert_close(stats['denoms']['ce_loss'], masks[rank].sum().float())
+            loss.backward()
+            reference_logits = model.logits.detach().clone().requires_grad_(True)
+            numerator = sum(
+                (torch.nn.functional.cross_entropy(
+                    reference_logits.reshape(-1, 3), targets[r].reshape(-1),
+                    reduction='none',
+                ) * masks[r].reshape(-1)).sum()
+                for r in range(2)
+            )
+            reference_loss = numerator / sum(mask.sum() for mask in masks)
+            reference_grad, = torch.autograd.grad(reference_loss, reference_logits)
+            torch.testing.assert_close(model.logits.grad, reference_grad)
+            window = MetricWindow()
+            window.update(stats)
+            summary = window.summary()
+            assert abs(summary['ce_loss'] - reference_loss.item()) < 1e-6
     finally:
         dist.destroy_process_group()
 
@@ -134,12 +194,16 @@ class TestMetricWindow(unittest.TestCase):
             def forward(self, **kw):
                 sums = {k: torch.tensor(v) for k, v in
                         {'ce_loss': 20., 'l1_loss': 4., 'confidence_loss': 1.,
-                         'mtp_1_ce': 12., 'mtp_2_ce': 8., 'mtp_1_l1': 2.}.items()}
+                         'mtp_1_loss': 12., 'mtp_2_loss': 8.}.items()}
                 denoms = {k: torch.tensor(2.) for k in sums}
-                return self.w * 99, torch.tensor(.5), dict(
-                    eval_metric_sums=sums, eval_metric_denoms=denoms,
-                    acc_corrects=[torch.tensor(1.), torch.tensor(1.)],
-                    acc_denoms=[torch.tensor(2.), torch.tensor(2.)])
+                sums['acc'], denoms['acc'] = torch.tensor(2.), torch.tensor(4.)
+                weights = {'ce_loss': .1, 'l1_loss': .9, 'confidence_loss': 1.}
+                metrics = ({'log_window': dict(sums=sums, denoms=denoms, weights=weights)}
+                           if self.training else {
+                               'eval_metric_sums': sums, 'eval_metric_denoms': denoms,
+                               'eval_objective_weights': weights,
+                           })
+                return self.w * 99, torch.tensor(.5), metrics
         model = Model()
         batch = _batch()
         batch.tensors.update({k: torch.ones(1, 2) for k in
@@ -154,6 +218,24 @@ class TestMetricWindow(unittest.TestCase):
         self.assertEqual(out.loss.item(), 99.)
         model.eval()
         self.assertNotIn('log_window', DSparkTrainStrategy(model).forward_loss(batch).metrics)
+
+    def test_window_metrics_bypass_per_step_reduction_and_scalarization(self):
+        strategy = WindowStrategy()
+        core = TrainerCore(strategy, FakeBackend(strategy.model), accumulation_steps=2)
+        with (
+            mock.patch('specforge.training.controller._dp_mean_scalars',
+                       side_effect=AssertionError('window metrics reduced per step')),
+            mock.patch('specforge.training.controller._scalar',
+                       wraps=lambda value: float(value.item())) as scalar,
+        ):
+            first = core.train_step(_batch())
+            self.assertEqual(scalar.call_count, 1)  # StepResult.loss only.
+            second = core.train_step(_batch())
+            self.assertEqual(scalar.call_count, 3)  # Loss and boundary grad norm.
+        self.assertFalse(first.optimizer_stepped)
+        self.assertTrue(second.optimizer_stepped)
+        self.assertEqual(core.metric_window.count, 2)
+        self.assertEqual(core.metric_window.summary()['log_micro_batches'], 2)
 
     def test_natural_end_and_interval_one(self):
         for interval, updates, expected_steps, expected_counts in (

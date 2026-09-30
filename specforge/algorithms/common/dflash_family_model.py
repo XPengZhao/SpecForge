@@ -1,7 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1016,7 +1016,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         confidence_pred: Optional[torch.Tensor],
         aligned_target_logits: Optional[torch.Tensor],
         unique_target_probs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         has_target = aligned_target_logits is not None or unique_target_probs is not None
         loss_weight_mask = self._dspark_loss_weight_mask(eval_mask)
         ce_loss_den = loss_weight_mask.sum()
@@ -1025,10 +1025,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         kl_loss_sum = loss_weight_mask.new_zeros(())
         confidence_loss_sum = loss_weight_mask.new_zeros(())
         confidence_abs_error_sum = loss_weight_mask.new_zeros(())
-        position_sums = []
-        position_denoms = []
-        eval_metric_sums = {}
-        eval_metric_denoms = {}
+        metric_sums = {}
+        metric_denoms = {}
         accept_rates = []
         use_confidence_loss = (
             confidence_pred is not None and self.dspark_confidence_head_alpha > 0
@@ -1090,24 +1088,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
             ce_position_sum = (ce_p * wmask_p).sum()
             position_denom = wmask_p.sum()
             ce_loss_sum = ce_loss_sum + ce_position_sum
-            eval_metric_sums[f"mtp_{position + 1}_ce"] = (
-                ce_position_sum.detach()
-            )
-            eval_metric_denoms[f"mtp_{position + 1}_ce"] = (
-                position_denom.detach()
-            )
+            position_losses = {"ce": ce_position_sum}
 
             if tl_p is not None:
                 l1_position_sum = (l1_p * wmask_p).sum()
                 kl_position_sum = (kl_p * wmask_p).sum()
                 l1_loss_sum = l1_loss_sum + l1_position_sum
                 kl_loss_sum = kl_loss_sum + kl_position_sum
-                l1_name = f"mtp_{position + 1}_l1"
-                kl_name = f"mtp_{position + 1}_kl"
-                eval_metric_sums[l1_name] = l1_position_sum.detach()
-                eval_metric_denoms[l1_name] = position_denom.detach()
-                eval_metric_sums[kl_name] = kl_position_sum.detach()
-                eval_metric_denoms[kl_name] = position_denom.detach()
+                position_losses.update(l1=l1_position_sum, kl=kl_position_sum)
             else:
                 kl_position_sum = kl_p.new_zeros(())
 
@@ -1133,8 +1121,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 if self.dspark_loss_mode == "original"
                 else kl_position_sum
             )
-            position_sums.append(position_sum)
-            position_denoms.append(position_denom)
+            if self.training:
+                position_losses = {"loss": position_sum}
+            for component, value in position_losses.items():
+                name = f"mtp_{position + 1}_{component}"
+                metric_sums[name] = value.detach()
+                metric_denoms[name] = position_denom.detach()
 
             if use_confidence_loss:
                 confidence_loss_sum = confidence_loss_sum + (
@@ -1150,8 +1142,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             accept_sums, accept_denoms = acceptance_stats(
                 torch.stack(accept_rates, dim=-1), eval_mask
             )
-            eval_metric_sums.update(accept_sums)
-            eval_metric_denoms.update(accept_denoms)
+            metric_sums.update(accept_sums)
+            metric_denoms.update(accept_denoms)
 
         if self.dspark_loss_mode == "original":
             objective_sum = (
@@ -1164,78 +1156,47 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 self.dspark_kl_loss_alpha * kl_loss_sum
                 + self.dspark_confidence_head_alpha * confidence_loss_sum
             )
-        global_stats = torch.stack(
-            (
-                ce_loss_den.detach(),
-                ce_loss_sum.detach(),
-                l1_loss_sum.detach(),
-                kl_loss_sum.detach(),
-                confidence_loss_sum.detach(),
-                confidence_abs_error_sum.detach(),
-                *(value.detach() for value in position_sums),
-                *(value.detach() for value in position_denoms),
-            )
-        )
+        global_denominator = ce_loss_den.detach().clone()
         world_size = 1
         if (
             self.training
             and torch.distributed.is_available()
             and torch.distributed.is_initialized()
         ):
-            torch.distributed.all_reduce(global_stats)
+            # Only the denominator belongs on the per-micro-batch collective
+            # path. Logging statistics stay local until the window is emitted.
+            torch.distributed.all_reduce(global_denominator)
             world_size = torch.distributed.get_world_size()
 
-        global_denominator = global_stats[0].clamp_min(1e-6)
-        # FSDP averages gradients across ranks. Scale each rank's local
-        # numerator so the resulting gradient is sum(N_r) / sum(D_r).
-        loss = objective_sum * world_size / global_denominator
-        position_offset = 6
-        global_position_sums = global_stats[
-            position_offset : position_offset + self.block_size
-        ]
-        global_position_denoms = global_stats[
-            position_offset + self.block_size : position_offset + 2 * self.block_size
-        ]
-        position_metrics = {
-            f"mtp_{position + 1}_loss": (
-                global_position_sums[position]
-                / global_position_denoms[position].clamp_min(1e-6)
-            )
-            for position in range(self.block_size)
-        }
-        position_metrics.update(
-            {
-                f"mtp_{position + 1}_minus_{position}_loss": (
-                    position_metrics[f"mtp_{position + 1}_loss"]
-                    - position_metrics[f"mtp_{position}_loss"]
-                )
-                for position in range(1, self.block_size)
-            }
-        )
-        metrics = {
-            "ce_loss": global_stats[1] / global_denominator,
-            "l1_loss": global_stats[2] / global_denominator,
-            "kl_loss": global_stats[3] / global_denominator,
-            "confidence_loss": global_stats[4] / global_denominator,
-            "confidence_abs_error": global_stats[5] / global_denominator,
-            "metric_loss_denoms": [ce_loss_den.detach()],
-            "eval_metric_sums": eval_metric_sums,
-            "eval_metric_denoms": eval_metric_denoms,
-            **position_metrics,
-        }
-        eval_metric_sums["ce_loss"] = ce_loss_sum.detach()
-        eval_metric_denoms["ce_loss"] = ce_loss_den.detach()
+        # FSDP/DDP average gradients across ranks. Compensate so the gradient
+        # remains sum(N_r) / sum(D_r), including unequal or empty local masks.
+        loss = objective_sum * world_size / global_denominator.clamp_min(1e-6)
+        metric_sums["ce_loss"] = ce_loss_sum.detach()
+        metric_denoms["ce_loss"] = ce_loss_den.detach()
         if has_target and needs_target_distribution:
-            eval_metric_sums["l1_loss"] = l1_loss_sum.detach()
-            eval_metric_denoms["l1_loss"] = ce_loss_den.detach()
-            eval_metric_sums["kl_loss"] = kl_loss_sum.detach()
-            eval_metric_denoms["kl_loss"] = ce_loss_den.detach()
+            metric_sums["l1_loss"] = l1_loss_sum.detach()
+            metric_denoms["l1_loss"] = ce_loss_den.detach()
+            metric_sums["kl_loss"] = kl_loss_sum.detach()
+            metric_denoms["kl_loss"] = ce_loss_den.detach()
         if use_confidence_loss:
-            eval_metric_sums["confidence_loss"] = confidence_loss_sum.detach()
-            eval_metric_denoms["confidence_loss"] = ce_loss_den.detach()
-            eval_metric_sums["confidence_abs_error"] = confidence_abs_error_sum.detach()
-            eval_metric_denoms["confidence_abs_error"] = ce_loss_den.detach()
-        return loss, metrics
+            metric_sums["confidence_loss"] = confidence_loss_sum.detach()
+            metric_denoms["confidence_loss"] = ce_loss_den.detach()
+            metric_sums["confidence_abs_error"] = confidence_abs_error_sum.detach()
+            metric_denoms["confidence_abs_error"] = ce_loss_den.detach()
+        objective_weights = (
+            {"ce_loss": self.dspark_ce_loss_alpha, "l1_loss": self.dspark_l1_loss_alpha}
+            if self.dspark_loss_mode == "original"
+            else {"kl_loss": self.dspark_kl_loss_alpha}
+        )
+        objective_weights["confidence_loss"] = self.dspark_confidence_head_alpha
+        return loss, {
+            "sums": metric_sums,
+            "denoms": metric_denoms,
+            "weights": {
+                name: weight for name, weight in objective_weights.items()
+                if weight > 0 and name in metric_sums
+            },
+        }
 
     def forward(
         self,
@@ -1243,7 +1204,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """Parallel DSpark training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
             raise ValueError(
@@ -1289,7 +1250,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         unique_target_probs = self._unique_target_probs(
             target_last_hidden_states, safe_label_indices,
         )
-        loss, metrics = self._compute_dspark_loss(
+        loss, stats = self._compute_dspark_loss(
             draft_logits=draft_logits,
             target_ids=target_ids,
             eval_mask=eval_mask,
@@ -1297,23 +1258,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             aligned_target_logits=None,
             unique_target_probs=unique_target_probs,
         )
-        if not self.training:
-            if self.dspark_loss_mode == "kl":
-                objective_weights = {
-                    "kl_loss": self.dspark_kl_loss_alpha,
-                    "confidence_loss": self.dspark_confidence_head_alpha,
-                }
-            else:
-                objective_weights = {
-                    "ce_loss": self.dspark_ce_loss_alpha,
-                    "l1_loss": self.dspark_l1_loss_alpha,
-                    "confidence_loss": self.dspark_confidence_head_alpha,
-                }
-            metrics["eval_objective_weights"] = {
-                name: weight
-                for name, weight in objective_weights.items()
-                if weight > 0 and name in metrics["eval_metric_sums"]
-            }
         flat_logits = draft_logits.reshape(-1, draft_logits.size(-1))
         flat_targets = target_ids.reshape(-1)
         binary_eval_mask = eval_mask.reshape(-1)
@@ -1322,14 +1266,25 @@ class OnlineDSparkModel(OnlineDFlashModel):
             correct = (pred_ids == flat_targets) & binary_eval_mask
             accuracy_denom = binary_eval_mask.to(torch.float32).sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
-            metrics["accuracy_denom"] = accuracy_denom.detach()
             correct_3d = correct.view_as(eval_mask)
-            metrics["acc_corrects"] = [
-                correct_3d[..., position].sum().detach()
-                for position in range(self.block_size)
-            ]
-            metrics["acc_denoms"] = [
-                eval_mask[..., position].sum().detach()
-                for position in range(self.block_size)
-            ]
+            if self.training:
+                stats["sums"]["acc"] = correct.sum().float()
+                stats["denoms"]["acc"] = accuracy_denom
+                metrics = {"log_window": stats}
+            else:
+                metrics = {
+                    "accuracy_denom": accuracy_denom,
+                    "metric_loss_denoms": [stats["denoms"]["ce_loss"]],
+                    "eval_metric_sums": stats["sums"],
+                    "eval_metric_denoms": stats["denoms"],
+                    "eval_objective_weights": stats["weights"],
+                    "acc_corrects": [
+                        correct_3d[..., position].sum()
+                        for position in range(self.block_size)
+                    ],
+                    "acc_denoms": [
+                        eval_mask[..., position].sum()
+                        for position in range(self.block_size)
+                    ],
+                }
         return loss, accuracy, metrics

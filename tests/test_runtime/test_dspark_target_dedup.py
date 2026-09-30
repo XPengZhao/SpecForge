@@ -104,4 +104,4 @@ def test_forward_routes_through_unique_projection():
     with patch.object(m, '_aligned_target_logits', side_effect=AssertionError('legacy path')):
         loss, acc, metrics = m(ids, hidden, mask, target)
     assert torch.isfinite(loss) and torch.isfinite(acc)
-    assert 'tau_probabilistic' in metrics['eval_metric_sums']
+    assert 'tau_probabilistic' in metrics['log_window']['sums']

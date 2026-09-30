@@ -266,6 +266,16 @@ class TrainerCore:
         return self._result(out, grad_norm, stepped)
 
     def _result(self, out: StepOutput, grad_norm, stepped: bool) -> StepResult:
+        if "log_window" in out.metrics:
+            # Window statistics are already accumulated on device. Their means
+            # and DP reduction are computed only when the controller logs.
+            loss = _scalar(out.loss)
+            gn = _scalar(grad_norm) if grad_norm is not None else None
+            metrics = {"loss": loss}
+            if gn is not None:
+                metrics["grad_norm"] = gn
+            return StepResult(stepped, loss, gn, metrics)
+
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
         # would both collapse the TTT structure and log one rank's local data.

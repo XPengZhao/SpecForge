@@ -87,6 +87,12 @@ window; it does not reconstruct metrics from before the checkpoint.
 - `log_micro_batches`: the number of micro-batches **per rank** in this window.
 - `lr`, `grad_norm`: values at the last optimizer update in the window.
 
+The model supplies local sums, denominators, and objective weights directly to
+the logging window. Only the denominator needed for gradient normalization is
+reduced on every training micro-batch. Component means and position-loss
+differences are calculated when the window is logged, with one transfer of the
+complete summary to the CPU. Evaluation keeps its full-dataset aggregation.
+
 These changes affect logging only, not backward loss, gradients, optimizer,
 anchor sampling, or learning-rate scheduling. Existing running processes keep
 the old logging until restarted with the updated code. Evaluation retains its

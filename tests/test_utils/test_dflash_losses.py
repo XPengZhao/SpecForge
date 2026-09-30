@@ -578,12 +578,15 @@ class TestDFlashLosses(unittest.TestCase):
         conf = (conf * weights).sum() / (weights.sum() + 1e-6)
         want = 0.1 * ce + 0.9 * l1 + conf
         torch.testing.assert_close(loss, want, rtol=0, atol=1e-6)
-        torch.testing.assert_close(metrics["ce_loss"], ce, rtol=0, atol=1e-6)
+        stats = metrics["log_window"]
+        means = {name: value / stats["denoms"][name].clamp_min(1e-6)
+                 for name, value in stats["sums"].items()}
+        torch.testing.assert_close(means["ce_loss"], ce, rtol=0, atol=1e-6)
         torch.testing.assert_close(
-            metrics["l1_loss"], l1, rtol=0, atol=1e-6, check_dtype=False
+            means["l1_loss"], l1, rtol=0, atol=1e-6, check_dtype=False
         )
         torch.testing.assert_close(
-            metrics["confidence_loss"],
+            means["confidence_loss"],
             conf,
             rtol=0,
             atol=1e-6,
