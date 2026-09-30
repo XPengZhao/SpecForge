@@ -474,6 +474,11 @@ def warm_start_draft_model(
     allowed_missing = set()
     if allow_missing_embedding:
         allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
+    initialize_missing = getattr(
+        model, "initialize_missing_warm_start_parameters", None
+    )
+    if initialize_missing is not None:
+        allowed_missing.update(initialize_missing(set(result.missing_keys)))
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(

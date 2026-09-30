@@ -20,7 +20,7 @@ def make_config():
                 "draft_model_config": "draft.json",
             },
             "data": {"hidden_states_path": "/unavailable-training-cache"},
-            "training": {"strategy": "dspark", "dspark_draft_memory": True},
+            "training": {"strategy": "dspark", "num_anchors": 64},
         }
     )
 
@@ -48,7 +48,7 @@ def test_eval_config_uses_only_eval_cache_and_checkpoint_weights():
     assert result.training.resume_from is None
     assert result.training.resume_learning_rate is None
     assert not result.training.resume_reset_data_position
-    assert result.training.dspark_draft_memory
+    assert result.training.num_anchors == 64
     assert result.training.save_interval == 0
     assert result.tracking.report_to == "none"
 

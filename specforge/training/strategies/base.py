@@ -528,6 +528,8 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             weights["confidence_loss"] = float(loss_model.dspark_confidence_head_alpha)
             weights["opd_loss"] = float(loss_model.dspark_opd_loss_alpha)
             weights = {name: weight for name, weight in weights.items() if weight and name in sums}
+            if "eval_objective_weights" in model_metrics:
+                weights = dict(model_metrics["eval_objective_weights"])
             position_component = "kl" if loss_mode == "kl" else "ce"
             for name in list(sums):
                 if name.startswith("mtp_") and name.endswith(f"_{position_component}"):

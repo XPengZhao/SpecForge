@@ -97,7 +97,9 @@ def materialize_draft(
         )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
     non_embed_missing = [
-        key for key in missing if "embed" not in key.lower() and key not in tolerated
+        key for key in missing
+        if ("embed" not in key.lower() or key.startswith("prefix_reranker."))
+        and key not in tolerated
     ]
     if non_embed_missing:
         raise ValueError(
