@@ -223,6 +223,118 @@ def test_full_head_checkpoint_is_not_reinitialized(tmp_path):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_reranker_only_warm_start_preserves_baseline_after_optimizer_steps(tmp_path, dtype):
+    from specforge.algorithms.dspark.providers import build_draft, resume_contract
+    from specforge.config import load_config
+    from specforge.optimizer import BF16Optimizer
+
+    torch.manual_seed(53)
+    baseline = DSparkDraftModel(config(False)).to(dtype=dtype)
+    checkpoint = tmp_path / "training_state.pt"
+    torch.save(
+        dict(strategy="dspark", draft_state_dict=baseline.state_dict(), global_step=2604),
+        checkpoint,
+    )
+    with hf_init.no_init_weights():
+        draft = DSparkDraftModel(config()).to(dtype=dtype)
+    report = warm_start_draft_model(
+        draft, str(checkpoint), draft_config=draft.config, strategy="dspark"
+    )
+    assert report.missing_keys and all(
+        key.startswith("prefix_reranker.") for key in report.missing_keys
+    )
+    cfg = load_config("examples/configs/qwen3.8-flash-next-dspark-prefix-reranker.yaml")
+    cfg.model.draft_checkpoint_path = str(checkpoint)
+    cfg.training.dspark_reranker_only = True
+    # Exercise the provider's freeze policy after a real CPU weights-only load.
+    with patch(
+        "specforge.algorithms.model_providers.build_registered_draft", return_value=draft
+    ):
+        assert build_draft(cfg, draft.config) is draft
+    for name, parameter in draft.named_parameters():
+        assert parameter.requires_grad == name.startswith("prefix_reranker.")
+        assert torch.isfinite(parameter).all()
+    assert draft.prefix_reranker.residual_out.weight.count_nonzero() == 0
+    assert draft.prefix_reranker.qkv.weight.abs().sum() > 0
+    for key, value in baseline.state_dict().items():
+        assert torch.equal(draft.state_dict()[key], value)
+
+    model = OnlineDSparkModel(
+        draft_model=draft,
+        target_lm_head=nn.Linear(8, 19, bias=False).requires_grad_(False),
+        target_embed_tokens=nn.Embedding(19, 8).requires_grad_(False),
+        mask_token_id=0,
+        block_size=3,
+        attention_backend="sdpa",
+        num_anchors=2,
+        dspark_ce_loss_alpha=0.1,
+        dspark_l1_loss_alpha=0.9,
+        dspark_confidence_head_alpha=1.0,
+    ).to(dtype=dtype)
+
+    def anchors(self, seq_len, loss_mask, device):
+        return torch.tensor([[0, 2], [0, 2]], device=device), torch.ones(
+            2, 2, dtype=torch.bool, device=device
+        )
+
+    model._sample_anchor_positions = MethodType(anchors, model)
+    inputs = dict(
+        input_ids=torch.randint(1, 19, (2, 8)),
+        hidden_states=torch.randn(2, 8, 16).to(dtype),
+        loss_mask=torch.ones(2, 8),
+        target_last_hidden_states=torch.randn(2, 8, 8).to(dtype),
+    )
+    initial = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    optimizer = BF16Optimizer(draft, lr=0.01, total_steps=10, warmup_ratio=0)
+    assert {id(p) for p in optimizer.model_params} == {
+        id(p) for p in draft.prefix_reranker.parameters()
+    }
+    assert len(optimizer.fp32_params) == len(list(draft.prefix_reranker.parameters()))
+    assert not optimizer.optimizer.state
+    frozen_contract = resume_contract(cfg, draft, model)
+    assert frozen_contract["dspark_reranker_only"] is True
+    joint_cfg = cfg.model_copy(deep=True)
+    joint_cfg.training.dspark_reranker_only = False
+    joint_contract = resume_contract(joint_cfg, draft, model)
+    assert "dspark_reranker_only" not in joint_contract
+    assert frozen_contract["dspark_prefix_reranker_objective"] != joint_contract[
+        "dspark_prefix_reranker_objective"
+    ]
+
+    proposal_logits = []
+    hook = draft.prefix_reranker.register_forward_pre_hook(
+        lambda _module, args: proposal_logits.append(args[0].detach().clone())
+    )
+    try:
+        for _ in range(2):
+            loss, _, _ = model(**inputs)
+            assert loss.requires_grad and torch.isfinite(loss)
+            loss.backward()
+            for name, parameter in model.named_parameters():
+                if name.startswith("draft_model.prefix_reranker."):
+                    assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                else:
+                    assert parameter.grad is None
+            assert draft.prefix_reranker.residual_out.weight.grad.abs().sum() > 0
+            optimizer.step()
+        with torch.no_grad():
+            model(**inputs)
+    finally:
+        hook.remove()
+    assert len(proposal_logits) == 3
+    assert all(torch.equal(proposal_logits[0], value) for value in proposal_logits[1:])
+    for key, value in model.state_dict().items():
+        if not key.startswith("draft_model.prefix_reranker."):
+            assert torch.equal(value, initial[key]), key
+    assert draft.prefix_reranker.residual_out.weight.abs().sum() > 0
+    assert any(
+        not torch.equal(value, initial[key])
+        for key, value in model.state_dict().items()
+        if key.startswith("draft_model.prefix_reranker.") and "residual_out" not in key
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_real_training_forward_alignment_and_joint_updates(dtype):
     torch.manual_seed(5)
     draft = DSparkDraftModel(config())
@@ -462,12 +574,62 @@ def test_example_config_defaults_to_scratch():
     assert cfg.training.batch_size * cfg.training.accumulation_steps * 4 == 512
     assert cfg.model.draft_checkpoint_path is None
     assert cfg.training.resume_from is None
+    assert cfg.training.dspark_reranker_only is False
     with patch("specforge.algorithms.model_providers.build_registered_draft", return_value="scratch") as build:
         assert build_draft(cfg, config()) == "scratch"
         build.assert_called_once()
     cfg.training.dspark_ce_loss_alpha = cfg.training.dspark_l1_loss_alpha = 0
     with pytest.raises(ValueError, match="baseline CE or L1"):
         build_draft(cfg, config())
+
+
+def test_frozen_example_warm_starts_baseline_with_a_fresh_run():
+    from specforge.config import load_config
+
+    cfg = load_config(
+        "examples/configs/qwen3.8-flash-next-dspark-prefix-reranker-frozen.yaml"
+    )
+    joint = load_config("examples/configs/qwen3.8-flash-next-dspark-prefix-reranker.yaml")
+    assert cfg.training.dspark_reranker_only is True
+    assert "step2604" in cfg.model.draft_checkpoint_path
+    assert cfg.training.resume_from is None
+    assert cfg.model.draft_model_config == joint.model.draft_model_config
+    assert cfg.training.total_steps == 26040 and cfg.training.max_steps == 2604
+    assert cfg.training.batch_size * cfg.training.accumulation_steps * 4 == 512
+    assert cfg.run_id != joint.run_id and cfg.output_dir != joint.output_dir
+
+
+@pytest.mark.parametrize("enabled,checkpoint", [(False, "/baseline/step2604"), (True, None)])
+def test_reranker_only_rejects_missing_head_or_initial_weights(enabled, checkpoint):
+    from specforge.algorithms.dspark.providers import build_draft
+    from specforge.config import load_config
+
+    cfg = load_config("examples/configs/qwen3.8-flash-next-dspark-prefix-reranker.yaml")
+    cfg.training.dspark_reranker_only = True
+    cfg.model.draft_checkpoint_path = checkpoint
+    with patch("specforge.algorithms.model_providers.build_registered_draft") as build:
+        with pytest.raises(ValueError, match="reranker"):
+            build_draft(cfg, config(enabled))
+        build.assert_not_called()
+
+
+def test_reranker_only_can_resume_without_baseline_warm_start():
+    from specforge.algorithms.dspark.providers import build_draft
+    from specforge.config import load_config
+
+    cfg = load_config("examples/configs/qwen3.8-flash-next-dspark-prefix-reranker.yaml")
+    cfg.training.dspark_reranker_only = True
+    cfg.training.resume_from = "/reranker/checkpoint"
+    assert cfg.model.draft_checkpoint_path is None
+    draft = DSparkDraftModel(config())
+    with patch(
+        "specforge.algorithms.model_providers.build_registered_draft", return_value=draft
+    ):
+        assert build_draft(cfg, draft.config) is draft
+    assert all(
+        parameter.requires_grad == name.startswith("prefix_reranker.")
+        for name, parameter in draft.named_parameters()
+    )
 
 
 def test_distributed_rank_loss_uses_global_hit_denominator():
@@ -487,7 +649,7 @@ def test_distributed_rank_loss_uses_global_hit_denominator():
     torch.testing.assert_close(distributed_loss, local_loss * 2 / 4)
 
 
-def _ddp_reranker_worker(rank, rendezvous):
+def _ddp_reranker_worker(rank, rendezvous, reranker_only):
     from datetime import timedelta
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
@@ -503,6 +665,17 @@ def _ddp_reranker_worker(rank, rendezvous):
     try:
         torch.manual_seed(31)
         draft = DSparkDraftModel(config())
+        if reranker_only:
+            from specforge.algorithms.dspark.providers import build_draft
+            from specforge.config import load_config
+
+            cfg = load_config("examples/configs/qwen3.8-flash-next-dspark-prefix-reranker.yaml")
+            cfg.training.dspark_reranker_only = True
+            cfg.model.draft_checkpoint_path = "/baseline/step2604"
+            with patch(
+                "specforge.algorithms.model_providers.build_registered_draft", return_value=draft
+            ):
+                draft = build_draft(cfg, draft.config)
         model = OnlineDSparkModel(
             draft_model=draft,
             target_lm_head=nn.Linear(8, 19, bias=False).requires_grad_(False),
@@ -516,6 +689,11 @@ def _ddp_reranker_worker(rank, rendezvous):
             dspark_confidence_head_alpha=1.0,
         )
         wrapped = DistributedDataParallel(model)
+        frozen_initial = {
+            name: parameter.detach().clone()
+            for name, parameter in draft.named_parameters()
+            if not parameter.requires_grad
+        }
         optimizer = torch.optim.SGD(
             [p for p in model.parameters() if p.requires_grad], lr=0.1
         )
@@ -530,10 +708,13 @@ def _ddp_reranker_worker(rank, rendezvous):
                 target_last_hidden_states=torch.randn(1, 8, 8),
             )
             loss.backward()
-            assert all(p.grad is not None for p in draft.parameters())
+            assert all((p.grad is not None) == p.requires_grad for p in draft.parameters())
             assert all(p.grad is not None for p in draft.prefix_reranker.parameters())
             optimizer.step()
             optimizer.zero_grad()
+        for name, parameter in draft.named_parameters():
+            if name in frozen_initial:
+                assert torch.equal(parameter, frozen_initial[name]), name
         weight = draft.prefix_reranker.residual_out.weight.detach()
         copies = [torch.empty_like(weight) for _ in range(2)]
         dist.all_gather(copies, weight)
@@ -544,10 +725,11 @@ def _ddp_reranker_worker(rank, rendezvous):
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="requires Gloo")
-def test_two_rank_training_with_empty_rank(tmp_path):
+@pytest.mark.parametrize("reranker_only", [False, True], ids=["joint", "reranker_only"])
+def test_two_rank_training_with_empty_rank(tmp_path, reranker_only):
     torch.multiprocessing.spawn(
         _ddp_reranker_worker,
-        args=(f"file://{tmp_path}/rendezvous",),
+        args=(f"file://{tmp_path}/rendezvous", reranker_only),
         nprocs=2,
         join=True,
     )

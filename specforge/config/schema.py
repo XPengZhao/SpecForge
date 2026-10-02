@@ -156,6 +156,9 @@ class TrackingConfig(StrictConfigModel):
     """Optional experiment tracking behind the trainer's logger seam."""
 
     report_to: Literal["none", "wandb", "tensorboard", "swanlab", "mlflow"] = "none"
+    #: Shift external chart steps for warm-start comparisons. Training counters,
+    #: optimizer/scheduler progress, checkpoints and console steps stay local.
+    step_offset: int = Field(default=0, ge=0)
     wandb_project: Optional[str] = None
     wandb_name: Optional[str] = None
     wandb_key: Optional[str] = None
@@ -511,6 +514,8 @@ class TrainingConfig(StrictConfigModel):
     dspark_l1_loss_alpha: float = Field(default=0.9, ge=0.0)
     dspark_kl_loss_alpha: float = Field(default=1.0, ge=0.0)
     dspark_confidence_head_alpha: float = Field(default=1.0, ge=0.0)
+    #: Freeze the loaded DSpark draft, training only its prefix reranker.
+    dspark_reranker_only: bool = False
     #: Recompute the per-position DSpark loss (CE + L1 + confidence) under
     #: gradient checkpointing in backward to cut the loss-step memory peak.
     #: ``true`` saves ~2.6 GiB at 512x5x129280; ``false`` (default) disables
@@ -558,6 +563,8 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.dspark_reranker_only and self.strategy != "dspark":
+            raise ValueError("training.dspark_reranker_only requires strategy=dspark")
         if self.resume_learning_rate is not None and self.resume_from is None:
             raise ValueError(
                 "training.resume_learning_rate requires training.resume_from"

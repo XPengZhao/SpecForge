@@ -357,6 +357,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `tracking.report_to` | `none` | `none`, `wandb`, `tensorboard`, `swanlab`, or `mlflow`. |
+| `tracking.step_offset` | `0` | Add to external chart steps for warm-start comparisons; optimizer, checkpoints, and console keep local steps. Existing events are unchanged. |
 | `tracking.wandb_project` | `null` | W&B project. |
 | `tracking.wandb_name` | `null` | W&B run name. |
 | `tracking.wandb_key` | `null` | W&B API key; prefer the environment instead of committing it. |
