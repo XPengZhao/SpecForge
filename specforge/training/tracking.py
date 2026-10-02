@@ -79,9 +79,11 @@ class TrackerLogger:
         tracker: Any,
         *,
         console_logger: Optional[Callable[[Dict[str, float], int], None]] = None,
+        step_offset: int = 0,
     ) -> None:
         self.tracker = tracker
         self.console_logger = console_logger
+        self.step_offset = step_offset
         self._closed = False
 
     def __call__(self, metrics: Mapping[str, Any], step: int) -> None:
@@ -90,7 +92,8 @@ class TrackerLogger:
         values = training_metric_names(scalar_metrics(metrics))
         if self.console_logger is not None:
             self.console_logger(values, step)
-        self.tracker.log(values, step=step)
+        # Presentation only: never feed the shifted step back into the trainer.
+        self.tracker.log(values, step=step + self.step_offset)
 
     def close(self) -> None:
         if not self._closed:
@@ -123,7 +126,11 @@ def create_tracker_logger(
             raise ValueError(message)
 
     tracker_class.validate_args(_ValidationErrors(), args)
-    return TrackerLogger(tracker_class(args, output_dir), console_logger=console_logger)
+    return TrackerLogger(
+        tracker_class(args, output_dir),
+        console_logger=console_logger,
+        step_offset=getattr(args, "step_offset", 0),
+    )
 
 
 __all__ = [

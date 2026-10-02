@@ -1,11 +1,17 @@
 # coding=utf-8
 """Backend-neutral experiment tracking at the Trainer logger seam."""
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from specforge.tracker import _public_config
+from pydantic import ValidationError
+
+from specforge.config import Config, TrackingConfig
+from specforge.tracker import SummaryWriter, _public_config
+from specforge.training.assembly import _configured_logger
 from specforge.training.tracking import (
     TrackerLogger,
     create_tracker_logger,
@@ -107,6 +113,23 @@ class TrackingLoggerTest(unittest.TestCase):
         self.assertEqual(tracker.logged, [({"train/loss": 1.5}, 7)])
         console.assert_called_once_with({"train/loss": 1.5}, 7)
 
+    def test_offset_shifts_train_and_eval_tracking_but_keeps_console_steps(self):
+        tracker = _Tracker()
+        console = mock.Mock()
+        logger = TrackerLogger(tracker, console_logger=console, step_offset=2604)
+
+        logger({"loss": 1.5}, 0)
+        logger({"eval/loss": 1.25}, 20)
+
+        self.assertEqual(
+            tracker.logged,
+            [({"train/loss": 1.5}, 2604), ({"eval/loss": 1.25}, 2624)],
+        )
+        self.assertEqual(
+            console.call_args_list,
+            [mock.call({"train/loss": 1.5}, 0), mock.call({"eval/loss": 1.25}, 20)],
+        )
+
     def test_training_namespace_keeps_eval_metrics_unchanged(self):
         self.assertEqual(
             training_metric_names({"loss": 1.0, "eval/loss": 2.0}),
@@ -129,12 +152,71 @@ class TrackingLoggerTest(unittest.TestCase):
             "specforge.tracker.get_tracker_class", return_value=tracker_class
         ) as make:
             logger = create_tracker_logger(
-                mock.Mock(report_to="tensorboard"), "/tmp/output"
+                SimpleNamespace(report_to="tensorboard"), "/tmp/output"
             )
         make.assert_called_once_with("tensorboard")
         tracker_class.validate_args.assert_called_once()
         logger({"loss": 2.0}, 3)
         self.assertEqual(tracker.logged, [({"train/loss": 2.0}, 3)])
+
+    def test_tracking_offset_defaults_to_zero_and_rejects_negative_values(self):
+        self.assertEqual(TrackingConfig().step_offset, 0)
+        with self.assertRaises(ValidationError):
+            TrackingConfig(step_offset=-1)
+
+    def test_configured_logger_adds_offset_to_resumed_local_steps(self):
+        config = Config.model_validate(
+            {
+                "model": {
+                    "target_model_path": "target",
+                    "draft_model_config": "draft.json",
+                },
+                "data": {"hidden_states_path": "features"},
+                "training": {"resume_from": "/tmp/checkpoint-200"},
+                "tracking": {"report_to": "tensorboard", "step_offset": 2604},
+                "output_dir": "/tmp/output",
+            }
+        )
+        tracker = _Tracker()
+        tracker_class = mock.Mock(return_value=tracker)
+        with (
+            mock.patch("specforge.tracker.get_tracker_class", return_value=tracker_class),
+            mock.patch("specforge.training.assembly._logger") as console,
+        ):
+            logger = _configured_logger(config)
+
+        logger({"loss": 2.0}, 201)
+        logger({"eval/loss": 1.0}, 220)
+
+        self.assertEqual(
+            tracker.logged,
+            [({"train/loss": 2.0}, 2805), ({"eval/loss": 1.0}, 2824)],
+        )
+        self.assertEqual(
+            console.call_args_list,
+            [mock.call({"train/loss": 2.0}, 201), mock.call({"eval/loss": 1.0}, 220)],
+        )
+
+    @unittest.skipIf(SummaryWriter is None, "TensorBoard is not installed")
+    def test_tensorboard_events_store_the_shifted_steps(self):
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with create_tracker_logger(
+                SimpleNamespace(report_to="tensorboard", step_offset=2604), output_dir
+            ) as logger:
+                logger({"loss": 1.5}, 0)
+                logger({"loss": 1.0, "eval/loss": 0.75}, 200)
+
+            events = EventAccumulator(str(Path(output_dir) / "runs")).Reload()
+            self.assertEqual(
+                [(event.step, event.value) for event in events.Scalars("train/loss")],
+                [(2604, 1.5), (2804, 1.0)],
+            )
+            self.assertEqual(
+                [(event.step, event.value) for event in events.Scalars("eval/loss")],
+                [(2804, 0.75)],
+            )
 
     def test_noop_tracker_does_not_require_initialized_distributed(self):
         logger = create_tracker_logger(SimpleNamespace(report_to="none"), "/tmp/output")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
@@ -35,6 +37,7 @@ ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
 DEEPSEEK_V4_DRAFT_ARCHITECTURE = "DeepseekV4DSparkDraftModel"
 GLM52_DRAFT_ARCHITECTURE = "Glm52DSparkDraftModel"
+logger = logging.getLogger(__name__)
 
 
 class DSparkDraftConfigProvider(DraftConfigProvider):
@@ -118,6 +121,14 @@ def resume_contract(_config, draft_model, training_model):
         contract["dspark_prefix_reranker_objective"] = (
             "joint_dspark_plus_target_argmax_topk_ce_v2"
         )
+        # Omit the default to preserve existing joint-training resume contracts.
+        if _config.training.dspark_reranker_only:
+            contract["dspark_reranker_only"] = True
+            # This existing key is checked in both directions, including when
+            # switching back to joint training, before restoring the optimizer.
+            contract["dspark_prefix_reranker_objective"] = (
+                "frozen_dspark_plus_target_argmax_topk_ce_v2"
+            )
     return contract
 
 
@@ -127,6 +138,15 @@ def build_draft(config, draft_config):
     reranker = (getattr(draft_config, "dflash_config", None) or {}).get(
         "prefix_reranker"
     )
+    reranker_only = config.training.dspark_reranker_only
+    if reranker_only:
+        if reranker is None:
+            raise ValueError("training.dspark_reranker_only requires a prefix reranker")
+        if not (config.model.draft_checkpoint_path or config.training.resume_from):
+            raise ValueError(
+                "training.dspark_reranker_only requires model.draft_checkpoint_path "
+                "or training.resume_from; refusing to freeze a random draft"
+            )
     if reranker is not None:
         if list(getattr(draft_config, "architectures", None) or []) != [
             DRAFT_ARCHITECTURE
@@ -138,7 +158,21 @@ def build_draft(config, draft_config):
             raise ValueError("joint prefix reranker requires a baseline CE or L1 loss")
         if config.training.dspark_opd_loss_alpha > 0:
             raise ValueError("prefix reranker does not support OPD")
-    return build_registered_draft(config, draft_config)
+    draft_model = build_registered_draft(config, draft_config)
+    if reranker_only:
+        # Freeze BEFORE DDP/FSDP wrapping and optimizer/master-weight creation.
+        # The reranker reads shared Markov tables, which must remain frozen too.
+        draft_model.requires_grad_(False)
+        draft_model.prefix_reranker.requires_grad_(True)
+        trainable = sum(p.numel() for p in draft_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in draft_model.parameters())
+        logger.info(
+            "DSpark reranker-only training: %d/%d draft parameters trainable; "
+            "backbone, Markov and confidence parameters are frozen",
+            trainable,
+            total,
+        )
+    return draft_model
 
 
 def apply_draft_overrides(config, draft_config):
