@@ -112,6 +112,7 @@ class Trainer:
         dataset_size: Optional[int] = None,
         checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
+        overwrite_checkpoints: bool = False,
         tp_size: int = 1,
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
@@ -499,7 +500,8 @@ class Trainer:
             logger=logger,
             ack_fn=ack_fn,
             checkpoint_manager=CheckpointManager(
-                output_dir, run_id, max_checkpoints=max_checkpoints
+                output_dir, run_id, max_checkpoints=max_checkpoints,
+                overwrite_checkpoints=overwrite_checkpoints,
             ),
             checkpoint_extra=persisted_contract,
             start_step=resume["global_step"] if resume else 0,

@@ -421,6 +421,40 @@ class TestTrainerController(unittest.TestCase):
 
 
 class TestBestTracking(unittest.TestCase):
+    def test_final_save_uses_only_matching_step_evaluation(self):
+        for max_steps in (2, 3):
+            with self.subTest(max_steps=max_steps), tempfile.TemporaryDirectory() as d:
+                strat = FakeStrategy()
+                core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+                ctrl = TrainerController(
+                    core, run_id="r", output_dir=d, max_steps=max_steps,
+                    eval_interval=1 if max_steps == 2 else 2,
+                    eval_data_factory=lambda: [_batch()], save_interval=0,
+                )
+                ctrl.fit([_batch() for _ in range(max_steps)])
+                ctrl.save_checkpoint(max_steps)
+                with open(os.path.join(d, f"r-step{max_steps}", "eval_meta.json")) as stream:
+                    meta = json.load(stream)
+                if max_steps == 2:
+                    self.assertAlmostEqual(meta["score"], 0.5, places=6)
+                else:
+                    self.assertIsNone(meta["score"])
+
+    def test_periodic_non_best_checkpoint_records_its_eval(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(
+                core, run_id="r", output_dir=d, max_steps=2,
+                eval_interval=1, eval_data_factory=lambda: [_batch()], save_interval=1,
+            )
+            ctrl.fit([_batch(), _batch()])
+            with open(os.path.join(d, "r-step2", "eval_meta.json")) as stream:
+                meta = json.load(stream)
+            self.assertEqual(meta["step"], 2)
+            self.assertAlmostEqual(meta["score"], 0.5, places=6)
+            self.assertEqual(ctrl._checkpoint_manager().best_step, 1)
+
     def test_best_checkpoint_does_not_require_periodic_saves(self):
         strat = FakeStrategy()
         core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)

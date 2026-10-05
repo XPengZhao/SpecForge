@@ -532,6 +532,9 @@ class TrainingConfig(StrictConfigModel):
     log_interval: int = Field(default=50, gt=0)
     #: CheckpointManager rotation: keep the newest N checkpoints (0 = keep all).
     max_checkpoints: int = Field(default=0, ge=0)
+    #: Explicitly replace an existing checkpoint at the same step; later
+    #: checkpoints are never invalidated by a backfill.
+    overwrite_checkpoints: bool = False
     #: Offline EAGLE3 teacher projection without materializing full-vocab fp32
     #: logits. Exact, but trades additional head passes for lower peak memory.
     compact_teacher: bool = False

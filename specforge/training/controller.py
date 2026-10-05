@@ -397,6 +397,8 @@ class TrainerController:
         self.save_interval = save_interval
         self.eval_interval = eval_interval
         self.eval_data_factory = eval_data_factory
+        self._last_eval_step: Optional[int] = None
+        self._last_eval_metrics: Optional[Dict[str, Any]] = None
         self.log_interval = log_interval
         # Injected manager (rotation, best metric) or the lazy default layout.
         self._checkpoint_mgr = checkpoint_manager
@@ -497,6 +499,8 @@ class TrainerController:
         )
         if eval_enabled and self.global_step == 0:
             eval_metrics = self.evaluate_configured()
+            self._last_eval_step = self.global_step
+            self._last_eval_metrics = dict(eval_metrics or {})
             module.train()
             if eval_metrics:
                 if self.logger:
@@ -579,6 +583,8 @@ class TrainerController:
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:
                     eval_metrics = self.evaluate_configured()
+                    self._last_eval_step = self.global_step
+                    self._last_eval_metrics = dict(eval_metrics or {})
                     module.train()
                     if eval_metrics:
                         if self.logger:
@@ -594,7 +600,7 @@ class TrainerController:
                     eval_metrics and self._checkpoint_manager().is_better(eval_metrics)
                 )
                 if interval_hit or is_best:
-                    self.save_checkpoint(self.global_step)
+                    self.save_checkpoint(self.global_step, eval_metrics=eval_metrics)
                 if is_best:
                     self._checkpoint_manager().update_best(
                         self.global_step, eval_metrics
@@ -699,7 +705,13 @@ class TrainerController:
             self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
         return self._checkpoint_mgr
 
-    def save_checkpoint(self, step: int) -> Checkpoint:
+    def save_checkpoint(
+        self, step: int, *, eval_metrics: Optional[Dict[str, Any]] = None
+    ) -> Checkpoint:
+        # Final/manual saves may follow evaluation outside the periodic-save
+        # branch. Never attach a previous step's score to the current weights.
+        if eval_metrics is None and self._last_eval_step == step == self.global_step:
+            eval_metrics = self._last_eval_metrics
         # Every rank participates: FSDP model gathering is collective and every
         # rank persists its RNG. Sharded optimizer state stays rank-local; the
         # identical DDP optimizer is written once in the shared rank0 payload.
@@ -735,6 +747,7 @@ class TrainerController:
         ckpt_dir = mgr.save(
             shared,
             step,
+            eval_metrics=eval_metrics,
             rank_state={
                 "optimizer": None if replicated_optimizer else full["optimizer"],
                 "rng": full["rng"],

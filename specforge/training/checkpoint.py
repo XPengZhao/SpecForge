@@ -20,11 +20,14 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import math
 import os
 import re
 import shutil
+import tempfile
 import time
 import traceback
+import uuid
 from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
@@ -32,6 +35,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 STATE_FILE = "training_state.pt"
+EVAL_META_FILE = "eval_meta.json"
 
 
 def _cpu_tensors(obj: Any) -> Any:
@@ -52,12 +56,14 @@ class CheckpointManager:
         run_id: str,
         *,
         max_checkpoints: int = 0,
+        overwrite_checkpoints: bool = False,
         best_metric: str = "eval/simulated_acc_len",
         best_min_delta: float = 0.0,
     ) -> None:
         self.output_dir = output_dir
         self.run_id = run_id
         self.max_checkpoints = max_checkpoints
+        self.overwrite_checkpoints = overwrite_checkpoints
         self.best_metric = best_metric
         self.best_min_delta = best_min_delta
         self.best_score: Optional[float] = None
@@ -86,11 +92,13 @@ class CheckpointManager:
         step: int,
         *,
         rank_state: Optional[Dict[str, Any]] = None,
+        eval_metrics: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Write ``step``'s checkpoint, first deleting any on-disk steps >= step
-        (fork/rollback semantics), then repoint ``{run_id}-latest`` and rotate.
-        ``state`` is the shared payload (rank0 writes it); ``rank_state`` is
-        written by every rank. Collective: any rank's failure raises on all ranks.
+        """Stage a complete checkpoint, replacing only this step if opted in.
+
+        Backfills never invalidate later steps. Each save records evaluation
+        metadata bound to this version of the weights, including an unscored
+        marker when no evaluation ran. Collective: failures reach every rank.
         """
         ckpt_dir = self.checkpoint_dir(step)
         rank = self._rank()
@@ -98,36 +106,71 @@ class CheckpointManager:
         _pfx = f"[ckpt step={step} rank={rank}]"
 
         err = ""
+        staging_dir = None
         try:
             if self.is_rank0():
-                self._rewind(step)
+                if os.path.lexists(ckpt_dir):
+                    if not self.overwrite_checkpoints:
+                        raise FileExistsError(
+                            f"checkpoint already exists: {ckpt_dir}; set "
+                            "training.overwrite_checkpoints=true to replace only this step"
+                        )
+                    if os.path.islink(ckpt_dir) or not os.path.isdir(ckpt_dir):
+                        raise ValueError(f"refusing to replace non-directory checkpoint: {ckpt_dir}")
+                if state is None:
+                    raise ValueError("rank0 must supply the shared checkpoint state")
+                os.makedirs(self.output_dir, exist_ok=True)
+                staging_dir = tempfile.mkdtemp(
+                    prefix=f".{os.path.basename(ckpt_dir)}.pending-", dir=self.output_dir
+                )
         except Exception as exc:
-            err = f"rewind failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        self._barrier()  # stale >= step dirs are gone before any rank recreates them
-        print(f"{_pfx} rewind done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
-
-        if not err:
-            try:
-                os.makedirs(ckpt_dir, exist_ok=True)
-                print(f"{_pfx} mkdir done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
-
-                if rank_state is not None:
-                    self._atomic_save(
-                        rank_state,
-                        os.path.join(ckpt_dir, self._rank_file(rank)),
-                    )
-                print(f"{_pfx} rank_save done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
-
-                if self.is_rank0() and state is not None:
-                    self._atomic_save(state, self._state_path(ckpt_dir))
-                    print(f"{_pfx} state_save done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
-            except Exception as exc:
-                err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-
+            err = f"prepare failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
         self._all_ok(err)
-        if self.is_rank0():
-            self._point(f"{self.run_id}-latest", ckpt_dir)
-            self._rotate(keep_step=step)
+        if torch.distributed.is_initialized():
+            box = [staging_dir]
+            torch.distributed.broadcast_object_list(box, src=0)
+            staging_dir = box[0]
+
+        try:
+            if rank_state is not None:
+                self._atomic_save(
+                    rank_state,
+                    os.path.join(staging_dir, self._rank_file(rank)),
+                )
+            print(f"{_pfx} rank_save done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
+
+            if self.is_rank0():
+                self._atomic_save(state, self._state_path(staging_dir))
+                self._atomic_json(
+                    self._evaluation_meta(step, eval_metrics or {}, checkpoint_id=uuid.uuid4().hex),
+                    os.path.join(staging_dir, EVAL_META_FILE),
+                )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+
+        try:
+            self._all_ok(err)
+        except RuntimeError:
+            if self.is_rank0():
+                shutil.rmtree(staging_dir)
+            raise
+        err = ""
+        try:
+            if self.is_rank0():
+                self._commit_staged(staging_dir, ckpt_dir)
+                self._load_best_meta()
+                self._publish_best(self._best_record)
+                self._rotate(keep_step=step)
+                latest = self.latest_dir()
+                if latest is not None:
+                    self._point(f"{self.run_id}-latest", latest)
+        except Exception as exc:
+            err = f"commit failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        self._all_ok(err)
+        if torch.distributed.is_initialized():
+            box = [self.best_step, self.best_score]
+            torch.distributed.broadcast_object_list(box, src=0)
+            self.best_step, self.best_score = box
         print(f"{_pfx} rotate done  (+{time.monotonic() - t0:.1f}s)\n", end="", flush=True)
 
         self._barrier()  # no rank proceeds before the checkpoint is complete
@@ -135,27 +178,27 @@ class CheckpointManager:
 
         return ckpt_dir
 
-    def _rewind(self, step: int) -> None:
-        # Fork semantics: saving step S invalidates on-disk steps >= S, including
-        # a best record inside the deleted range.
-        stale = sorted(path for s, path in self._step_dirs() if s >= step)
-        if stale:
-            logger.warning(
-                "rewinding checkpoint timeline at step %d: deleting %s",
-                step,
-                ", ".join(stale),
-            )
-            for path in stale:
-                shutil.rmtree(path)
-        if self.best_step is not None and self.best_step >= step:
-            self.best_score = None
-            self.best_step = None
-            best_link = os.path.join(self.output_dir, f"{self.run_id}-best")
-            for path in (self._best_meta_path, best_link):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass  # best-effort: reload ignores meta whose step dir is gone
+    def _commit_staged(self, staging_dir: str, ckpt_dir: str) -> None:
+        """Keep the old directory until every new rank shard has been written."""
+        backup = staging_dir + ".previous"
+        replacing = os.path.lexists(ckpt_dir)
+        if replacing:
+            if not self.overwrite_checkpoints:
+                raise FileExistsError(f"checkpoint appeared during save: {ckpt_dir}")
+            if os.path.islink(ckpt_dir) or not os.path.isdir(ckpt_dir):
+                raise ValueError(f"refusing to replace non-directory checkpoint: {ckpt_dir}")
+            os.replace(ckpt_dir, backup)
+        try:
+            os.replace(staging_dir, ckpt_dir)
+        except Exception:
+            if replacing:
+                os.replace(backup, ckpt_dir)
+            raise
+        if replacing:
+            try:
+                shutil.rmtree(backup)
+            except OSError as exc:
+                logger.warning("saved checkpoint but could not remove old backup %s: %s", backup, exc)
 
     def _all_ok(self, err: str) -> None:
         # Barrier replacement: every rank learns every rank's outcome, so one
@@ -176,7 +219,8 @@ class CheckpointManager:
     def score(self, eval_metrics: Optional[Dict[str, Any]]) -> Optional[float]:
         """Best-tracking score from an eval-metrics dict; None when absent."""
         s = (eval_metrics or {}).get(self.best_metric)
-        return float(s) if s is not None else None
+        s = float(s) if s is not None else None
+        return s if s is not None and math.isfinite(s) else None
 
     def is_better(self, eval_metrics: Optional[Dict[str, Any]]) -> bool:
         """Rank-agreed verdict: do these metrics beat the tracked best (higher
@@ -198,31 +242,47 @@ class CheckpointManager:
         self.best_step = step
         if not self.is_rank0():
             return
-        self._point(f"{self.run_id}-best", self.checkpoint_dir(step))
-        self._atomic_json(
-            {
-                "run_id": self.run_id,
-                "step": step,
-                "score": self.best_score,
-                "metric": self.best_metric,
-                "metrics": eval_metrics,
-            },
-            self._best_meta_path,
+        if not os.path.isfile(self._state_path(self.checkpoint_dir(step))):
+            raise ValueError("best must reference a saved checkpoint")
+        path = os.path.join(self.checkpoint_dir(step), EVAL_META_FILE)
+        previous = self._read_json(path) or {}
+        meta = self._evaluation_meta(
+            step, eval_metrics, checkpoint_id=previous.get("checkpoint_id") or uuid.uuid4().hex
         )
+        self._atomic_json(meta, path)
+        self._publish_best(meta)
 
     def _load_best_meta(self) -> None:
-        # Rehydrate so a restart neither rotates away the on-disk best nor lets
-        # a worse score overwrite it.
+        """Reconcile known scores; legacy unscored checkpoints are not guessed."""
+        current = self._read_json(self._best_meta_path)
+        best = current if self._valid_eval_meta(current) else None
+        if current is not None and best is None:
+            logger.warning("ignoring stale or incompatible best meta %s", self._best_meta_path)
+        for step, path in sorted(self._all_checkpoints()):
+            meta = self._read_json(os.path.join(path, EVAL_META_FILE))
+            if not self._valid_eval_meta(meta, expected_step=step):
+                continue
+            if best is None or meta["score"] > best["score"] + self.best_min_delta:
+                best = meta
+        self._best_record = best
+        self.best_score = best["score"] if best else None
+        self.best_step = best["step"] if best else None
+
+    @staticmethod
+    def _read_json(path: str) -> Optional[dict]:
         try:
-            with open(self._best_meta_path) as fh:
+            with open(path) as fh:
                 meta = json.load(fh)
         except FileNotFoundError:
-            return
+            return None
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "ignoring unreadable best meta %s: %s", self._best_meta_path, exc
-            )
-            return
+            logger.warning("ignoring unreadable checkpoint meta %s: %s", path, exc)
+            return None
+        return meta if isinstance(meta, dict) else None
+
+    def _valid_eval_meta(self, meta: Optional[dict], *, expected_step=None) -> bool:
+        if meta is None:
+            return False
         step = meta.get("step")
         score = meta.get("score")
         if (
@@ -230,15 +290,42 @@ class CheckpointManager:
             or meta.get("metric") != self.best_metric
             or not isinstance(step, int)
             or not isinstance(score, (int, float))
+            or not math.isfinite(score)
+            or (expected_step is not None and step != expected_step)
             or not os.path.isfile(self._state_path(self.checkpoint_dir(step)))
         ):
-            logger.warning(
-                "ignoring best meta %s: run_id/metric mismatch, malformed, or its "
-                "checkpoint is gone",
-                self._best_meta_path,
-            )
+            return False
+        path = os.path.join(self.checkpoint_dir(step), EVAL_META_FILE)
+        if os.path.exists(path):
+            own = self._read_json(path)
+            # An old global score must not attach to replacement weights.
+            if own is None or any(
+                own.get(key) != meta.get(key)
+                for key in ("checkpoint_id", "run_id", "step", "metric", "score")
+            ):
+                return False
+        return True
+
+    def _evaluation_meta(self, step, metrics, *, checkpoint_id):
+        return {
+            "run_id": self.run_id, "step": step, "score": self.score(metrics),
+            "metric": self.best_metric, "metrics": metrics,
+            "checkpoint_id": checkpoint_id,
+        }
+
+    def _publish_best(self, meta: Optional[dict]) -> None:
+        self._best_record = meta
+        self.best_step = meta["step"] if meta else None
+        self.best_score = meta["score"] if meta else None
+        if meta is None:
+            if os.path.isfile(self._best_meta_path):
+                os.remove(self._best_meta_path)
+            best_link = os.path.join(self.output_dir, f"{self.run_id}-best")
+            if os.path.islink(best_link):
+                os.unlink(best_link)
             return
-        self.best_score, self.best_step = float(score), int(step)
+        self._atomic_json(meta, self._best_meta_path)
+        self._point(f"{self.run_id}-best", self.checkpoint_dir(meta["step"]))
 
     # -- load --------------------------------------------------------------
     def load(self, step: Optional[int] = None, *, map_location="cpu") -> Dict[str, Any]:
@@ -326,6 +413,19 @@ class CheckpointManager:
                 latest.append(resolved)
         latest = sorted(set(latest))
         if len(latest) == 1:
+            # Older versions could leave the pointer at a lower backfill step.
+            # An explicit checkpoint/symlink path above still selects that step.
+            match = re.match(r"^(.+)-step(\d+)$", os.path.basename(latest[0]))
+            if match:
+                run_id = match.group(1)
+                pattern = re.compile(rf"^{re.escape(run_id)}-step(\d+)$")
+                candidates = []
+                for candidate in glob.glob(os.path.join(glob.escape(path), f"{glob.escape(run_id)}-step*")):
+                    step_match = pattern.match(os.path.basename(candidate))
+                    if step_match and os.path.isfile(os.path.join(candidate, STATE_FILE)):
+                        candidates.append((int(step_match.group(1)), candidate))
+                if candidates:
+                    return max(candidates)[1]
             return latest[0]
         if len(latest) > 1:
             raise ValueError(
@@ -353,11 +453,6 @@ class CheckpointManager:
 
     def latest_dir(self) -> Optional[str]:
         """Directory of the newest complete checkpoint, or None."""
-        link = os.path.join(self.output_dir, f"{self.run_id}-latest")
-        if os.path.islink(link):
-            target = os.path.realpath(link)
-            if os.path.isfile(self._state_path(target)):
-                return target
         step = self._max_step_on_disk()
         return self.checkpoint_dir(step) if step is not None else None
 
@@ -406,19 +501,19 @@ class CheckpointManager:
 
     def _point(self, name: str, ckpt_dir: str) -> None:
         link = os.path.join(self.output_dir, name)
+        if os.path.lexists(link) and not os.path.islink(link):
+            logger.warning("not replacing non-symlink checkpoint pointer %s", link)
+            return
+        tmp = link + "." + uuid.uuid4().hex + ".tmp"
         try:
-            if os.path.islink(link):
-                os.remove(link)
-            elif os.path.isdir(link):
-                logger.warning("removing non-symlink %s shadowing checkpoints", link)
-                shutil.rmtree(link)
-            elif os.path.exists(link):
-                logger.warning("removing non-symlink %s shadowing checkpoints", link)
-                os.remove(link)
             # Relative target survives relocating output_dir to another mount.
-            os.symlink(os.path.basename(ckpt_dir), link)
+            os.symlink(os.path.basename(ckpt_dir), tmp)
+            os.replace(tmp, link)
         except OSError:
             return  # no symlink support: step dirs + best meta stay authoritative
+        finally:
+            if os.path.islink(tmp):
+                os.unlink(tmp)
 
     def _rotate(self, keep_step: int) -> None:
         if self.max_checkpoints <= 0:
@@ -434,14 +529,14 @@ class CheckpointManager:
                 logger.warning("rotation could not remove %s: %s", path, exc)
 
     def _step_dirs(self) -> Iterator[Tuple[int, str]]:
-        # Raw {run_id}-step{N} dirs, complete or not (rewind must see both).
+        # Pending saves and backups do not match this run-scoped layout.
         pat = re.compile(rf"^{re.escape(self.run_id)}-step(\d+)$")
         pattern = os.path.join(
             glob.escape(self.output_dir), f"{glob.escape(self.run_id)}-step*"
         )
         for path in glob.glob(pattern):
             m = pat.match(os.path.basename(path))
-            if m and os.path.isdir(path):
+            if m and os.path.isdir(path) and not os.path.islink(path):
                 yield int(m.group(1)), path
 
     def _all_checkpoints(self) -> Iterator[Tuple[int, str]]:

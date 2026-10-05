@@ -76,6 +76,12 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_checkpoint_overwrite_requires_explicit_opt_in(self):
+        cfg = Config.model_validate(copy.deepcopy(MINIMAL))
+        self.assertFalse(cfg.training.overwrite_checkpoints)
+        configured = apply_overrides(cfg, ["training.overwrite_checkpoints=true"])
+        self.assertTrue(configured.training.overwrite_checkpoints)
+
     def test_dspark_objective_parameters_are_validated_at_config_entry(self):
         fields = (
             "dspark_ce_loss_alpha",

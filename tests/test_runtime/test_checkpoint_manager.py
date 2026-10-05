@@ -1,5 +1,5 @@
 # coding=utf-8
-"""CheckpointManager gates: atomic/complete-dir scanning, timeline rewind,
+"""CheckpointManager gates: atomic/complete-dir scanning, safe backfills,
 run-scoped pointers and best meta, is_better/update_best API, read_resume_state,
 plus a 2-process gloo pass over save + per-rank resume. CPU-only.
 """
@@ -11,6 +11,7 @@ import shutil
 import socket
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import timedelta
 
 import torch
@@ -60,7 +61,7 @@ class TestLayoutAndAtomicity(unittest.TestCase):
         self.assertEqual(leftovers, [], "atomic writes must not leave .tmp files")
         self.assertTrue(os.path.isfile(os.path.join(mgr.checkpoint_dir(2), STATE_FILE)))
 
-    def test_latest_requires_symlink_and_shadow_is_repaired(self):
+    def test_latest_ignores_and_preserves_non_symlink_shadows(self):
         from specforge.training.checkpoint import STATE_FILE
 
         out = tempfile.mkdtemp(prefix="ckpt_shadow_")
@@ -76,66 +77,172 @@ class TestLayoutAndAtomicity(unittest.TestCase):
         self.assertEqual(os.path.realpath(got), os.path.realpath(mgr.checkpoint_dir(1)))
         self.assertNotEqual(os.path.realpath(got), os.path.realpath(link))
 
-        mgr.save(_state(2), 2)
-        self.assertTrue(os.path.islink(link))
+        with self.assertLogs(LOGGER, level="WARNING"):
+            mgr.save(_state(2), 2)
+        self.assertTrue(os.path.isdir(link))
+        self.assertFalse(os.path.islink(link))
         self.assertEqual(
-            os.path.realpath(link), os.path.realpath(mgr.checkpoint_dir(2))
+            os.path.realpath(mgr.latest_dir()), os.path.realpath(mgr.checkpoint_dir(2))
         )
 
-        os.remove(link)
+        shutil.rmtree(link)
         with open(link, "w") as fh:
             fh.write("x")
         self.assertEqual(
             os.path.realpath(mgr.latest_dir()),
             os.path.realpath(mgr.checkpoint_dir(2)),
         )
-        mgr.save(_state(3), 3)
-        self.assertTrue(os.path.islink(link))
+        with self.assertLogs(LOGGER, level="WARNING"):
+            mgr.save(_state(3), 3)
+        self.assertFalse(os.path.islink(link))
+        with open(link) as fh:
+            self.assertEqual(fh.read(), "x")
         self.assertEqual(
-            os.path.realpath(link), os.path.realpath(mgr.checkpoint_dir(3))
+            os.path.realpath(mgr.latest_dir()), os.path.realpath(mgr.checkpoint_dir(3))
         )
 
 
-class TestRewind(unittest.TestCase):
-    def test_save_rewinds_future_steps_and_clears_best(self):
+class TestBackfill(unittest.TestCase):
+    def test_overwrite_preserves_future_steps_and_best(self):
         out = tempfile.mkdtemp(prefix="ckpt_rewind_")
-        mgr = _mgr(out)
+        mgr = _mgr(out, overwrite_checkpoints=True)
         for s in (1, 2, 3):
             mgr.save(_state(s), s)
         mgr.update_best(3, {METRIC: 5.0})
         self.assertEqual(mgr.best_step, 3)
 
-        with self.assertLogs(LOGGER, level="WARNING"):
-            mgr.save(_state(2), 2)
+        mgr.save(_state(2, replacement=True), 2)
 
-        self.assertFalse(os.path.exists(mgr.checkpoint_dir(3)))
+        self.assertTrue(os.path.exists(mgr.checkpoint_dir(3)))
         self.assertTrue(os.path.exists(mgr.checkpoint_dir(1)))
-        self.assertEqual(_steps(mgr), [1, 2])
-        self.assertIsNone(mgr.best_step)
-        self.assertIsNone(mgr.best_score)
-        self.assertFalse(os.path.exists(os.path.join(out, "run.best_meta.json")))
-        self.assertFalse(os.path.lexists(os.path.join(out, "run-best")))
+        self.assertEqual(_steps(mgr), [1, 2, 3])
+        self.assertTrue(mgr.load(2)["replacement"])
+        self.assertEqual(mgr.best_step, 3)
+        self.assertEqual(mgr.best_score, 5.0)
+        self.assertTrue(os.path.exists(os.path.join(out, "run.best_meta.json")))
+        self.assertTrue(os.path.lexists(os.path.join(out, "run-best")))
         self.assertEqual(
-            os.path.realpath(mgr.latest_dir()), os.path.realpath(mgr.checkpoint_dir(2))
+            os.path.realpath(mgr.latest_dir()), os.path.realpath(mgr.checkpoint_dir(3))
         )
-        self.assertIsNone(_mgr(out).best_step)
+        self.assertEqual(_mgr(out).best_step, 3)
 
-    def test_rewind_spares_best_below_step(self):
+    def test_overwrite_spares_best_below_step(self):
         out = tempfile.mkdtemp(prefix="ckpt_rewind_lo_")
-        mgr = _mgr(out)
+        mgr = _mgr(out, overwrite_checkpoints=True)
         mgr.save(_state(1), 1)
         mgr.save(_state(2), 2)
         mgr.update_best(1, {METRIC: 5.0})
-        mgr.save(_state(2), 2)  # rewind hits step 2 only; best_step=1 < 2 survives
+        mgr.save(_state(2), 2)
         self.assertEqual(mgr.best_step, 1)
         self.assertEqual(mgr.best_score, 5.0)
         self.assertTrue(os.path.exists(os.path.join(out, "run.best_meta.json")))
+
+    def test_existing_step_requires_explicit_overwrite(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out)
+            mgr.save(_state(2, original=True), 2)
+            with self.assertRaisesRegex(RuntimeError, "overwrite_checkpoints=true"):
+                mgr.save(_state(2, original=False), 2)
+            self.assertTrue(mgr.load(2)["original"])
+
+    def test_missing_older_step_does_not_move_latest_backwards(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out)
+            mgr.save(_state(21483), 21483, eval_metrics={METRIC: 5.5})
+            mgr.save(_state(10416), 10416, eval_metrics={METRIC: 5.0})
+            self.assertEqual(_steps(mgr), [10416, 21483])
+            self.assertEqual(mgr.load()["global_step"], 21483)
+            self.assertEqual(mgr.best_step, 21483)
+            self.assertEqual(
+                os.path.realpath(os.path.join(out, "run-latest")),
+                os.path.realpath(mgr.checkpoint_dir(21483)),
+            )
+
+    def test_failed_overwrite_keeps_old_weights_scores_and_pointers(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            mgr.save(_state(2, original=True), 2, eval_metrics={METRIC: 5.0})
+            with patch.object(mgr, "_atomic_save", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(RuntimeError, "disk full"):
+                    mgr.save(_state(2, original=False), 2)
+            self.assertTrue(mgr.load(2)["original"])
+            self.assertEqual(_mgr(out).best_score, 5.0)
+            self.assertEqual(mgr.load()["global_step"], 2)
+
+    def test_commit_failure_restores_old_directory(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            mgr.save(_state(2, original=True), 2, eval_metrics={METRIC: 5.0})
+            real_replace = os.replace
+
+            def fail_publish(src, dst):
+                if ".pending-" in src and not src.endswith(".previous") and dst == mgr.checkpoint_dir(2):
+                    raise OSError("publish failed")
+                return real_replace(src, dst)
+
+            with patch("specforge.training.checkpoint.os.replace", side_effect=fail_publish):
+                with self.assertRaisesRegex(RuntimeError, "publish failed"):
+                    mgr.save(_state(2, original=False), 2)
+            self.assertTrue(mgr.load(2)["original"])
+            self.assertEqual(_mgr(out).best_score, 5.0)
+
+    def test_overwriting_best_reselects_from_scored_checkpoints(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            mgr.save(_state(1), 1, eval_metrics={METRIC: 4.5})
+            mgr.save(_state(2), 2, eval_metrics={METRIC: 5.0})
+            mgr.save(_state(3), 3, eval_metrics={METRIC: 4.0})
+            mgr.save(_state(2), 2, eval_metrics={METRIC: 3.0})
+            self.assertEqual(mgr.best_step, 1)
+            self.assertEqual(mgr.best_score, 4.5)
+            self.assertEqual(_mgr(out).best_step, 1)
+            self.assertEqual(_steps(mgr), [1, 2, 3])
+
+    def test_overwriting_only_best_without_eval_clears_stale_score(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            mgr.save(_state(1), 1, eval_metrics={METRIC: 5.0})
+            mgr.save(_state(1), 1)
+            self.assertIsNone(mgr.best_step)
+            self.assertIsNone(_mgr(out).best_step)
+            self.assertFalse(os.path.lexists(os.path.join(out, "run-best")))
+            self.assertFalse(os.path.exists(os.path.join(out, "run.best_meta.json")))
+
+    def test_legacy_best_is_preserved_but_unscored_fallback_is_not_guessed(self):
+        with tempfile.TemporaryDirectory() as out:
+            from specforge.training.checkpoint import EVAL_META_FILE
+
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            mgr.save(_state(1), 1)
+            mgr.save(_state(2), 2)
+            for step in (1, 2):
+                os.remove(os.path.join(mgr.checkpoint_dir(step), EVAL_META_FILE))
+            with open(mgr._best_meta_path, "w") as fh:
+                json.dump({"run_id": "run", "step": 2, "score": 5.0, "metric": METRIC}, fh)
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            self.assertEqual(mgr.best_step, 2)
+            mgr.save(_state(3), 3)
+            self.assertEqual(mgr.best_step, 2)
+            mgr.save(_state(2), 2)
+            self.assertIsNone(mgr.best_step)
+
+    def test_stale_global_score_is_rejected_after_replacement(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out, overwrite_checkpoints=True)
+            mgr.save(_state(1), 1, eval_metrics={METRIC: 5.0})
+            with open(mgr._best_meta_path) as fh:
+                old_best = json.load(fh)
+            mgr.save(_state(1), 1)
+            # Simulate a crash between replacing weights and refreshing best.
+            with open(mgr._best_meta_path, "w") as fh:
+                json.dump(old_best, fh)
+            self.assertIsNone(_mgr(out).best_step)
 
 
 class TestRunScoping(unittest.TestCase):
     def test_two_run_ids_do_not_interact(self):
         out = tempfile.mkdtemp(prefix="ckpt_runs_")
-        a = _mgr(out, "alpha", max_checkpoints=2)
+        a = _mgr(out, "alpha", max_checkpoints=2, overwrite_checkpoints=True)
         b = _mgr(out, "beta")
         a.save(_state(1), 1)
         a.save(_state(2), 2)
@@ -156,7 +263,7 @@ class TestRunScoping(unittest.TestCase):
         self.assertIsNone(_mgr(out, "beta").best_step)
         self.assertEqual(_mgr(out, "alpha").best_step, 3)
 
-        a.save(_state(2), 2)  # alpha rewind must not touch beta's step 5
+        a.save(_state(2), 2)  # replacing alpha-step2 must not touch beta
         self.assertTrue(os.path.exists(b.checkpoint_dir(5)))
         self.assertEqual(_steps(b), [5])
 
@@ -176,8 +283,8 @@ class TestRunScoping(unittest.TestCase):
         self.assertEqual(
             os.path.realpath(mgr.latest_dir()), os.path.realpath(mgr.checkpoint_dir(1))
         )
-        mgr.save(_state(0), 0)  # rewind deletes run[ab]-step1, not the decoys
-        self.assertFalse(os.path.exists(mgr.checkpoint_dir(1)))
+        mgr.save(_state(0), 0)
+        self.assertTrue(os.path.exists(mgr.checkpoint_dir(1)))
         self.assertTrue(os.path.exists(os.path.join(out, "runa-step9")))
         self.assertTrue(os.path.exists(os.path.join(out, "runb-step7")))
 
@@ -229,6 +336,25 @@ class TestBestMeta(unittest.TestCase):
         self.assertEqual(mgr.best_step, 1)
         self.assertEqual(mgr.best_score, 5.0)
 
+    def test_rebuild_from_per_checkpoint_scores_without_global_meta(self):
+        from specforge.training.checkpoint import EVAL_META_FILE
+
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out)
+            mgr.save(_state(1), 1, eval_metrics={METRIC: 5.0})
+            mgr.save(_state(2), 2, eval_metrics={METRIC: 4.0})
+            self.assertTrue(os.path.isfile(os.path.join(mgr.checkpoint_dir(2), EVAL_META_FILE)))
+            os.remove(mgr._best_meta_path)
+            self.assertEqual(_mgr(out).best_step, 1)
+
+    def test_nonfinite_score_is_not_best(self):
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out)
+            for step, score in enumerate((float("nan"), float("inf"), -float("inf")), 1):
+                self.assertFalse(mgr.is_better({METRIC: score}))
+                mgr.save(_state(step), step, eval_metrics={METRIC: score})
+            self.assertIsNone(mgr.best_step)
+
 
 class TestBestApi(unittest.TestCase):
     def test_is_better_gates_and_min_delta(self):
@@ -264,6 +390,19 @@ class TestBestApi(unittest.TestCase):
 
 
 class TestReadResumeState(unittest.TestCase):
+    def test_root_resume_ignores_stale_lower_latest_pointer(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        with tempfile.TemporaryDirectory() as out:
+            mgr = _mgr(out)
+            mgr.save(_state(3), 3)
+            mgr.save(_state(5), 5)
+            mgr._point("run-latest", mgr.checkpoint_dir(3))
+            self.assertEqual(CheckpointManager.read_resume_state(out, require_full_state=False)["global_step"], 5)
+            self.assertEqual(
+                CheckpointManager.read_resume_state(mgr.checkpoint_dir(3), require_full_state=False)["global_step"], 3
+            )
+
     def test_replicated_optimizer_is_restored_from_shared_state(self):
         from specforge.training.checkpoint import CheckpointManager
 
@@ -371,7 +510,7 @@ def _dist_worker(rank, world, port, out_dir, results_dir):
     )
     from specforge.training.checkpoint import CheckpointManager
 
-    mgr = CheckpointManager(out_dir, "dist")
+    mgr = CheckpointManager(out_dir, "dist", overwrite_checkpoints=True)
     ckpt = mgr.save(
         {"global_step": 3, "world_size": world},
         3,
@@ -380,6 +519,29 @@ def _dist_worker(rank, world, port, out_dir, results_dir):
     verdict = mgr.is_better({METRIC: 2.0})  # collective: every rank must call
     if verdict:
         mgr.update_best(3, {METRIC: 2.0})
+    # A rank-local failure during overwrite must reach all ranks and leave the
+    # previous shared weights, shards, and best record untouched.
+    original_atomic_save = mgr._atomic_save
+
+    def fail_rank_save(obj, path):
+        if rank == 1:
+            raise OSError("rank1 disk full")
+        return original_atomic_save(obj, path)
+
+    failed = False
+    with patch.object(mgr, "_atomic_save", side_effect=fail_rank_save):
+        try:
+            mgr.save(
+                {"global_step": 3, "world_size": world, "replacement": True}, 3,
+                rank_state={"optimizer": {"rank": rank}, "rng": {"torch": [99]}},
+            )
+        except RuntimeError as exc:
+            failed = "rank1 disk full" in str(exc)
+    mgr.save(
+        {"global_step": 1, "world_size": world}, 1,
+        rank_state={"optimizer": {"rank": rank}, "rng": {"torch": [rank]}},
+        eval_metrics={METRIC: 3.0},
+    )
     st = CheckpointManager.read_resume_state(ckpt)
     with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as fh:
         json.dump(
@@ -391,6 +553,10 @@ def _dist_worker(rank, world, port, out_dir, results_dir):
                 "global_step": st["global_step"],
                 "verdict": bool(verdict),
                 "best_step": mgr.best_step,
+                "best_score": mgr.best_score,
+                "latest_step": mgr.load()["global_step"],
+                "overwrite_failed": failed,
+                "old_weights_preserved": not st.get("replacement", False),
             },
             fh,
         )
@@ -401,7 +567,7 @@ class TestDistributedSaveAndResume(unittest.TestCase):
     def test_two_rank_save_and_per_rank_resume(self):
         import torch.multiprocessing as mp
 
-        from specforge.training.checkpoint import STATE_FILE
+        from specforge.training.checkpoint import EVAL_META_FILE, STATE_FILE
 
         out = tempfile.mkdtemp(prefix="ckpt_dist_")
         results = tempfile.mkdtemp(prefix="ckpt_dist_res_")
@@ -415,7 +581,7 @@ class TestDistributedSaveAndResume(unittest.TestCase):
                 loaded.append(json.load(fh))
         self.assertEqual(loaded[0]["ckpt"], loaded[1]["ckpt"])
         expected = sorted(
-            [STATE_FILE, "training_state_rank0.pt", "training_state_rank1.pt"]
+            [STATE_FILE, EVAL_META_FILE, "training_state_rank0.pt", "training_state_rank1.pt"]
         )
         for r, res in enumerate(loaded):
             self.assertEqual(res["files"], expected)
@@ -423,7 +589,11 @@ class TestDistributedSaveAndResume(unittest.TestCase):
             self.assertEqual(res["backend_rng"], [r])
             self.assertEqual(res["global_step"], 3)
             self.assertTrue(res["verdict"])
-            self.assertEqual(res["best_step"], 3)
+            self.assertEqual(res["best_step"], 1)
+            self.assertEqual(res["best_score"], 3.0)
+            self.assertEqual(res["latest_step"], 3)
+            self.assertTrue(res["overwrite_failed"])
+            self.assertTrue(res["old_weights_preserved"])
 
 
 if __name__ == "__main__":
