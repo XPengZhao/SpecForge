@@ -143,18 +143,60 @@ def save_cdf(histograms, output_dir, threshold, log_x):
     plt.close(fig)
 
 
+def load_saved_lengths(output_dir):
+    """Rebuild histograms from saved counts without loading a tokenizer."""
+    histograms = {name: Counter() for name in SERIES}
+    with (output_dir / "lengths.csv").open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if not set(f"{name}_tokens" for name in SERIES).issubset(reader.fieldnames or []):
+            raise ValueError("lengths.csv is missing token-length columns")
+        for row_number, row in enumerate(reader, 2):
+            for name in SERIES:
+                length = int(row[f"{name}_tokens"])
+                if length < 0:
+                    raise ValueError(f"negative token length at CSV row {row_number}")
+                histograms[name][length] += 1
+    count = sum(histograms["total"].values())
+    if not count:
+        raise ValueError("lengths.csv has no records")
+    summary_path = output_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
+    expected = summary.get("counts", {}).get("records_analyzed")
+    if expected is not None and expected != count:
+        raise ValueError(f"lengths.csv has {count} records but summary.json records {expected}")
+    return histograms, summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--tokenizer", required=True, help="Local model/tokenizer directory or HF ID")
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--tokenizer", help="Local model/tokenizer directory or HF ID")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--threshold", type=int, default=4096)
+    parser.add_argument("--threshold", type=int, help="Length limit; defaults to 4096 or the saved threshold")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--limit", type=int, help="Stop after this many valid records for a smoke run")
     parser.add_argument("--log-x", action="store_true", help="Use a symlog token-length axis")
+    parser.add_argument("--plot-only", action="store_true", help="Plot existing lengths.csv without tokenizing again")
     args = parser.parse_args()
-    if args.batch_size < 1 or args.threshold < 1 or (args.limit is not None and args.limit < 1):
+    if args.batch_size < 1 or (args.threshold is not None and args.threshold < 1) or (args.limit is not None and args.limit < 1):
         parser.error("batch size, threshold and limit must be positive")
+    if not args.plot_only and (args.input is None or args.tokenizer is None):
+        parser.error("--input and --tokenizer are required unless --plot-only is used")
+    # Check before starting a potentially long tokenization run.
+    try:
+        import matplotlib  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise SystemExit("Missing plotting dependency. Run: python -m pip install matplotlib\n"
+                         "If statistics already exist, rerun with --plot-only.") from exc
+    if args.plot_only:
+        histograms, summary = load_saved_lengths(args.output_dir)
+        threshold = args.threshold if args.threshold is not None else summary.get("threshold", 4096)
+        save_cdf(histograms, args.output_dir, threshold, args.log_x)
+        print(f"Reused {sum(histograms['total'].values()):,} saved records; no tokenization performed.")
+        print(f"Saved CDF plots to {args.output_dir.resolve()}")
+        return
+    if args.threshold is None:
+        args.threshold = 4096
     if not args.input.is_file():
         parser.error(f"input file not found: {args.input}")
     from transformers import AutoTokenizer
