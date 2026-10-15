@@ -24,6 +24,7 @@ from typing import Callable, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.data.preparation_progress import preparation_stage
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -529,7 +530,8 @@ def _build_online(
     # The producer owns capture and explicit attempt cleanup. The consumer must
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
-    store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
+    with preparation_stage(f"{cfg.training.role}.connect_feature_store"):
+        store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
     from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
@@ -544,36 +546,50 @@ def _build_online(
         from specforge.training.model_loading import resolve_draft_config
 
         input_adapter = streaming.create_input_adapter(cfg)
-        input_tools = _load_input_tools(
-            cfg,
-            algorithm,
-            input_adapter=input_adapter,
-        )
-        draft_config = resolve_draft_config(
-            cfg,
-            provider=algorithm.providers.model.draft_config,
-        )
-        if input_adapter is None:
-            prompts = prepare_prompts(
+        with preparation_stage(
+            "producer.load_tokenizer_or_processor", model=cfg.model.target_model_path
+        ):
+            input_tools = _load_input_tools(
                 cfg,
-                input_tools,
-                draft_config=draft_config,
+                algorithm,
+                input_adapter=input_adapter,
             )
-        else:
-            prompts = input_adapter.prepare_prompts(
+        with preparation_stage("producer.resolve_draft_config"):
+            draft_config = resolve_draft_config(
                 cfg,
-                input_tools,
-                draft_config=draft_config,
+                provider=algorithm.providers.model.draft_config,
             )
+        with preparation_stage(
+            "producer.prepare_prompts",
+            path=cfg.data.prompts_path or cfg.data.train_data_path,
+            num_proc=cfg.data.build_dataset_num_proc,
+            prompt_build_num_proc=cfg.data.prompt_build_num_proc,
+            max_prompts=cfg.data.max_prompts,
+        ) as summary:
+            if input_adapter is None:
+                prompts = prepare_prompts(
+                    cfg,
+                    input_tools,
+                    draft_config=draft_config,
+                )
+            else:
+                prompts = input_adapter.prepare_prompts(
+                    cfg,
+                    input_tools,
+                    draft_config=draft_config,
+                )
+            summary["samples"] = len(prompts)
         if cfg.training.total_steps is None and cfg.training.max_steps is None:
             schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
             _write_control(
                 channel_path + _ONLINE_SCHEDULE_SUFFIX,
                 json.dumps(schedule, sort_keys=True),
             )
-        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
-            cfg, algorithm
-        )
+        with preparation_stage("producer.resolve_capture_metadata") as summary:
+            layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
+                cfg, algorithm
+            )
+            summary.update(layers=layers, hidden_size=hidden_size)
         layout = streaming.layout
         capture_schema = ServerCaptureSchema(
             aux_feature=layout.aux_feature,
@@ -611,40 +627,41 @@ def _build_online(
                 else cfg.runtime.in_flight_low_watermark
             )
         )
-        _workers, drive = build_disagg_online_producer(
-            algorithm=algorithm,
-            modality=modality,
-            prompts=prompts,
-            feature_store=store,
-            channel=channel,
-            feature_source=adapters if len(adapters) > 1 else adapters[0],
-            num_rollout_workers=len(adapters),
-            run_id=cfg.run_id,
-            target_hidden_size=hidden_size,
-            target_vocab_size=target_vocab,
-            draft_vocab_size=draft_vocab,
-            target_repr=target_repr,
-            aux_hidden_state_layer_ids=layers,
-            prompt_epochs=cfg.training.num_epochs,
-            prompt_seed=cfg.training.seed,
-            lease=cfg.runtime.producer_lease,
-            in_flight_high_watermark=in_flight_high_watermark,
-            in_flight_low_watermark=in_flight_low_watermark,
-            resident_high_watermark_bytes=(
-                int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
-                if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
-                else cfg.runtime.resident_high_watermark_bytes
-            ),
-            resident_low_watermark_bytes=(
-                int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
-                if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
-                else cfg.runtime.resident_low_watermark_bytes
-            ),
-            feature_store_max_resident_bytes=(
-                cfg.runtime.feature_store_max_resident_bytes
-            ),
-            peer_wait_timeout_s=peer_wait_timeout_s,
-        )
+        with preparation_stage("producer.build_capture_pipeline", samples=len(prompts)):
+            _workers, drive = build_disagg_online_producer(
+                algorithm=algorithm,
+                modality=modality,
+                prompts=prompts,
+                feature_store=store,
+                channel=channel,
+                feature_source=adapters if len(adapters) > 1 else adapters[0],
+                num_rollout_workers=len(adapters),
+                run_id=cfg.run_id,
+                target_hidden_size=hidden_size,
+                target_vocab_size=target_vocab,
+                draft_vocab_size=draft_vocab,
+                target_repr=target_repr,
+                aux_hidden_state_layer_ids=layers,
+                prompt_epochs=cfg.training.num_epochs,
+                prompt_seed=cfg.training.seed,
+                lease=cfg.runtime.producer_lease,
+                in_flight_high_watermark=in_flight_high_watermark,
+                in_flight_low_watermark=in_flight_low_watermark,
+                resident_high_watermark_bytes=(
+                    int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
+                    if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
+                    else cfg.runtime.resident_high_watermark_bytes
+                ),
+                resident_low_watermark_bytes=(
+                    int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
+                    if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
+                    else cfg.runtime.resident_low_watermark_bytes
+                ),
+                feature_store_max_resident_bytes=(
+                    cfg.runtime.feature_store_max_resident_bytes
+                ),
+                peer_wait_timeout_s=peer_wait_timeout_s,
+            )
 
         def produce() -> int:
             produced = 0

@@ -76,6 +76,25 @@ class TestContracts(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, r"<root>\[4096\]"):
             assert_no_tensors(payload)
 
+    def test_integer_sequence_guard_preserves_mixed_values_and_error_paths(self):
+        for container in (list, tuple):
+            with self.subTest(container=container.__name__):
+                assert_no_tensors(container([*range(4096), True, False]))
+                assert_no_tensors(container([*range(4096), None, "version", 0.5]))
+                payload = container([*range(4096), {"nested": torch.zeros(1)}])
+                with self.assertRaisesRegex(TypeError, r"<root>\[4096\]\['nested'\]"):
+                    assert_no_tensors(payload)
+
+    def test_custom_list_iterator_is_not_scanned_twice(self):
+        class SinglePassList(list):
+            def __iter__(self):
+                if getattr(self, "iterated", False):
+                    raise AssertionError("custom iterator was scanned twice")
+                self.iterated = True
+                return super().__iter__()
+
+        assert_no_tensors(SinglePassList(range(4096)))
+
     def test_assert_no_tensors_catches_tensor_in_metadata(self):
         ref = self._sample_ref()
         # smuggle a tensor into metadata -> must be caught

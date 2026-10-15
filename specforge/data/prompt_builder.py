@@ -14,6 +14,8 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from numbers import Integral
 from typing import Any
 
+from .preparation_progress import preparation_rows, preparation_stage
+
 PromptTaskDict = dict[str, Any]
 
 
@@ -28,6 +30,7 @@ def prepare_prompt_tasks(
     cache_dir: str | None,
     cache_key: str | None,
     num_proc: int | None,
+    prompt_build_num_proc: int = 1,
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
 ) -> list[PromptTaskDict]:
@@ -49,8 +52,16 @@ def prepare_prompt_tasks(
         cache_dir=cache_dir,
         cache_key=cache_key,
     )
+    if prompt_build_num_proc < 1:
+        raise ValueError("prompt_build_num_proc must be positive")
     path_string = os.fspath(path)
-    first_record = next(_iter_records(path_string), None)
+    with preparation_stage("inspect_input", path=path_string) as summary:
+        first_record = next(_iter_records(path_string), None)
+        summary["format"] = (
+            "empty"
+            if first_record is None
+            else "tokenized" if "input_ids" in first_record[1] else "raw"
+        )
     if first_record is None:
         return []
 
@@ -89,6 +100,7 @@ def prepare_prompt_tasks(
         num_proc=num_proc,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
+        prompt_build_num_proc=prompt_build_num_proc,
     )
 
 
@@ -105,19 +117,26 @@ def _prepare_raw_prompts(
     num_proc: int | None,
     min_loss_tokens: int,
     limit: int | None,
+    prompt_build_num_proc: int,
 ) -> list[PromptTaskDict]:
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - package dependency in production
-        raise ImportError(
-            "preparing raw conversation prompts requires the 'datasets' package"
-        ) from exc
+    with preparation_stage("load_preprocessing_dependencies"):
+        try:
+            from datasets import load_dataset
+        except (
+            ImportError
+        ) as exc:  # pragma: no cover - package dependency in production
+            raise ImportError(
+                "preparing raw conversation prompts requires the 'datasets' package"
+            ) from exc
+        from .preprocessing import build_eagle3_dataset
 
-    from .preprocessing import build_eagle3_dataset
-
-    dataset = load_dataset("json", data_files=path, split="train")
+    with preparation_stage("load_dataset", path=path) as summary:
+        dataset = load_dataset("json", data_files=path, split="train")
+        summary["samples"] = len(dataset)
     if limit is not None and limit < len(dataset):
-        dataset = dataset.select(range(limit))
+        with preparation_stage("select_subset", max_prompts=limit) as summary:
+            dataset = dataset.select(range(limit))
+            summary["samples"] = len(dataset)
 
     processed_dataset = build_eagle3_dataset(
         dataset=dataset,
@@ -131,6 +150,19 @@ def _prepare_raw_prompts(
         train_only_last_turn=train_only_last_turn,
         minimum_valid_tokens=min_loss_tokens,
     )
+    # Online tasks need Python lists, not the preprocessor's training tensors.
+    # Restrict columns before iteration to avoid formatting unused attention masks.
+    processed_dataset = processed_dataset.with_format(
+        "numpy", columns=["input_ids", "loss_mask"]
+    )
+    if prompt_build_num_proc > 1:
+        return _materialize_dataset_parallel(
+            processed_dataset,
+            workers=prompt_build_num_proc,
+            max_length=max_length,
+            min_loss_tokens=min_loss_tokens,
+            limit=limit,
+        )
     rows = (
         (record, f"processed dataset row {index}")
         for index, record in enumerate(processed_dataset)
@@ -140,6 +172,7 @@ def _prepare_raw_prompts(
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
         limit=limit,
+        total=len(processed_dataset),
     )
 
 
@@ -149,42 +182,72 @@ def _materialize_prompt_tasks(
     max_length: int,
     min_loss_tokens: int,
     limit: int | None,
+    total: int | None = None,
 ) -> list[PromptTaskDict]:
-    prompts: list[PromptTaskDict] = []
-    for record, source in rows:
-        if "input_ids" not in record or "loss_mask" not in record:
-            raise ValueError(f"{source} must contain both input_ids and loss_mask")
-
-        input_ids = _normalize_integer_sequence(
-            record["input_ids"], field="input_ids", source=source, binary=False
+    with preparation_stage(
+        "materialize_tasks", total=total, max_prompts=limit
+    ) as summary:
+        tasks = (
+            _prompt_result(record, source, max_length, min_loss_tokens)
+            for record, source in rows
         )
-        loss_mask = _normalize_integer_sequence(
-            record["loss_mask"], field="loss_mask", source=source, binary=True
-        )
-        if len(input_ids) != len(loss_mask):
-            raise ValueError(
-                f"{source} has mismatched input_ids/loss_mask lengths: "
-                f"{len(input_ids)} != {len(loss_mask)}"
-            )
-        if not input_ids:
-            raise ValueError(f"{source} contains an empty token sequence")
+        return _collect_prompt_tasks(tasks, total=total, limit=limit, summary=summary)
 
-        input_ids = input_ids[:max_length]
-        loss_mask = loss_mask[:max_length]
-        if sum(loss_mask) < min_loss_tokens:
-            continue
 
-        prompts.append(
-            {
-                "payload": {
-                    "input_ids": input_ids,
-                    "loss_mask": loss_mask,
-                }
-            }
-        )
-        if limit is not None and len(prompts) >= limit:
-            break
+def _collect_prompt_tasks(tasks, *, total, limit, summary):
+    """Apply the same ordered filtering, cap and progress to either producer."""
+    prompts = []
+    summary.update(scanned=0, accepted=0, skipped=0)
+    with preparation_rows(tasks, total=total) as progress:
+        for task in progress:
+            summary["scanned"] += 1
+            if isinstance(task, ValueError):
+                raise task
+            if task is None:
+                summary["skipped"] += 1
+                continue
+            prompts.append(task)
+            summary["accepted"] = len(prompts)
+            if limit is not None and len(prompts) >= limit:
+                break
     return prompts
+
+
+def _prompt_result(record, source, max_length, min_loss_tokens):
+    try:
+        return _prompt_task(
+            record, source, max_length=max_length, min_loss_tokens=min_loss_tokens
+        )
+    except ValueError as exc:
+        # Surface errors only when their row is consumed, preserving the cap
+        # even when parallel workers have already processed later rows.
+        return exc
+
+
+def _prompt_task(record, source, *, max_length, min_loss_tokens):
+    if "input_ids" not in record or "loss_mask" not in record:
+        raise ValueError(f"{source} must contain both input_ids and loss_mask")
+
+    input_ids = _normalize_integer_sequence(
+        record["input_ids"], field="input_ids", source=source, binary=False
+    )
+    loss_mask = _normalize_integer_sequence(
+        record["loss_mask"], field="loss_mask", source=source, binary=True
+    )
+    if len(input_ids) != len(loss_mask):
+        raise ValueError(
+            f"{source} has mismatched input_ids/loss_mask lengths: "
+            f"{len(input_ids)} != {len(loss_mask)}"
+        )
+    if not input_ids:
+        raise ValueError(f"{source} contains an empty token sequence")
+
+    input_ids = input_ids[:max_length]
+    loss_mask = loss_mask[:max_length]
+    if sum(loss_mask) < min_loss_tokens:
+        return None
+
+    return {"payload": {"input_ids": input_ids, "loss_mask": loss_mask}}
 
 
 def _normalize_integer_sequence(
@@ -300,6 +363,84 @@ def _validate_options(
         )
     if (cache_dir is None) != (cache_key is None):
         raise ValueError("cache_dir and cache_key must be provided together")
+
+
+# Each spawned worker opens its own view of the Arrow-backed dataset. Only
+# bounded batches of tasks cross IPC; the parent never sends token lists.
+_TASK_DATASET = None
+
+
+def _init_task_worker(dataset):
+    global _TASK_DATASET
+    _TASK_DATASET = dataset
+
+
+def _build_task_batch(bounds, max_length, min_loss_tokens):
+    start, stop = bounds
+    batch = _TASK_DATASET[start:stop]
+    return [
+        _prompt_result(
+            {key: values[offset] for key, values in batch.items()},
+            f"processed dataset row {start + offset}",
+            max_length,
+            min_loss_tokens,
+        )
+        for offset in range(stop - start)
+    ]
+
+
+def _materialize_dataset_parallel(
+    dataset, *, workers, max_length, min_loss_tokens, limit
+):
+    from collections import deque
+    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import get_context
+
+    total = len(dataset)
+    if not total:
+        return []
+    batch_size = 64
+    workers = min(workers, (total + batch_size - 1) // batch_size)
+    with preparation_stage(
+        "materialize_tasks", total=total, workers=workers
+    ) as summary:
+        # Spawn avoids inheriting tokenizer threads or an initialized CUDA runtime.
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=get_context("spawn"),
+            initializer=_init_task_worker,
+            initargs=(dataset,),
+        ) as pool:
+            bounds = iter(
+                (i, min(i + batch_size, total)) for i in range(0, total, batch_size)
+            )
+            pending = deque()
+
+            def submit_next():
+                bound = next(bounds, None)
+                if bound is not None:
+                    pending.append(
+                        pool.submit(
+                            _build_task_batch, bound, max_length, min_loss_tokens
+                        )
+                    )
+
+            for _ in range(2 * workers):
+                submit_next()
+
+            def ordered_tasks():
+                while pending:
+                    batch = pending.popleft().result()
+                    yield from batch
+                    submit_next()
+
+            try:
+                return _collect_prompt_tasks(
+                    ordered_tasks(), total=total, limit=limit, summary=summary
+                )
+            finally:
+                for future in pending:
+                    future.cancel()
 
 
 __all__ = ["PromptTaskDict", "prepare_prompt_tasks"]

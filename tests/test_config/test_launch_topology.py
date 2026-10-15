@@ -38,6 +38,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-4b-dflash-online.yaml": 8,
     "qwen3-4b-dspark-disaggregated.yaml": 1,
     "qwen3-4b-eagle3-online.yaml": 1,
+    "qwen3-4b-dspark-1server-dp7-disaggregated.yaml": 7,
     "qwen3-8b-dflash-disaggregated.yaml": 4,
     "qwen3-8b-dflash-1server-dp7-disaggregated.yaml": 7,
     "qwen3-8b-dflash-online.yaml": 8,
@@ -76,6 +77,27 @@ LOCAL_MOONCAKE_ENDPOINTS = {
 }
 
 EXPECTED_DISAGGREGATED = {
+    "qwen3-4b-dspark-1server-dp7-disaggregated.yaml": {
+        "control_dir": "outputs/qwen3-4b-dspark-1server-dp7/control",
+        "consumer_state_dir": "outputs/qwen3-4b-dspark-1server-dp7/consumer-state",
+        "backend": "mooncake",
+        "managed_local": {
+            "trainer_cuda_visible_devices": ["1", "2", "3", "4", "5", "6", "7"],
+            "mooncake": {
+                "protocol": "tcp",
+                "global_segment_size_bytes": 34359738368,
+                "local_buffer_size_bytes": 1073741824,
+            },
+            "capture_servers": [
+                {
+                    "port": 30000,
+                    "cuda_visible_devices": ["0"],
+                    "tp_size": 1,
+                    "mem_fraction_static": 0.5,
+                }
+            ],
+        },
+    },
     "qwen2.5-7b-eagle3-offline-disaggregated.yaml": {
         "control_dir": ("outputs/qwen2.5-7b-eagle3-offline-disaggregated/control"),
         "backend": "shared_dir",
@@ -267,7 +289,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 56)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 57)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():

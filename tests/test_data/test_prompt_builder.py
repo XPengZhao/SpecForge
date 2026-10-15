@@ -19,6 +19,9 @@ class _FakeDataset:
     def __len__(self):
         return len(self.rows)
 
+    def with_format(self, *args, **kwargs):
+        return self
+
     def select(self, indices):
         return _FakeDataset(self.rows[index] for index in indices)
 

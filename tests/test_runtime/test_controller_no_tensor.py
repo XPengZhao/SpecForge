@@ -94,6 +94,33 @@ class TestControllerCarriesNoTensor(unittest.TestCase):
         self.assertEqual(task_ids, expected)
         self.assertEqual([task.task_id for task in tasks], expected)
 
+    def test_long_token_prompts_preserve_payloads_and_lease_order(self):
+        ctrl = DataFlowController("run1")
+        prompts = [
+            {
+                "task_id": f"epoch0000-prompt{index:012d}",
+                "payload": {
+                    "input_ids": list(range(index, index + 4096)),
+                    "loss_mask": [0] * 2048 + [1] * 2048,
+                },
+                "metadata": {"epoch": 0, "prompt_index": index},
+            }
+            for index in (7, 2, 9, 1)
+        ]
+        ids = ctrl.ingest_prompts(prompts)
+        tasks = ctrl.lease_prompt_tasks("w0", 2) + ctrl.lease_prompt_tasks("w0", 8)
+        self.assertEqual(ids, [p["task_id"] for p in prompts])
+        self.assertEqual([task.task_id for task in tasks], ids)
+        self.assertEqual(
+            [task.payload for task in tasks], [p["payload"] for p in prompts]
+        )
+        self.assertEqual(
+            [task.metadata for task in tasks], [p["metadata"] for p in prompts]
+        )
+        self.assertTrue(
+            all(task.payload is p["payload"] for task, p in zip(tasks, prompts))
+        )
+
     def test_commit_samples_idempotent(self):
         ctrl = DataFlowController("run1")
         ref = _ref(0)

@@ -38,7 +38,8 @@ training, `*-offline.yaml` consumes precomputed features, and
 recipe is disaggregated even when its historical filename only says `online`.
 VLM training is not supported, so the catalog contains text-only recipes.
 
-The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
+The `qwen3-4b-dspark-1server-dp7-disaggregated.yaml`,
+`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-multiserver-disaggregated.yaml`,
 `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`, and
@@ -48,6 +49,11 @@ two patched SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up each complete stack.
 Disaggregated recipes without `managed_local` keep Mooncake and SGLang external
 for scheduler- or service-managed deployments.
+
+For eight 96 GB GPUs, start with the
+[Qwen3-4B DSpark walkthrough](../../docs/examples/qwen3-4b-dspark-online.md).
+It includes direct conversation-JSONL input, a short smoke run, and
+host-memory sizing for a bounded online feature window.
 
 Before running a recipe, update model/data paths and create any referenced
 offline feature or vocabulary-mapping artifacts. Managed-local recipes

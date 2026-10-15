@@ -156,11 +156,17 @@ class FeatureStore(abc.ABC):
         return {"force_freed": 0, "force_freed_bytes": 0, "release_pending": 0}
 
 
+# Mooncake's default KV read lease is 10 seconds. Leave headroom for a final
+# fetch/probe before shutdown; retry counts remain overridable by callers.
+DEFAULT_REMOVAL_DRAIN_ATTEMPTS = 121
+DEFAULT_REMOVAL_DRAIN_INTERVAL_S = 0.25
+
+
 def drain_feature_store_removals(
     store: FeatureStore,
     *,
-    max_attempts: int = 8,
-    retry_interval_s: float = 0.25,
+    max_attempts: int = DEFAULT_REMOVAL_DRAIN_ATTEMPTS,
+    retry_interval_s: float = DEFAULT_REMOVAL_DRAIN_INTERVAL_S,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, int]:
     """Bound lifecycle shutdown until deferred physical removes settle.
@@ -169,8 +175,9 @@ def drain_feature_store_removals(
     may expose ``drain_pending_removals`` to retry fallible RPCs.  Keeping this
     small adapter at the FeatureStore boundary lets online producer/consumer
     finalization enforce the same loud contract without depending on Mooncake's
-    concrete class. The default is bounded to eight attempts and 1.75 seconds of
-    inter-attempt waiting; Mooncake's implementation avoids existence probes
+    concrete class. The default allows 30 seconds of inter-attempt waiting
+    (plus RPC time), covering Mooncake's default 10-second read lease.
+    Mooncake's implementation avoids existence probes
     between attempts so those waits let an existing read lease expire rather
     than renewing it.
     """

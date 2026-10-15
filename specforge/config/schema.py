@@ -125,6 +125,8 @@ class DataConfig(StrictConfigModel):
     is_preformatted: bool = False
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
+    #: Processes constructing online tasks from the tokenized Arrow dataset.
+    prompt_build_num_proc: int = Field(default=1, gt=0)
     #: Ordered background feature-loader workers. ``None`` preserves the
     #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)

@@ -411,6 +411,7 @@ def _prepare_prompts(
         cache_dir=cfg.data.cache_dir,
         cache_key=cache_key,
         num_proc=cfg.data.build_dataset_num_proc,
+        prompt_build_num_proc=cfg.data.prompt_build_num_proc,
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
     )

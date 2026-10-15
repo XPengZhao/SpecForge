@@ -338,6 +338,80 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["force_freed_total"], 0)
         self.assertTrue(_phys_resident(fake))
 
+    def test_default_lifecycle_drain_covers_ten_second_mooncake_read_lease(self):
+        clock = _FakeClock()
+
+        class LeaseFake(_FakeMooncakeStore):
+            def __init__(self):
+                super().__init__()
+                self.lease_until = {}
+                self.exists_calls = 0
+
+            def is_exist(self, key):
+                self.exists_calls += 1
+                self.lease_until[key] = clock() + 10.0
+                return super().is_exist(key)
+
+            def get_into(self, key, ptr, size):
+                self.lease_until[key] = clock() + 10.0
+                return super().get_into(key, ptr, size)
+
+            def remove(self, key):
+                if clock() < self.lease_until.get(key, 0.0):
+                    return -706
+                return super().remove(key)
+
+        fake = LeaseFake()
+        producer = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumers = [
+            MooncakeFeatureStore(store=fake, store_id="run0") for _ in range(4)
+        ]
+        for rank, consumer in enumerate(consumers):
+            ref = producer.put(_tensors(), sample_id=f"rank{rank}", metadata=_meta())
+            _, handle = consumer.get(ref)
+            consumer.release(handle)
+        # Reproduce the smoke-run failure with the former 1.75-second budget.
+        with self.assertRaisesRegex(RuntimeError, "after 8 attempts"):
+            drain_feature_store_removals(
+                consumers[0],
+                max_attempts=8,
+                retry_interval_s=0.25,
+                sleep=clock.advance,
+            )
+        probes = fake.exists_calls
+        for consumer in consumers:
+            report = drain_feature_store_removals(consumer, sleep=clock.advance)
+            self.assertEqual(report["release_pending"], 0)
+        self.assertGreaterEqual(clock(), 10.0)
+        self.assertEqual(fake.exists_calls, probes)
+        self.assertFalse(fake._d)
+
+    def test_drain_error_includes_remote_remove_status(self):
+        class FailingFake(_FakeMooncakeStore):
+            def remove(self, key):
+                return -706
+
+        fs = MooncakeFeatureStore(store=FailingFake(), store_id="run0")
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fs.abort("s0")
+        with self.assertRaisesRegex(RuntimeError, "status -706"):
+            fs.drain_pending_removals(max_attempts=2, retry_interval_s=0)
+        self.assertEqual(fs.health()["release_pending"], 1)
+
+    def test_failed_existence_probe_does_not_confirm_remote_removal(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        fake.fail_remove = True
+        fake.is_exist = lambda key: -1
+        # An RPC error is not evidence that a hard-pinned feature is absent.
+        with self.assertRaisesRegex(RuntimeError, "is_exist.*status -1"):
+            fs.abort("s0")
+        with self.assertRaisesRegex(RuntimeError, "is_exist.*status -1"):
+            fs.drain_pending_removals(max_attempts=2, retry_interval_s=0)
+        self.assertEqual(fs.health()["release_pending"], 1)
+        self.assertEqual(fs.health()["resident_samples"], 1)
+
     def test_restart_authority_adopts_acked_remote_ref_before_removing(self):
         fake = _FakeMooncakeStore()
         producer = MooncakeFeatureStore(store=fake, store_id="run0")

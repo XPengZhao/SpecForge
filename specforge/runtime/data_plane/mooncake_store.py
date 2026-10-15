@@ -63,7 +63,12 @@ import torch
 
 from specforge.runtime.contracts import SCHEMA_VERSION, FeatureHandle, SampleRef
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
-from specforge.runtime.data_plane.feature_store import FeatureStore, spec_from_tensor
+from specforge.runtime.data_plane.feature_store import (
+    DEFAULT_REMOVAL_DRAIN_ATTEMPTS,
+    DEFAULT_REMOVAL_DRAIN_INTERVAL_S,
+    FeatureStore,
+    spec_from_tensor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +241,7 @@ class MooncakeFeatureStore(FeatureStore):
         # Samples whose remote remove() failed. gc() performs bounded
         # steady-state retries; lifecycle drain either removes them or raises.
         self._release_pending: Dict[str, int] = {}
+        self._remove_errors: Dict[str, str] = {}
         # (sample_id, generation) logically freed in THIS process. Mooncake's
         # remove() is lease-deferred (an object keeps a short read-lease), so the
         # bytes can linger after release/abort; this makes the B5 "no
@@ -258,7 +264,10 @@ class MooncakeFeatureStore(FeatureStore):
 
     # -- store wrappers (status-code aware) --------------------------------
     def _store_exists(self, key: str) -> bool:
-        return int(self._store.is_exist(key)) == 1
+        rc = int(self._store.is_exist(key))
+        if rc not in (0, 1):
+            raise RuntimeError(f"mooncake is_exist failed (status {rc}) for {key}")
+        return rc == 1
 
     def _store_put_tensor(self, key: str, t: torch.Tensor) -> None:
         """Zero-copy publish: DMA straight from the tensor's storage, hard-pinned.
@@ -318,9 +327,14 @@ class MooncakeFeatureStore(FeatureStore):
         """Best-effort physical free. Returns True on confirmed removal."""
         try:
             rc = self._store.remove(key)
-        except Exception:  # pragma: no cover - transient RPC failure
+        except Exception as exc:  # transient RPC failure
+            self._remove_errors[key] = f"{type(exc).__name__}: {exc}"
             return False
-        return rc is None or int(rc) == 0
+        if rc is None or int(rc) == 0:
+            self._remove_errors.pop(key, None)
+            return True
+        self._remove_errors[key] = f"remove failed (status {rc})"
+        return False
 
     # -- write -------------------------------------------------------------
     def put(
@@ -583,14 +597,26 @@ class MooncakeFeatureStore(FeatureStore):
             key = self._tkey(sample_id, gen, name)
             if self._store_remove(key):
                 continue
-            if confirm_absent_on_failure and not self._store_exists(key):
-                continue  # already gone (freed remotely) counts as freed
+            if confirm_absent_on_failure:
+                try:
+                    if not self._store_exists(key):
+                        self._remove_errors.pop(key, None)
+                        continue  # already gone (freed remotely) counts as freed
+                except Exception as exc:
+                    # A failed probe cannot certify deletion of a hard-pinned
+                    # feature. Keep it pending even if the caller propagates
+                    # the probe failure, and include both RPC failures.
+                    self._remove_errors[key] += f"; {type(exc).__name__}: {exc}"
+                    self._release_pending.setdefault(sample_id, 0)
+                    raise
             ok = False
         return ok
 
     def _free_bookkeeping_locked(self, sample_id: str) -> int:
         """Drop in-process tracking for a sample. Returns bytes accounted freed."""
         generation = self._generation.get(sample_id)
+        for name in self._sample_names.get(sample_id, []):
+            self._remove_errors.pop(self._tkey(sample_id, generation, name), None)
         nbytes = self._sample_bytes.pop(sample_id, 0)
         self._generation.pop(sample_id, None)
         self._put_time.pop(sample_id, None)
@@ -639,8 +665,8 @@ class MooncakeFeatureStore(FeatureStore):
     def drain_pending_removals(
         self,
         *,
-        max_attempts: int = 8,
-        retry_interval_s: float = 0.25,
+        max_attempts: int = DEFAULT_REMOVAL_DRAIN_ATTEMPTS,
+        retry_interval_s: float = DEFAULT_REMOVAL_DRAIN_INTERVAL_S,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:
         """Retry deferred removes at lifecycle shutdown or fail loudly.
@@ -704,11 +730,28 @@ class MooncakeFeatureStore(FeatureStore):
                     "release_pending": 0,
                     "attempts": attempts_run,
                 }
+            if attempt == 0:
+                logger.info(
+                    "MooncakeFeatureStore %s waiting for %d pending removal(s); "
+                    "read leases may still be active (retry wait budget %.2fs)",
+                    self.store_id,
+                    len(remaining),
+                    (max_attempts - 1) * retry_interval_s,
+                )
             if attempt + 1 < max_attempts and retry_interval_s:
                 sleep(retry_interval_s)
 
         with self._lock:
             remaining = list(self._release_pending)
+            for sample_id in remaining[:16]:
+                gen = self._generation.get(sample_id)
+                errors = {
+                    name: self._remove_errors[key]
+                    for name in self._sample_names.get(sample_id, [])
+                    if (key := self._tkey(sample_id, gen, name)) in self._remove_errors
+                }
+                if errors:
+                    last_errors[sample_id] = str(errors)
         preview = remaining[:16]
         detail = f"; last errors={last_errors}" if last_errors else ""
         raise RuntimeError(

@@ -182,6 +182,13 @@ def assert_no_tensors(obj: Any, *, _path: str = "<root>") -> None:
             assert_no_tensors(v, _path=f"{_path}[{k!r}]")
         return
     if isinstance(obj, (list, tuple, set, frozenset)):
+        # Online token IDs and loss masks are integer lists. Run their complete
+        # type check through C-level iterators instead of a Python loop per
+        # token. Restrict this path to built-in containers so custom iterators
+        # retain their original single-pass behavior. Mixed lists still receive
+        # the recursive checks below, including precise tensor error paths.
+        if type(obj) in (list, tuple) and all(map(int.__instancecheck__, obj)):
+            return
         # Token-id and mask sequences dominate prompt payloads. Avoid a Python
         # call and path formatting for every primitive element while preserving
         # recursive checks for nested containers and tensor-like values.

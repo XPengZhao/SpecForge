@@ -37,6 +37,7 @@ from transformers import PreTrainedTokenizer
 
 from ..distributed import get_draft_sp_group, get_sp_ring_group
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
+from .preparation_progress import preparation_stage
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -228,7 +229,8 @@ def build_eagle3_dataset(
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
-    dataset = dataset.shuffle(seed=shuffle_seed)
+    with preparation_stage("shuffle_dataset", samples=len(dataset), seed=shuffle_seed):
+        dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
     def preprocess_function(examples):
@@ -298,7 +300,7 @@ def build_eagle3_dataset(
         load_from_cache_file = True
         os.makedirs(cache_dir, exist_ok=True)
         cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
-        print(f"dataset is cached at {cache_file_name}")
+        print(f"dataset cache path: {cache_file_name}", flush=True)
     elif cache_dir is None and cache_key is None:
         load_from_cache_file = False
         cache_file_name = None
@@ -313,16 +315,26 @@ def build_eagle3_dataset(
     if num_proc is not None and num_proc > 1:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    dataset = dataset.map(
-        preprocess_function,
-        batched=True,
+    with preparation_stage(
+        "tokenize_or_load_cache",
+        samples=len(dataset),
         num_proc=num_proc,
-        batch_size=1000,
-        remove_columns=original_cols,
-        # keep_in_memory=True,
+        max_length=max_length,
+        cache_file=cache_file_name,
         load_from_cache_file=load_from_cache_file,
-        cache_file_name=cache_file_name,
-    )
+    ) as summary:
+        dataset = dataset.map(
+            preprocess_function,
+            desc="Tokenizing conversations",
+            batched=True,
+            num_proc=num_proc,
+            batch_size=1000,
+            remove_columns=original_cols,
+            # keep_in_memory=True,
+            load_from_cache_file=load_from_cache_file,
+            cache_file_name=cache_file_name,
+        )
+        summary["samples"] = len(dataset)
 
     if minimum_valid_tokens is not None:
         before_filter = len(dataset)
@@ -339,11 +351,19 @@ def build_eagle3_dataset(
                 )
             return valid_tokens >= minimum_valid_tokens
 
-        dataset = dataset.filter(
-            has_minimum_valid_tokens,
+        with preparation_stage(
+            "filter_samples",
+            samples=before_filter,
             num_proc=num_proc,
-            desc=f"Filtering samples with >= {minimum_valid_tokens} trainable tokens",
-        )
+            minimum_valid_tokens=minimum_valid_tokens,
+        ) as summary:
+            dataset = dataset.filter(
+                has_minimum_valid_tokens,
+                num_proc=num_proc,
+                desc=f"Filtering samples with >= {minimum_valid_tokens} trainable tokens",
+            )
+            summary["kept"] = len(dataset)
+            summary["dropped"] = before_filter - len(dataset)
         print(
             f"Filtered dataset by trainable tokens: {before_filter} -> {len(dataset)}"
         )

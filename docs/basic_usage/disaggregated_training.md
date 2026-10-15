@@ -377,6 +377,15 @@ optimizer boundary, `DPAckController` commits sample ids and the durable marker,
 removes their feature objects, then advances the channel counters. A crash
 before the transaction replays refs; a crash after it skips them.
 
+Mooncake may defer physical deletion while a read lease is active (the upstream
+default lease is 10 seconds). At shutdown, each rank retries pending removals
+with up to 30 seconds of inter-attempt waiting, plus RPC time. Training can reach
+its final step and save a checkpoint before that drain finishes. Cleanup retries
+avoid existence probes until the final attempt because probing a live object
+can renew its lease. Persistent deletion failures still fail the run and retain
+sample/key bookkeeping; the error includes the last remote removal status or
+exception. A failed existence query is never treated as proof of deletion.
+
 ## Offline shared-directory and Mooncake stores
 
 The checked-in offline recipe uses a shared directory:
