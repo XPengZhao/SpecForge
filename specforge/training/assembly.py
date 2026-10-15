@@ -317,7 +317,9 @@ def _configured_logger(cfg: Config):
 
     from types import SimpleNamespace
 
-    from specforge.training.tracking import create_tracker_logger
+    from functools import partial
+
+    from specforge.training.tracking import create_tracker_logger, dspark_tensorboard_metrics
 
     options = cfg.tracking.model_dump()
     options["wandb_project"] = options["wandb_project"] or "specforge"
@@ -326,8 +328,16 @@ def _configured_logger(cfg: Config):
     options["swanlab_name"] = options["swanlab_name"] or cfg.run_id
     options["mlflow_experiment_name"] = options["mlflow_experiment_name"] or "specforge"
     options["mlflow_run_name"] = options["mlflow_run_name"] or cfg.run_id
+    metric_filter = None
+    if cfg.training.strategy == "dspark" and cfg.tracking.report_to == "tensorboard":
+        metric_filter = partial(
+            dspark_tensorboard_metrics,
+            loss_mode=cfg.training.dspark_loss_mode,
+            diagnostics=cfg.tracking.dspark_diagnostics,
+        )
     return create_tracker_logger(
-        SimpleNamespace(**options), cfg.output_dir, console_logger=_logger
+        SimpleNamespace(**options), cfg.output_dir, console_logger=_logger,
+        metric_filter=metric_filter,
     )
 
 

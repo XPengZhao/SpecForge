@@ -51,6 +51,32 @@ class _Tracker:
 
 
 class TrackingLoggerTest(unittest.TestCase):
+    def test_configured_logger_limits_filter_to_dspark_tensorboard(self):
+        from specforge.config import Config
+        from specforge.training.assembly import _configured_logger
+
+        cfg = Config.model_validate({
+            "model": {"target_model_path": "target", "draft_model_config": "draft.json"},
+            "data": {"hidden_states_path": "/cache"},
+            "training": {"strategy": "dspark", "dspark_loss_mode": "kl"},
+            "tracking": {"report_to": "tensorboard"},
+        })
+        with mock.patch("specforge.training.tracking.create_tracker_logger") as create:
+            _configured_logger(cfg)
+            select = create.call_args.kwargs["metric_filter"]
+            values = {"train/kl_loss": 0.4, "train/ce_loss": 0.0}
+            self.assertEqual(select(values), {"train/kl_loss": 0.4})
+            cfg.tracking.dspark_diagnostics = True
+            _configured_logger(cfg)
+            self.assertEqual(create.call_args.kwargs["metric_filter"](values), values)
+            cfg.tracking.report_to = "wandb"
+            _configured_logger(cfg)
+            self.assertIsNone(create.call_args.kwargs["metric_filter"])
+            cfg.tracking.report_to = "tensorboard"
+            cfg.training.strategy = "dflash"
+            _configured_logger(cfg)
+            self.assertIsNone(create.call_args.kwargs["metric_filter"])
+
     @staticmethod
     def _trainer(*, fit_error=None):
         trainer = Trainer.__new__(Trainer)

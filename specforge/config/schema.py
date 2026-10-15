@@ -156,6 +156,7 @@ class TrackingConfig(StrictConfigModel):
     """Optional experiment tracking behind the trainer's logger seam."""
 
     report_to: Literal["none", "wandb", "tensorboard", "swanlab", "mlflow"] = "none"
+    dspark_diagnostics: bool = False
     wandb_project: Optional[str] = None
     wandb_name: Optional[str] = None
     wandb_key: Optional[str] = None

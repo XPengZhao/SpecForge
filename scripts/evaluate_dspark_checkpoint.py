@@ -30,13 +30,19 @@ def checkpoint_step(checkpoint: str, explicit_step: int | None = None) -> int:
     return int(match.group(1))
 
 
-def write_tensorboard(metrics: dict, log_dir: str, step: int) -> None:
+def write_tensorboard(
+    metrics: dict, log_dir: str, step: int, *,
+    loss_mode: str = "original", diagnostics: bool = False,
+) -> None:
     from torch.utils.tensorboard import SummaryWriter
 
-    from specforge.training.tracking import scalar_metrics
+    from specforge.training.tracking import dspark_tensorboard_metrics, scalar_metrics
 
+    values = dspark_tensorboard_metrics(
+        scalar_metrics(metrics), loss_mode=loss_mode, diagnostics=diagnostics
+    )
     with SummaryWriter(log_dir=log_dir) as writer:
-        for name, value in scalar_metrics(metrics).items():
+        for name, value in values.items():
             writer.add_scalar(name, value, global_step=step)
         writer.flush()
 
@@ -152,7 +158,11 @@ def main(argv=None) -> int:
                 json.dump(report, handle, indent=2, ensure_ascii=False, allow_nan=False)
                 handle.write("\n")
             if args.tensorboard_dir:
-                write_tensorboard(metrics, args.tensorboard_dir, step)
+                write_tensorboard(
+                    metrics, args.tensorboard_dir, step,
+                    loss_mode=cfg.training.dspark_loss_mode,
+                    diagnostics=cfg.tracking.dspark_diagnostics,
+                )
                 print(
                     f"TensorBoard saved to {args.tensorboard_dir}, step={step}",
                     flush=True,

@@ -982,7 +982,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         l1_loss_sum = loss_weight_mask.new_zeros(())
         kl_loss_sum = loss_weight_mask.new_zeros(())
         confidence_loss_sum = loss_weight_mask.new_zeros(())
-        confidence_abs_error_sum = loss_weight_mask.new_zeros(())
+        confidence_mae_sum = loss_weight_mask.new_zeros(())
         metric_sums = {}
         metric_denoms = {}
         accept_rates = []
@@ -1086,7 +1086,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 ).sum()
                 with torch.no_grad():
                     accept_p = (1.0 - 0.5 * l1_p).clamp(0.0, 1.0)
-                    confidence_abs_error_sum = confidence_abs_error_sum + (
+                    confidence_mae_sum = confidence_mae_sum + (
                         (cconf_p.float().sigmoid() - accept_p).abs() * wmask_p
                     ).sum()
 
@@ -1133,8 +1133,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if use_confidence_loss:
             metric_sums["confidence_loss"] = confidence_loss_sum.detach()
             metric_denoms["confidence_loss"] = ce_loss_den.detach()
-            metric_sums["confidence_abs_error"] = confidence_abs_error_sum.detach()
-            metric_denoms["confidence_abs_error"] = ce_loss_den.detach()
+            metric_sums["confidence_mae"] = confidence_mae_sum.detach()
+            metric_denoms["confidence_mae"] = ce_loss_den.detach()
         objective_weights = (
             {"ce_loss": self.dspark_ce_loss_alpha, "l1_loss": self.dspark_l1_loss_alpha}
             if self.dspark_loss_mode == "original"

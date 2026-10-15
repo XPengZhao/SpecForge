@@ -366,6 +366,52 @@ TensorBoard writes beneath `output_dir/runs`, and SwanLab writes beneath
 `output_dir/swanlog`. Trainer and evaluator metrics use `train/*` and `eval/*`
 names consistently.
 
+DSpark TensorBoard runs use a compact metric set by default. Training records
+`loss_weighted`, the objective's loss components (`ce_loss` and `l1_loss` for
+`original`, or `kl_loss` for `kl`), `confidence_loss` and `confidence_mae` when
+enabled, `acc`,
+`tau_probabilistic`, `grad_norm`, `lr`, `log_interval_sec`, and all per-position
+losses. Evaluation records
+`avg_loss`, the same objective components, `confidence_loss` and `confidence_mae` when enabled,
+`tau_probabilistic`, `simulated_acc_len`, and per-position `accept_rate@k` and
+`mtp_i_accuracy`, plus all per-position losses for the active objective.
+`confidence_mae` is the weighted mean absolute error between
+predicted confidence and distribution overlap; lower is better.
+
+Per-position losses are separate scalar charts grouped under
+`train/position_loss` and `eval/position_loss`, with tags such as
+`train/position_loss/01_ce` through `train/position_loss/07_ce` for a seven-position
+`original` run. In `kl` mode the suffix is `_kl`. Position numbers are zero-padded
+to sort numerically. Training and evaluation both show CE in `original` mode or
+KL in `kl` mode; these are not the full weighted objective. Each experiment
+remains one run. TensorBoard groups slash-separated tags; depending on the
+dashboard, select the tag grouping depth to expose the `position_loss` group.
+Chart arrangement and axis ranges are UI settings, not event-file metadata;
+these scalar tags do not enforce a shared vertical scale.
+
+To include additional historical metrics, including other per-position components, aliases,
+derived metrics, and logging-window counters, set:
+
+```yaml
+tracking:
+  report_to: tensorboard
+  dspark_diagnostics: true
+```
+
+Position-loss tags use the same grouped names with diagnostics enabled.
+
+This selection also applies to `scripts/evaluate_dspark_checkpoint.py` when
+writing TensorBoard events; use `tracking.dspark_diagnostics=true` as a dotted
+config override there. Full evaluation JSON, console output, internal metric
+aggregation, and best-checkpoint selection remain unchanged. Other algorithms
+and tracking backends are unaffected. Existing event files retain their old
+tags; use a fresh log directory to see only the compact set.
+
+`loss_weighted` aggregates component statistics over all ranks and the logging
+window; the diagnostic `loss` instead averages rank 0's local micro-batch losses.
+`tau_probabilistic` is a distribution-overlap proxy, not measured decoding
+acceptance length. Filtering events does not skip metric computation.
+
 ## CUDA, ROCm, and Ascend NPU
 
 CUDA and ROCm runs use the same YAML and entry point. For ROCm, install the

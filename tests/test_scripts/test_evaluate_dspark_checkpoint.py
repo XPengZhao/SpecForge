@@ -96,7 +96,8 @@ def test_tensorboard_events_keep_eval_tags_and_checkpoint_steps(tmp_path):
 
     log_dir = str(tmp_path / "events")
     write_tensorboard(
-        {"eval/tau_probabilistic": 4.5, "eval/per_position_acc": [0.8, 0.6]},
+        {"eval/tau_probabilistic": 4.5, "eval/per_position_acc": [0.8, 0.6],
+         "eval/mtp_1_accuracy": 0.8, "eval/kl_loss": 0.0},
         log_dir,
         2604,
     )
@@ -105,5 +106,15 @@ def test_tensorboard_events_keep_eval_tags_and_checkpoint_steps(tmp_path):
     points = events.Scalars("eval/tau_probabilistic")
     assert [point.step for point in points] == [2604, 3255]
     assert [point.value for point in points] == pytest.approx([4.5, 4.7])
-    assert events.Scalars("eval/per_position_acc/0")[0].value == pytest.approx(0.8)
+    assert events.Scalars("eval/mtp_1_accuracy")[0].value == pytest.approx(0.8)
+    assert "eval/per_position_acc/0" not in events.Tags()["scalars"]
+    assert "eval/kl_loss" not in events.Tags()["scalars"]
     assert not any(tag.startswith("train/") for tag in events.Tags()["scalars"])
+
+    diagnostic_dir = str(tmp_path / "diagnostics")
+    write_tensorboard(
+        {"eval/per_position_acc": [0.8, 0.6]}, diagnostic_dir, 2604,
+        diagnostics=True,
+    )
+    diagnostic_events = EventAccumulator(diagnostic_dir).Reload()
+    assert diagnostic_events.Scalars("eval/per_position_acc/0")[0].value == pytest.approx(0.8)

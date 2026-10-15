@@ -12,6 +12,7 @@ trackers to that seam without putting tracker-specific branches in the trainer.
 from __future__ import annotations
 
 import numbers
+import re
 from typing import Any, Callable, Dict, Mapping, Optional
 
 
@@ -66,6 +67,47 @@ def training_metric_names(metrics: Mapping[str, float]) -> Dict[str, float]:
     }
 
 
+def dspark_tensorboard_metrics(
+    metrics: Mapping[str, float], *, loss_mode: str = "original", diagnostics: bool = False
+) -> Dict[str, float]:
+    """Select dashboard scalars without changing internal/checkpoint metrics.
+
+    Diagnostics retains additional historical metrics. Position losses use
+    hierarchical tags in both modes. Select by objective mode, never by value:
+    a legitimate zero is still a useful observation.
+    """
+    components = {"ce_loss", "l1_loss"} if loss_mode == "original" else {"kl_loss"}
+    train = components | {
+        "loss_weighted", "confidence_loss", "confidence_mae", "acc", "tau_probabilistic",
+        "grad_norm", "lr", "log_interval_sec",
+    }
+    evaluation = components | {
+        "avg_loss", "confidence_loss", "confidence_mae",
+        "tau_probabilistic", "simulated_acc_len",
+    }
+    selected = dict(metrics) if diagnostics else {
+        key: value for key, value in metrics.items()
+        if (key.startswith("train/") and (
+            key[6:] in train or re.fullmatch(r"mtp_\d+_loss", key[6:])
+        ))
+        or (key.startswith("eval/") and (
+            key[5:] in evaluation
+            or re.fullmatch(r"accept_rate@\d+|mtp_\d+_accuracy", key[5:])
+            or re.fullmatch(r"mtp_\d+_" + ("ce" if loss_mode == "original" else "kl"), key[5:])
+        ))
+    }
+    grouped = {}
+    component = "ce" if loss_mode == "original" else "kl"
+    for key, value in selected.items():
+        position = re.fullmatch(r"(train|eval)/mtp_(\d+)_(loss|ce|kl|l1)", key)
+        if position:
+            phase, index, name = position.groups()
+            name = component if name == "loss" else name
+            key = f"{phase}/position_loss/{int(index):02d}_{name}"
+        grouped[key] = value
+    return grouped
+
+
 class TrackerLogger:
     """Callable tracker adapter with an idempotent lifecycle.
 
@@ -79,9 +121,11 @@ class TrackerLogger:
         tracker: Any,
         *,
         console_logger: Optional[Callable[[Dict[str, float], int], None]] = None,
+        metric_filter: Optional[Callable[[Dict[str, float]], Dict[str, float]]] = None,
     ) -> None:
         self.tracker = tracker
         self.console_logger = console_logger
+        self.metric_filter = metric_filter
         self._closed = False
 
     def __call__(self, metrics: Mapping[str, Any], step: int) -> None:
@@ -90,7 +134,7 @@ class TrackerLogger:
         values = training_metric_names(scalar_metrics(metrics))
         if self.console_logger is not None:
             self.console_logger(values, step)
-        self.tracker.log(values, step=step)
+        self.tracker.log(self.metric_filter(values) if self.metric_filter else values, step=step)
 
     def close(self) -> None:
         if not self._closed:
@@ -109,6 +153,7 @@ def create_tracker_logger(
     output_dir: str,
     *,
     console_logger: Optional[Callable[[Dict[str, float], int], None]] = None,
+    metric_filter: Optional[Callable[[Dict[str, float]], Dict[str, float]]] = None,
 ) -> TrackerLogger:
     """Build and validate a configured tracker behind the unified contract."""
     from specforge.tracker import get_tracker_class
@@ -123,12 +168,16 @@ def create_tracker_logger(
             raise ValueError(message)
 
     tracker_class.validate_args(_ValidationErrors(), args)
-    return TrackerLogger(tracker_class(args, output_dir), console_logger=console_logger)
+    return TrackerLogger(
+        tracker_class(args, output_dir), console_logger=console_logger,
+        metric_filter=metric_filter,
+    )
 
 
 __all__ = [
     "TrackerLogger",
     "create_tracker_logger",
+    "dspark_tensorboard_metrics",
     "scalar_metrics",
     "training_metric_names",
 ]

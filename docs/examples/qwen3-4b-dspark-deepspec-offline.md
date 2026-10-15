@@ -89,7 +89,7 @@ window; it does not reconstruct metrics from before the checkpoint.
 
 - `loss`: DeepSpec console-compatible rank-0 mean of local, coefficient-weighted
   per-micro-batch component losses over the window. Broadcast to all loggers.
-- `ce_loss`, `l1_loss`, `confidence_loss`, `confidence_abs_error`, position losses:
+- `ce_loss`, `l1_loss`, `confidence_loss`, `confidence_mae`, position losses:
   sum of local numerators across ranks and micro-batches divided by the matching
   summed denominator. Position decay weights remain included for loss metrics.
 - `loss_weighted`: coefficients applied to these global window component means.
