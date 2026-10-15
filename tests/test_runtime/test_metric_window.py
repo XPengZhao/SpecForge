@@ -229,13 +229,43 @@ class TestMetricWindow(unittest.TestCase):
                        wraps=lambda value: float(value.item())) as scalar,
         ):
             first = core.train_step(_batch())
-            self.assertEqual(scalar.call_count, 1)  # StepResult.loss only.
+            self.assertEqual(scalar.call_count, 0)
             second = core.train_step(_batch())
-            self.assertEqual(scalar.call_count, 3)  # Loss and boundary grad norm.
+            self.assertEqual(scalar.call_count, 2)  # Boundary loss and grad norm.
         self.assertFalse(first.optimizer_stepped)
+        self.assertIsNone(first.loss)
+        self.assertEqual(first.metrics, {})
         self.assertTrue(second.optimizer_stepped)
+        self.assertIsInstance(second.loss, float)
         self.assertEqual(core.metric_window.count, 2)
         self.assertEqual(core.metric_window.summary()['log_micro_batches'], 2)
+
+    def test_window_accumulation_does_not_extract_scalars_between_boundaries(self):
+        for accumulation in (1, 128):
+            with self.subTest(accumulation=accumulation):
+                strategy = WindowStrategy()
+                core = TrainerCore(strategy, FakeBackend(strategy.model),
+                                   accumulation_steps=accumulation)
+                for value in range(1, accumulation + 1):
+                    batch = _batch()
+                    batch.tensors['x'] = torch.tensor([float(value)])
+                    if value < accumulation:
+                        with mock.patch.object(
+                            torch.Tensor, 'item',
+                            side_effect=AssertionError('non-boundary scalar extraction'),
+                        ):
+                            core.train_step(batch)
+                    else:
+                        result = core.train_step(batch)
+                self.assertEqual(result.loss, float(accumulation))
+                self.assertEqual(result.grad_norm, 1.)
+                self.assertEqual(core.backend.steps, 1)
+                expected_mean = (accumulation + 1) / 2
+                torch.testing.assert_close(strategy.model.w.grad,
+                                           torch.tensor([expected_mean]))
+                summary = core.metric_window.summary()
+                self.assertEqual(summary['log_micro_batches'], accumulation)
+                self.assertEqual(summary['ce_loss'], expected_mean)
 
     def test_natural_end_and_interval_one(self):
         for interval, updates, expected_steps, expected_counts in (

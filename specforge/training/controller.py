@@ -52,10 +52,12 @@ class Checkpoint:
 @dataclass(frozen=True)
 class StepResult:
     """Result of one TrainerCore step; ``optimizer_stepped`` is the authoritative
-    grad-accumulation boundary signal."""
+    grad-accumulation boundary signal. Window-based strategies omit ``loss``
+    and scalar metrics between optimizer steps to avoid device synchronization.
+    """
 
     optimizer_stepped: bool
-    loss: float
+    loss: Optional[float]
     grad_norm: Optional[float]
     metrics: Dict[str, Any] = field(default_factory=dict)
 
@@ -254,13 +256,14 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
-        loss = out.loss / self.accumulation_steps
+        # DDP's synchronization decision is made during forward. Both passes
+        # must share the same context for non-boundary gradient accumulation.
+        stepped = (self._micro + 1) % self.accumulation_steps == 0
+        with self.backend.accumulation_context(is_boundary=stepped):
+            out: StepOutput = self.strategy.forward_loss(batch, ctx)
+            loss = out.loss / self.accumulation_steps
+            self.backend.backward(loss, is_boundary=stepped)
         self._micro += 1
-        # The boundary is known before backward so the backend can defer the FSDP
-        # gradient reduction (no_sync) on non-boundary micro-steps.
-        stepped = self._micro % self.accumulation_steps == 0
-        self.backend.backward(loss, is_boundary=stepped)
         grad_norm = self.backend.step() if stepped else None
         self.metric_window.update(out.metrics.get("log_window"))
         return self._result(out, grad_norm, stepped)
@@ -269,6 +272,8 @@ class TrainerCore:
         if "log_window" in out.metrics:
             # Window statistics are already accumulated on device. Their means
             # and DP reduction are computed only when the controller logs.
+            if not stepped:
+                return StepResult(False, None, None)
             loss = _scalar(out.loss)
             gn = _scalar(grad_norm) if grad_norm is not None else None
             metrics = {"loss": loss}

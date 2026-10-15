@@ -126,6 +126,10 @@ class ParallelConfig:
 class TrainingBackend(abc.ABC):
     name: str
 
+    def accumulation_context(self, *, is_boundary: bool):
+        """Context covering both forward and backward of one micro-batch."""
+        return contextlib.nullcontext()
+
     @abc.abstractmethod
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
@@ -393,19 +397,18 @@ class FSDPTrainingBackend(TrainingBackend):
             gradient.copy_(flat_gradients[offset : offset + numel].view_as(gradient))
             offset += numel
 
-    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
-        """Backward one micro-step with one gradient collective per window.
+    def accumulation_context(self, *, is_boundary: bool):
+        # DDP decides whether to reduce gradients during forward, so suppressing
+        # synchronization only around loss.backward() is too late.
+        if self._wrapped and not is_boundary:
+            return self.module.no_sync()
+        return contextlib.nullcontext()
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
-        """
-        if is_boundary or not self._wrapped:
-            loss.backward()
-            if is_boundary and self._wrapper_kind == "fsdp":
-                self._sync_replicated_gradients()
-        else:
-            with self.module.no_sync():
-                loss.backward()
+    def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
+        """Backward inside the caller's forward/backward accumulation context."""
+        loss.backward()
+        if is_boundary and self._wrapper_kind == "fsdp":
+            self._sync_replicated_gradients()
 
     def step(self) -> Optional[torch.Tensor]:
         """Run the optimizer step, which clips and returns the global grad norm."""

@@ -56,7 +56,8 @@ flowchart TD
 
 The training plane is the only tensor-carrying side besides the data plane; it
 consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
-`accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
+`accumulation_steps`, wraps both forward and backward in the backend's
+`accumulation_context` (`no_sync()` for non-boundary DDP/FSDP micro-batches), and
 returns `optimizer_stepped` as the single authoritative boundary signal.
 `TrainerController` increments `global_step` only at that boundary, commits the
 pending sample acknowledgements, emits metrics, and performs configured
