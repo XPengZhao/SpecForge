@@ -9,6 +9,8 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel
+from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
+from .dspark_moe import SharedSparseMLP
 from .registry import register_draft
 
 
@@ -295,7 +297,18 @@ class DSparkDraftModel(DFlashDraftModel):
             raise ValueError(
                 "DSparkDraftModel requires " "dflash_config.projector_type='dspark'."
             )
-        super().__init__(config)
+        moe = dflash_config.get("moe", {})
+        kernels = DEFAULT_DFLASH_KERNELS
+        if moe.get("enabled", False):
+            kernels = DFlashKernels(
+                make_rms_norm=kernels.make_rms_norm,
+                make_mlp=lambda cfg: SharedSparseMLP(cfg, DEFAULT_DFLASH_KERNELS.make_mlp),
+            )
+        super().__init__(config, dflash_kernels=kernels)
+        self.moe_enabled = bool(moe.get("enabled", False))
+        self.moe_balance_alpha = float(moe.get("balance_loss_alpha", 0.01))
+        if not 0 <= self.moe_balance_alpha < float("inf"):
+            raise ValueError("moe.balance_loss_alpha must be finite and nonnegative")
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)

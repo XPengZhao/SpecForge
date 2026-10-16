@@ -322,11 +322,15 @@ class OnlineDFlashModel(nn.Module):
                 context_window=getattr(self.draft_model, "context_window", None),
             )
 
+        routing_kwargs = {}
+        if getattr(self.draft_model, "moe_enabled", False):
+            routing_kwargs = dict(routing_mask=block_keep_mask, return_router_stats=True)
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **routing_kwargs,
         )
         return anchor_positions, block_keep_mask, output_hidden
 
@@ -1169,6 +1173,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_mask=loss_mask,
         )
 
+        router_stats = []
+        if getattr(self.draft_model, "moe_enabled", False):
+            output_hidden, router_stats = output_hidden
+
         logits = self.lm_head(output_hidden)
         num_blocks = anchor_positions.size(1)
         output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
@@ -1209,6 +1217,24 @@ class OnlineDSparkModel(OnlineDFlashModel):
             confidence_pred=confidence_pred,
             unique_target_probs=unique_target_probs,
         )
+        if router_stats:
+            balance_loss = torch.stack([s["balance_loss"] for s in router_stats]).mean()
+            # Keep the original DSpark task metrics comparable with dense runs.
+            # The auxiliary term is local per microbatch, then averaged by DDP
+            # and the existing gradient accumulation scaling.
+            if self.training:
+                loss = loss + self.draft_model.moe_balance_alpha * balance_loss
+            stats["sums"]["moe_balance_loss"] = balance_loss.detach()
+            stats["denoms"]["moe_balance_loss"] = balance_loss.new_ones(())
+            for layer_id, routing in enumerate(router_stats):
+                for expert_id in range(routing["counts"].numel()):
+                    for suffix, values in (
+                        ("fraction", routing["counts"]),
+                        ("probability", routing["probability_sums"]),
+                    ):
+                        key = f"moe_layer{layer_id}_expert{expert_id}_{suffix}"
+                        stats["sums"][key] = values[expert_id]
+                        stats["denoms"][key] = routing["count"]
         flat_logits = draft_logits.reshape(-1, draft_logits.size(-1))
         flat_targets = target_ids.reshape(-1)
         binary_eval_mask = eval_mask.reshape(-1)

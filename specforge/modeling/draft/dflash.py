@@ -175,6 +175,9 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        routing_context: Optional[torch.Tensor] = None,
+        routing_mask: Optional[torch.Tensor] = None,
+        collect_router_stats: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -196,8 +199,16 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if routing_context is not None:
+            hidden_states, router_stats = self.mlp(
+                hidden_states, routing_context, routing_mask,
+                return_router_stats=collect_router_stats,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        if routing_context is not None:
+            return hidden_states, router_stats
         return hidden_states
 
 
@@ -368,10 +379,41 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        routing_mask: Optional[torch.Tensor] = None,
+        return_router_stats: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
+        routing_kwargs = {}
+        router_stats = []
+        if getattr(self, "moe_enabled", False):
+            # Context positions may start above zero during cached inference.
+            batch, query_len = hidden_states.shape[:2]
+            context_len = target_hidden.shape[1]
+            if query_len % self.block_size or context_len == 0:
+                raise ValueError("MoE requires complete blocks and nonempty target context")
+            if position_ids.shape != (batch, context_len + query_len):
+                raise ValueError("MoE requires context + draft position_ids")
+            anchors = position_ids[:, context_len:].reshape(
+                batch, -1, self.block_size
+            )[:, :, 0]
+            context_indices = anchors - position_ids[:, :1] - 1
+            visible = (context_indices >= 0) & (context_indices < context_len)
+            indices = context_indices.clamp(0, context_len - 1)
+            context = target_hidden.gather(
+                1, indices.unsqueeze(-1).expand(-1, -1, target_hidden.shape[-1])
+            )
+            keep = (
+                torch.ones_like(visible) if routing_mask is None else routing_mask.bool()
+            )
+            routing_kwargs = dict(
+                # An anchor at position zero has no preceding target feature.
+                # Route it from a zero context rather than leaking token zero.
+                routing_context=context.masked_fill(~(keep & visible).unsqueeze(-1), 0),
+                routing_mask=keep,
+                collect_router_stats=return_router_stats,
+            )
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:
             hidden_states = layer(
@@ -382,9 +424,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                **routing_kwargs,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+            if routing_kwargs:
+                hidden_states, stats = hidden_states
+                if return_router_stats:
+                    router_stats.append(stats)
+        hidden_states = self.norm(hidden_states)
+        if return_router_stats:
+            return hidden_states, router_stats
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(
