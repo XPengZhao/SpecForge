@@ -544,6 +544,8 @@ class TrainingConfig(StrictConfigModel):
     compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
+    # Original publication journal required only for legacy managed resumes.
+    resume_ref_channel: Optional[str] = None
     #: Optional replacement peak LR after a full resume. Optimizer moments,
     #: scheduler progress, counters, data position, and RNG are still restored;
     #: only the saved LR curve is rescaled to this peak.
@@ -804,7 +806,10 @@ class Config(StrictConfigModel):
                     "managed_local requires the persisted training role to be auto"
                 )
             if self.training.resume_from is not None:
-                raise ValueError("managed_local does not support resume")
+                if len(managed_local.capture_servers) != 1:
+                    raise ValueError("managed resume requires exactly one capture server")
+                if self.training.resume_reset_data_position:
+                    raise ValueError("managed resume cannot reset the data position")
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )

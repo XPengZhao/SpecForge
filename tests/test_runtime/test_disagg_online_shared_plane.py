@@ -92,7 +92,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
             )
         store.close()
 
-    def _build(self, *, resume_from=None, idle_timeout_s=None):
+    def _build(self, *, resume_from=None, idle_timeout_s=None, rebuild_stream=False, resume_state=None):
         from specforge.launch import build_disagg_online_consumer
 
         captured = {}
@@ -123,6 +123,8 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 metadata_db_path=self.db,
                 inbox_dir=os.path.join(self.work, "inboxes"),
                 resume_from=resume_from,
+                rebuild_stream=rebuild_stream,
+                resume_state=resume_state,
                 idle_timeout_s=idle_timeout_s,
             )
         return trainer, captured, _FakeDistributor.latest
@@ -138,6 +140,22 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
 
         self.assertEqual(12.5, distributor.kwargs["idle_timeout_s"])
         self.assertEqual(12.5, captured["ref_source"]["queue"].idle_timeout_s)
+
+    def test_rebuild_resumes_weights_with_fresh_ledger_and_prepositioned_queue(self):
+        checkpoint = self._checkpoint(1962)
+        state = {"global_step": 1962}
+        _, captured, distributor = self._build(
+            resume_from=checkpoint, rebuild_stream=True, resume_state=state)
+        self.assertIs(captured["resume_state"], state)
+        self.assertIsNone(distributor.kwargs["skip_ids"])
+        self.assertIsNone(distributor.kwargs["requeued_ids"])
+        self.assertTrue(captured["ref_source"]["prepositioned"])
+        self.assertEqual(captured["resume_from"], checkpoint)
+
+    def test_rebuild_rejects_a_used_ledger(self):
+        self._seed_ledger()
+        with self.assertRaisesRegex(ValueError, "cannot reuse a ledger"):
+            self._build(resume_from=self._checkpoint(1962), rebuild_stream=True)
 
     def test_crash_before_ack_requeues_every_committed_ref(self):
         self._seed_ledger()

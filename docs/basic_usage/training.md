@@ -476,7 +476,12 @@ For a disaggregated offline resume, reuse the same manifest, feature store, and
 run id, then invoke `specforge train -c run.yaml --role consumer` with the
 checkpoint override; the producer never accepts a resume checkpoint.
 
-Online disaggregated resume is intentionally consumer-only. Reuse the retained
+Managed-local online training with one capture server can rebuild a fresh stream
+from a checkpoint, restoring the optimizer, scheduler and consumed sample position.
+Use new attempt directories and keep the original data and training configuration;
+see [managed-local resume](disaggregated_training.md#managed-local-rebuild-from-a-checkpoint).
+
+External-service online disaggregated resume is consumer-only. Reuse the retained
 SQLite metadata DB, original channel/inboxes, Mooncake objects, and matching
 checkpoint; rank 0 verifies that the durable optimizer marker equals the
 checkpoint step, skips acknowledged refs, and requeues the unacknowledged tail.

@@ -513,9 +513,9 @@ class LaunchPlanTest(unittest.TestCase):
                 ),
                 "nnodes=1",
             ),
-            "resume": (
-                lambda raw: raw["training"].update(resume_from="checkpoint"),
-                "does not support resume",
+            "resume_reset": (
+                lambda raw: raw["training"].update(resume_from="checkpoint", resume_reset_data_position=True),
+                "cannot reset the data position",
             ),
             "persisted role": (
                 lambda raw: raw["training"].update(role="producer"),
