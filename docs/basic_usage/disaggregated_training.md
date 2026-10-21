@@ -151,9 +151,9 @@ Mooncake deployment. The optional
 `deployment.disaggregated.managed_local` profile is a separate, explicit
 single-node development convenience: when configured, it owns local Mooncake
 and capture-server processes and derives their endpoints. Omitting that block
-preserves the external-services behavior exactly. Managed-local launch is for a
-fresh online Mooncake run with automatic producer + consumer supervision; it is
-not a remote scheduler, resume path, existing-torchrun path, or replacement for
+preserves the external-services behavior exactly. Managed-local launch is for an
+online Mooncake run with automatic producer + consumer supervision; it is
+not a remote scheduler, existing-torchrun path, or replacement for
 explicit producer and consumer pools.
 
 The historical self-contained DFlash and Domino topologies each record one
@@ -417,8 +417,64 @@ supervisor handles that lifecycle.
 
 ## Resume and freshness
 
+### Managed-local: rebuild from a checkpoint
+
+A managed-local run with **one capture server** can restart its services and
+rebuild the stream from an immutable checkpoint directory. Keep the original
+model, data, preprocessing, seed, producer epoch count, trainer topology, batch
+size, accumulation steps and `training.total_steps`. Use a new run ID, output
+directory, control directory and consumer-state directory. Stop the old run
+before reusing its service ports.
+
+Add these overrides to the original training command (including its original
+training and deployment overrides):
+
+```bash
+training.resume_from="$OLD_CHECKPOINT" \
+run_id="$NEW_ATTEMPT" \
+output_dir="$OUTPUT_PATH/$NEW_ATTEMPT" \
+deployment.disaggregated.control_dir="$OUTPUT_PATH/$NEW_ATTEMPT/control" \
+deployment.disaggregated.consumer_state_dir="$OUTPUT_PATH/$NEW_ATTEMPT/consumer-state"
+```
+
+`training.max_steps` is the absolute stopping step, not the number of additional
+steps. Do not set `resume_reset_data_position` or `resume_learning_rate` for an
+exact continuation. The trainer restores model weights, optimizer moments,
+FP32 master weights, scheduler and rank-local RNG state through the existing
+checkpoint loader. The producer skips only the checkpoint's completed samples;
+old prefetched features are discarded and the remaining features are regenerated.
+The consumer does not skip that prefix a second time. Samples trained *after*
+the selected checkpoint are intentionally replayed because their optimizer
+updates have also been rolled back.
+
+Checkpoint selection uses the trainer's resolver. A run directory selects its
+newest checkpoint; an explicit step directory or symlink selects that target.
+The producer pins the physical directory in the stream plan, so later changes
+to a `latest` link cannot change what the consumer loads. Each consumer rank
+reads its training state once and reuses it for validation and restoration.
+A checkpoint saved after natural stream exhaustion restores as a completed run:
+no samples are consumed, including any final incomplete window previously dropped.
+
+New checkpoints record a fingerprint of the prepared prompts and their ordering
+parameters. A mismatch fails before training. Capture must preserve prompt order;
+a capture failure stops the run instead of retrying samples out of order.
+For legacy checkpoints without that fingerprint, additionally supply:
+
+```bash
+training.resume_ref_channel="$OLD_OUTPUT/control/refs.jsonl"
+```
+
+The original journal must contain the complete consumed prefix in the expected
+order. This legacy check cannot prove unchanged input contents: retain the
+original dataset and preprocessing settings. Missing or reordered journals are
+rejected. Multi-capture-server reconstruction is not supported. Recomputed GPU
+features can have floating-point differences; this is not a bitwise GPU replay
+guarantee.
+
+### External services: retain the existing stream
+
 For every new online attempt, the consumer database and its WAL/SHM sidecars
-must not exist. The launcher checks that rule on global rank 0. Resume requires
+must not exist. The launcher checks that rule on global rank 0. External-service resume requires
 the retained database and a matching checkpoint:
 
 ```bash
@@ -426,7 +482,7 @@ specforge train -c run.yaml --role consumer \
   training.resume_from=outputs/run/run-latest
 ```
 
-With the default `--role auto`, a disaggregated config containing
+With the default `--role auto`, an external-service disaggregated config containing
 `training.resume_from` resolves to consumer-only. Explicit `--role both` is
 rejected because producers are never resumed. Reuse the same control directory,
 store id, run id, output directory, consumer topology, and Mooncake objects.

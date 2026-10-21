@@ -181,6 +181,9 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         max_grad_norm=1.0,
         total_steps=100,
         dataset_size=None,
+        queue_skip=None,
+        resume_state=None,
+        accumulation_steps=1,
     ):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -192,6 +195,14 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         seen = [] if seen is None else seen
         model = Composite() if model is None else model
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
+        ref_source = {"refs": refs}
+        if queue_skip is not None:
+            from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel, StreamingRefQueue
+            os.makedirs(out_dir, exist_ok=True)
+            channel = StreamingRefChannel(os.path.join(out_dir, "refs.jsonl"))
+            channel.publish_many(refs[queue_skip:])
+            channel.close()
+            ref_source = {"queue": StreamingRefQueue(channel), "prepositioned": bool(resume_from)}
         with _no_fsdp_wrap():
             trainer = Trainer(
                 algorithm_name=spec_name,
@@ -200,7 +211,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 ),
                 controller=DataFlowController(run_id),
                 store=LocalFeatureStore("st"),
-                ref_source={"refs": refs},
+                ref_source=ref_source,
                 model=model,
                 target_head=None,
                 optimizer_factory=lambda m: BF16Optimizer(
@@ -213,7 +224,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 run_id=run_id,
                 output_dir=out_dir,
                 batch_size=2,
-                accumulation_steps=1,
+                accumulation_steps=accumulation_steps,
                 num_epochs=1,
                 max_steps=max_steps,
                 total_steps=total_steps,
@@ -223,6 +234,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 collate_fn=_x_collate,
                 per_sample_transform=_x_transform,
                 resume_from=resume_from,
+                resume_state=resume_state,
                 resume_reset_data_position=resume_reset_data_position,
                 dataset_size=dataset_size,
                 checkpoint_extra=checkpoint_extra,
@@ -304,6 +316,80 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         self.assertEqual(t3.fit(), 2)
         self.assertEqual(seen3, [])
         self.assertTrue(torch.equal(model3.draft_model.w.detach(), w_cut))
+
+    def test_rebuilt_queue_resume_preserves_accumulation_optimizer_and_lr(self):
+        workdir = tempfile.mkdtemp(prefix="rebuilt_queue_resume_")
+        features = _write_feature_files(os.path.join(workdir, "features"), n=16)
+        def build(name, steps, **kwargs):
+            return self._make_trainer(os.path.join(workdir, name), feat_dir=features,
+                                     max_steps=steps, accumulation_steps=2, **kwargs)
+        full, full_model, full_seen = build("full", 4, queue_skip=0)
+        full.fit()
+        cut, _, cut_seen = build("cut", 2, queue_skip=0)
+        cut.fit()
+        checkpoint = os.path.realpath(os.path.join(workdir, "cut", "rz-latest"))
+        from specforge.training.checkpoint import CheckpointManager
+        state = CheckpointManager.read_resume_state(checkpoint)
+        with mock.patch.object(CheckpointManager, "read_resume_state",
+                               side_effect=AssertionError("checkpoint read twice")):
+            resumed, resumed_model, resumed_seen = build(
+                "resumed", 4, queue_skip=8, resume_from=checkpoint, resume_state=state)
+        self.assertEqual(resumed.backend.optimizer.scheduler.state_dict(),
+                         cut.backend.optimizer.scheduler.state_dict())
+        resumed.fit()
+        self.assertEqual(cut_seen + resumed_seen, full_seen)
+        self.assertEqual(len(set(full_seen)), 16)
+        self.assertTrue(torch.equal(resumed_model.draft_model.w, full_model.draft_model.w))
+        def equal(a, b):
+            if isinstance(a, torch.Tensor):
+                self.assertTrue(torch.equal(a, b))
+            elif isinstance(a, dict):
+                self.assertEqual(a.keys(), b.keys())
+                for key in a:
+                    equal(a[key], b[key])
+            elif isinstance(a, (list, tuple)):
+                self.assertEqual(len(a), len(b))
+                for x, y in zip(a, b):
+                    equal(x, y)
+            else:
+                self.assertEqual(a, b)
+        equal(resumed.backend.optimizer.state_dict(), full.backend.optimizer.state_dict())
+
+    def test_completed_rebuilt_queue_restores_state_without_consuming_data(self):
+        from specforge.training.checkpoint import CheckpointManager
+        from specforge.training.online_resume import prompt_plan, resume_cursor
+        for count in (8, 9):  # exact quantum and a dropped final sample
+            with self.subTest(count=count):
+                root = tempfile.mkdtemp(prefix="completed_online_resume_")
+                features = _write_feature_files(os.path.join(root, "features"), n=count)
+                source, source_model, seen = self._make_trainer(
+                    os.path.join(root, "source"), feat_dir=features,
+                    max_steps=None, accumulation_steps=2, queue_skip=0)
+                self.assertEqual(source.fit(), 2)
+                checkpoint = os.path.realpath(os.path.join(root, "source", "rz-latest"))
+                state = CheckpointManager.read_resume_state(checkpoint)
+                plan = prompt_plan([{"task_id": str(i)} for i in range(count)],
+                                   seed=42, epochs=1, dp_size=1, batch_size=2,
+                                   accumulation_steps=2)
+                skip = resume_cursor(state, plan)
+                self.assertEqual(skip, count)
+                self.assertEqual(state["epoch"], 1)
+                with mock.patch.object(CheckpointManager, "read_resume_state",
+                                       side_effect=AssertionError("checkpoint read twice")):
+                    resumed, model, resumed_seen = self._make_trainer(
+                        os.path.join(root, "resumed"), feat_dir=features,
+                        max_steps=None, accumulation_steps=2, queue_skip=skip,
+                        resume_from=checkpoint, resume_state=state)
+                    self.assertEqual(resumed.fit(), 2)
+                self.assertEqual(resumed_seen, [])
+                self.assertEqual(len(seen), 8)
+                self.assertTrue(torch.equal(model.draft_model.w, source_model.draft_model.w))
+                self.assertEqual(resumed.backend.optimizer.scheduler.state_dict(),
+                                 source.backend.optimizer.scheduler.state_dict())
+                self.assertEqual(resumed.backend.optimizer.optimizer.param_groups[0]["lr"],
+                                 source.backend.optimizer.optimizer.param_groups[0]["lr"])
+                self.assertTrue(torch.equal(resumed.backend.optimizer.fp32_params[0],
+                                            source.backend.optimizer.fp32_params[0]))
 
     def test_resume_reset_data_position_allows_a_new_dump(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_reset_data_")

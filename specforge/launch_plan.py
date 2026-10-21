@@ -193,7 +193,7 @@ def _resolve_role(
         if disaggregated and legacy_role in ("producer", "consumer"):
             requested = legacy_role
         elif disaggregated and cfg.training.resume_from:
-            requested = "consumer"
+            requested = "both" if cfg.deployment.disaggregated.managed_local else "consumer"
         else:
             requested = "both" if disaggregated else "all"
 
@@ -201,7 +201,7 @@ def _resolve_role(
         raise ValueError("disaggregated training does not support --role all")
     if not disaggregated and requested != "all":
         raise ValueError("--role producer/consumer/both requires disaggregated mode")
-    if requested == "both" and cfg.training.resume_from:
+    if requested == "both" and cfg.training.resume_from and not cfg.deployment.disaggregated.managed_local:
         raise ValueError(
             "--role both cannot resume a disaggregated producer; use " "--role consumer"
         )
@@ -572,7 +572,7 @@ def _validate_consumer_database(
     if not database:
         raise ValueError("online disaggregated consumer requires a metadata database")
     state_owner = int(base_env["RANK"]) == 0 if distributed else node_rank in (None, 0)
-    if cfg.training.resume_from:
+    if cfg.training.resume_from and not (deployment.managed_local or launch_env.get("SPECFORGE_ONLINE_REBUILD_CHECKPOINT")):
         if state_owner and not os.path.exists(database):
             raise ValueError(
                 "consumer resume requires the retained metadata database: "
@@ -700,6 +700,9 @@ def build_launch_plan(
             consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
         if managed_local is not None:
             producer_env.update(managed_environment)
+            if cfg.training.resume_from:
+                producer_env["SPECFORGE_ONLINE_REBUILD_CHECKPOINT"] = cfg.training.resume_from
+                consumer_env["SPECFORGE_ONLINE_REBUILD_CHECKPOINT"] = cfg.training.resume_from
             producer_env["CUDA_VISIBLE_DEVICES"] = ""
             producer_env[_MANAGED_CHILD_ENV] = "1"
             consumer_env.update(managed_environment)

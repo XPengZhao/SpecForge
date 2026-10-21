@@ -822,6 +822,8 @@ def build_disagg_online_producer(
     sleep=None,
     prompt_epochs: int = 1,
     prompt_seed: int = 0,
+    prompt_skip: int = 0,
+    ordered_prompts: bool = False,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -917,6 +919,11 @@ def build_disagg_online_producer(
             "feature_store_max_resident_bytes must be >= "
             "resident_high_watermark_bytes"
         )
+    if ordered_prompts and num_rollout_workers != 1:
+        raise ValueError("ordered prompt replay requires exactly one rollout worker")
+    if prompt_skip < 0:
+        raise ValueError("prompt_skip must be nonnegative")
+    expected_task_ids = iter(())
     worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
@@ -1124,6 +1131,11 @@ def build_disagg_online_producer(
                     run_once_start = time.perf_counter()
                     refs = w.run_once(max_tasks=worker_lease)
                 except Exception as exc:
+                    if ordered_prompts:
+                        raise RuntimeError(
+                            "ordered capture failed; restart from a checkpoint "
+                            "rather than reorder retries"
+                        ) from exc
                     # the worker already failed its leases retryable; peers
                     # (or this worker, next round) will re-lease them.
                     failures += 1
@@ -1148,6 +1160,11 @@ def build_disagg_online_producer(
                     continue
                 failures = 0
                 if refs:
+                    if ordered_prompts:
+                        for ref in refs:
+                            expected = next(expected_task_ids, None)
+                            if expected is None or ref.source_task_id != expected:
+                                raise RuntimeError("capture changed prompt order or omitted a sample; refusing to publish")
                     with publish_lock:
                         current_bytes = reconcile_consumed_locked()
                         ref_sizes = [
@@ -1217,12 +1234,20 @@ def build_disagg_online_producer(
                     sleep(backpressure_poll_s)
 
         def ingest_epoch(epoch: int) -> None:
+            nonlocal expected_task_ids
             epoch_prompts = _epoch_online_prompts(
                 prompts,
                 epoch,
                 prompt_epochs,
                 seed=prompt_seed,
             )
+            offset = max(0, prompt_skip - epoch * len(prompts)) if prompt_skip else 0
+            if offset:
+                epoch_prompts = epoch_prompts[offset:]
+            if ordered_prompts:
+                if any(not p.get("task_id") for p in epoch_prompts):
+                    raise ValueError("ordered capture requires stable prompt task IDs")
+                expected_task_ids = iter(p["task_id"] for p in epoch_prompts)
             epoch_count = (
                 len(epoch_prompts) if hasattr(epoch_prompts, "__len__") else "unknown"
             )
@@ -1269,7 +1294,8 @@ def build_disagg_online_producer(
 
         try:
             live_workers = list(workers)
-            for epoch in range(prompt_epochs):
+            first_epoch = prompt_skip // max(1, len(prompts)) if prompt_skip else 0
+            for epoch in range(first_epoch, prompt_epochs):
                 if should_stop is not None and should_stop():
                     break
                 ingest_epoch(epoch)
@@ -1281,6 +1307,8 @@ def build_disagg_online_producer(
                     )
                 run_epoch_workers(live_workers)
                 stopped = should_stop is not None and should_stop()
+                if ordered_prompts and not stopped and next(expected_task_ids, None) is not None:
+                    raise RuntimeError("capture ended before completing the ordered prompt plan")
                 live_workers = [w for w in live_workers if w.worker_id not in dead]
                 if dead and not stopped and not pool_drained():
                     raise RuntimeError(
@@ -1373,7 +1401,10 @@ def build_disagg_online_consumer(
     dp_rank: Optional[int] = None,
     dp_size: Optional[int] = None,
     inbox_dir: Optional[str] = None,
+    rebuild_stream: bool = False,
+    online_prompt_plan: Optional[dict] = None,
     resume_from: Optional[str] = None,
+    resume_state: Optional[dict] = None,
     resume_reset_data_position: bool = False,
     dataloader_num_workers: int = 0,
     profiling_options=None,
@@ -1389,7 +1420,10 @@ def build_disagg_online_consumer(
     ``resume_from`` is consumer-only. Rank 0 reconciles the retained SQLite
     ledger, skips optimizer-durable refs, requeues the unacked tail, and requires
     the durable marker to match the checkpoint step. The producer and original
-    data plane must still be available; this does not restart a producer.
+    data plane must still be available for that retained-stream path.
+    With ``rebuild_stream``, managed-local assembly instead supplies a fresh,
+    prepositioned stream and the already-validated ``resume_state``. The trainer
+    restores that state without reading the checkpoint a second time.
     """
     import torch.distributed as dist
 
@@ -1468,7 +1502,7 @@ def build_disagg_online_consumer(
             skip_ids = None
             requeued_ids = None
             committed = store.committed_count()
-            if resume_from is None:
+            if resume_from is None or rebuild_stream:
                 if committed > 0:
                     raise ValueError(
                         f"metadata store already holds {committed} committed "
@@ -1666,6 +1700,7 @@ def build_disagg_online_consumer(
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
             resume_from=resume_from,
+            resume_state=resume_state,
             resume_reset_data_position=resume_reset_data_position,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
@@ -1675,6 +1710,8 @@ def build_disagg_online_consumer(
         )
         #: Rank 0's lifecycle-owned RefDistributor handle (None elsewhere), exposed
         #: for runtime observability. ``Trainer.fit()`` always stops it.
+        if online_prompt_plan is not None:
+            trainer._controller.checkpoint_extra["online_prompt_plan"] = online_prompt_plan
         trainer.ref_distributor = distributor
         if distributor is not None:
             distributor.start()

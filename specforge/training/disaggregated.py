@@ -36,6 +36,7 @@ _ONLINE_CONTROL_SUFFIXES = (
     ".consumer_failed",
     ".consumer_quantum",
     _ONLINE_SCHEDULE_SUFFIX,
+    ".prompt-plan.json",
 )
 _OFFLINE_CONTROL_SUFFIXES = (".done", ".consumed", ".failed", ".consumer_failed")
 
@@ -522,6 +523,17 @@ def _build_online(
         _profiling_options,
     )
 
+    from specforge.training.online_resume import (
+        PLAN_KEY, PLAN_SUFFIX, REBUILD_ENV, prompt_plan, validate_resume_plan,
+        read_producer_checkpoint,
+    )
+    managed = os.environ.get("SPECFORGE_MANAGED_LOCAL_CHILD") == "1"
+    rebuild_checkpoint = os.environ.get(REBUILD_ENV)
+    plan = None
+    prompt_skip = 0
+    checkpoint_path = None
+    resume_state = None
+    resume_from = cfg.training.resume_from
     modality = cfg.model.input_modality
     streaming = algorithm.providers.server_streaming_for(modality)
     channel_path = _env("DISAGG_REF_CHANNEL")
@@ -579,6 +591,26 @@ def _build_online(
                     draft_config=draft_config,
                 )
             summary["samples"] = len(prompts)
+        # Single-worker managed capture has a deterministic, fail-closed order.
+        ordered = managed and len(_server_urls(cfg)) == 1
+        if ordered:
+            with preparation_stage("producer.verify_prompt_plan") as summary:
+                for index, prompt in enumerate(prompts):
+                    prompt.setdefault("task_id", f"prompt{index:012d}")
+                plan = prompt_plan(
+                    prompts, seed=cfg.training.seed, epochs=cfg.training.num_epochs,
+                    dp_size=cfg.deployment.trainer.nnodes * cfg.deployment.trainer.nproc_per_node,
+                    batch_size=cfg.training.batch_size,
+                    accumulation_steps=cfg.training.accumulation_steps,
+                )
+                if rebuild_checkpoint:
+                    checkpoint_path, state = read_producer_checkpoint(rebuild_checkpoint)
+                    prompt_skip = validate_resume_plan(
+                        state, plan, prompts, legacy_channel=cfg.training.resume_ref_channel,
+                    )
+                    del state
+                _write_control(channel_path + PLAN_SUFFIX, json.dumps({"plan": plan, "skip": prompt_skip, "checkpoint": checkpoint_path}))
+                summary["resume_skip"] = prompt_skip
         if cfg.training.total_steps is None and cfg.training.max_steps is None:
             schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
             _write_control(
@@ -644,6 +676,8 @@ def _build_online(
                 aux_hidden_state_layer_ids=layers,
                 prompt_epochs=cfg.training.num_epochs,
                 prompt_seed=cfg.training.seed,
+                prompt_skip=prompt_skip,
+                ordered_prompts=ordered,
                 lease=cfg.runtime.producer_lease,
                 in_flight_high_watermark=in_flight_high_watermark,
                 in_flight_low_watermark=in_flight_low_watermark,
@@ -746,6 +780,22 @@ def _build_online(
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)
+    if managed and len(_server_urls(cfg)) == 1:
+        _wait_for(channel_path + PLAN_SUFFIX,
+                  timeout_s=_optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT"),
+                  failure_path=channel_path + ".failed")
+        with open(channel_path + PLAN_SUFFIX, encoding="utf-8") as stream:
+            record = json.load(stream)
+        plan = record["plan"]
+        if rebuild_checkpoint:
+            from specforge.training.checkpoint import CheckpointManager
+            from specforge.training.online_resume import resume_cursor
+            resume_from = record["checkpoint"]
+            resume_state = CheckpointManager.read_resume_state(resume_from)
+            if resume_cursor(resume_state, plan) != record["skip"]:
+                raise ValueError("producer and consumer resume cursors differ")
+            if PLAN_KEY in resume_state and resume_state[PLAN_KEY] != plan:
+                raise ValueError("producer and checkpoint prompt plans differ")
     bundle = build_model_bundle(cfg)
     trainer = build_disagg_online_consumer(
         algorithm=algorithm,
@@ -773,7 +823,10 @@ def _build_online(
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
-        resume_from=cfg.training.resume_from,
+        rebuild_stream=bool(rebuild_checkpoint),
+        online_prompt_plan=plan,
+        resume_from=resume_from,
+        resume_state=resume_state,
         resume_reset_data_position=cfg.training.resume_reset_data_position,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),

@@ -163,6 +163,9 @@ def _config_for_role(cfg: Config, role: str) -> Config:
         disaggregated["managed_local"] = None
     if role == "producer":
         raw["profiling"]["enabled"] = False
+        if os.environ.get("SPECFORGE_ONLINE_REBUILD_CHECKPOINT"):
+            raw["training"]["resume_from"] = None
+            raw["training"]["resume_learning_rate"] = None
     return Config.model_validate(raw)
 
 
