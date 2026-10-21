@@ -305,7 +305,12 @@ class DSparkDraftModel(DFlashDraftModel):
                 make_mlp=lambda cfg: SharedSparseMLP(cfg, DEFAULT_DFLASH_KERNELS.make_mlp),
             )
         super().__init__(config, dflash_kernels=kernels)
-        self.moe_enabled = bool(moe.get("enabled", False))
+        attention_moe = dflash_config.get("attention_moe", {})
+        self.attention_moe_enabled = bool(attention_moe.get("enabled", False))
+        self.moe_enabled = bool(moe.get("enabled", False)) or self.attention_moe_enabled
+        self.attention_moe_balance_alpha = float(attention_moe.get("balance_loss_alpha", 0.01))
+        if not 0 <= self.attention_moe_balance_alpha < float("inf"):
+            raise ValueError("attention_moe.balance_loss_alpha must be finite and nonnegative")
         self.moe_balance_alpha = float(moe.get("balance_loss_alpha", 0.01))
         if not 0 <= self.moe_balance_alpha < float("inf"):
             raise ValueError("moe.balance_loss_alpha must be finite and nonnegative")

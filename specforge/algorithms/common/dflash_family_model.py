@@ -1217,22 +1217,30 @@ class OnlineDSparkModel(OnlineDFlashModel):
             confidence_pred=confidence_pred,
             unique_target_probs=unique_target_probs,
         )
-        if router_stats:
-            balance_loss = torch.stack([s["balance_loss"] for s in router_stats]).mean()
-            # Keep the original DSpark task metrics comparable with dense runs.
-            # The auxiliary term is local per microbatch, then averaged by DDP
-            # and the existing gradient accumulation scaling.
+        # Keep FFN and attention auxiliary losses independently layer-averaged:
+        # enabling Q/O experts must not halve the existing FFN regularization.
+        for prefix, rows, alpha in (
+            ("moe", [s for s in router_stats if "balance_loss" in s],
+             getattr(self.draft_model, "moe_balance_alpha", 0.0)),
+            ("attention_moe", [s["attention"] for s in router_stats if "attention" in s],
+             getattr(self.draft_model, "attention_moe_balance_alpha", 0.0)),
+        ):
+            if not rows:
+                continue
+            balance_loss = torch.stack([s["balance_loss"] for s in rows]).mean()
+            # Local per microbatch; existing DDP/accumulation scaling applies.
+            # Keep original DSpark task metrics comparable with dense runs.
             if self.training:
-                loss = loss + self.draft_model.moe_balance_alpha * balance_loss
-            stats["sums"]["moe_balance_loss"] = balance_loss.detach()
-            stats["denoms"]["moe_balance_loss"] = balance_loss.new_ones(())
-            for layer_id, routing in enumerate(router_stats):
+                loss = loss + alpha * balance_loss
+            stats["sums"][f"{prefix}_balance_loss"] = balance_loss.detach()
+            stats["denoms"][f"{prefix}_balance_loss"] = balance_loss.new_ones(())
+            for layer_id, routing in enumerate(rows):
                 for expert_id in range(routing["counts"].numel()):
                     for suffix, values in (
                         ("fraction", routing["counts"]),
                         ("probability", routing["probability_sums"]),
                     ):
-                        key = f"moe_layer{layer_id}_expert{expert_id}_{suffix}"
+                        key = f"{prefix}_layer{layer_id}_expert{expert_id}_{suffix}"
                         stats["sums"][key] = values[expert_id]
                         stats["denoms"][key] = routing["count"]
         flat_logits = draft_logits.reshape(-1, draft_logits.size(-1))

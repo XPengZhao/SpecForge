@@ -61,11 +61,20 @@ class Qwen3DFlashAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = False
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=config.attention_bias,
-        )
+        attention_moe = getattr(config, "dflash_config", {}).get("attention_moe", {})
+        self.qo_moe = None
+        if attention_moe.get("enabled", False):
+            from .dspark_moe import BlockRoutedQO
+
+            if config.dflash_config.get("projector_type") != "dspark":
+                raise ValueError("Q/O MoE currently requires the DSpark backbone")
+            self.qo_moe = BlockRoutedQO(config)
+        else:
+            self.q_proj = nn.Linear(
+                config.hidden_size,
+                config.num_attention_heads * self.head_dim,
+                bias=config.attention_bias,
+            )
         self.k_proj = nn.Linear(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
@@ -76,11 +85,12 @@ class Qwen3DFlashAttention(nn.Module):
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
+        if self.qo_moe is None:
+            self.o_proj = nn.Linear(
+                config.num_attention_heads * self.head_dim,
+                config.hidden_size,
+                bias=config.attention_bias,
+            )
         self.q_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = kernels.make_rms_norm(self.head_dim, config.rms_norm_eps)
         self.sliding_window = (
@@ -97,11 +107,21 @@ class Qwen3DFlashAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        routing_context: Optional[torch.Tensor] = None,
+        routing_mask: Optional[torch.Tensor] = None,
+        collect_router_stats: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ):
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
-        q = self.q_proj(hidden_states)
+        route = None
+        if self.qo_moe is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q, route = self.qo_moe(
+                hidden_states, routing_context, routing_mask,
+                return_router_stats=collect_router_stats,
+            )
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         k_ctx = self.k_proj(target_hidden)
@@ -136,6 +156,9 @@ class Qwen3DFlashAttention(nn.Module):
             **kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)
+        if self.qo_moe is not None:
+            attn_output = self.qo_moe.project_output(attn_output, route)
+            return attn_output, attn_weights, route[2]
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -155,6 +178,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             kernels=kernels,
         )
         self.mlp = kernels.make_mlp(config)
+        self.ffn_moe_enabled = getattr(config, "dflash_config", {}).get("moe", {}).get("enabled", False)
         self.input_layernorm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -184,7 +208,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     ]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        attn_result = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
             attention_mask=attention_mask,
@@ -194,12 +218,18 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            routing_context=routing_context,
+            routing_mask=routing_mask,
+            collect_router_stats=collect_router_stats,
             **kwargs,
-        )[0]
+        )
+        hidden_states = attn_result[0]
+        attention_stats = attn_result[2] if self.self_attn.qo_moe is not None else None
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if routing_context is not None:
+        router_stats = None
+        if routing_context is not None and self.ffn_moe_enabled:
             hidden_states, router_stats = self.mlp(
                 hidden_states, routing_context, routing_mask,
                 return_router_stats=collect_router_stats,
@@ -208,6 +238,8 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         if routing_context is not None:
+            if attention_stats is not None:
+                router_stats = dict(router_stats or {}, attention=attention_stats)
             return hidden_states, router_stats
         return hidden_states
 
