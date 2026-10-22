@@ -293,6 +293,24 @@ class OnlineDFlashModel(nn.Module):
             )
         assert block_keep_mask is not None
 
+        if getattr(self.draft_model, "late_conditioning", False):
+            # Sample a previous acceptance boundary without changing target
+            # labels. Only the old prefix is visible to the first four layers.
+            if self.training:
+                lag = torch.randint(1, self.block_size + 1, anchor_positions.shape,
+                                    device=device)
+            else:
+                lag = torch.full_like(anchor_positions, self.block_size)
+            old_cutoffs = (anchor_positions - lag).clamp_min(0)
+            anchor_ids = input_ids.gather(1, anchor_positions)
+            output = self.draft_model(late_inputs=dict(
+                target_hidden=hidden_states,
+                anchor_embeddings=self.embed_tokens(anchor_ids),
+                anchors=anchor_positions, keep=block_keep_mask,
+                old_cutoffs=old_cutoffs,
+            ))
+            return anchor_positions, block_keep_mask, output
+
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
         )

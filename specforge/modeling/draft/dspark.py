@@ -296,6 +296,32 @@ class DSparkDraftModel(DFlashDraftModel):
                 "DSparkDraftModel requires " "dflash_config.projector_type='dspark'."
             )
         super().__init__(config)
+        self.late_conditioning = bool(dflash_config.get("late_conditioning", {}).get("enabled", False))
+        if self.late_conditioning:
+            if config.num_hidden_layers != 5 or config.block_size != 7:
+                raise ValueError("4+1 DSpark requires five layers and block_size=7")
+            if any(dflash_config.get(key, {}).get("enabled", False) for key in ("moe", "attention_moe")):
+                raise ValueError("4+1 DSpark currently supports dense layers only")
+            self.future_mask = nn.Parameter(torch.empty(config.hidden_size))
+            nn.init.normal_(self.future_mask, std=config.initializer_range)
+            self.anchor_adapter = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            self._init_weights(self.anchor_adapter)
+
+    def forward(self, *args, late_inputs=None, **kwargs):
+        if not self.late_conditioning:
+            if late_inputs is not None:
+                raise ValueError("late_inputs requires late_conditioning.enabled")
+            return super().forward(*args, **kwargs)
+        if late_inputs is None:
+            raise ValueError("4+1 forward requires explicit old/new context boundaries")
+        from .dspark_late import training_forward
+        return training_forward(self, **late_inputs)
+
+    def spec_generate(self, *args, **kwargs):
+        if not self.late_conditioning:
+            return super().spec_generate(*args, **kwargs)
+        from .dspark_late import generate
+        return generate(self, *args, **kwargs)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)
