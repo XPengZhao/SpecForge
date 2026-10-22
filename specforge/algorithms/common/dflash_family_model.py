@@ -294,10 +294,10 @@ class OnlineDFlashModel(nn.Module):
         assert block_keep_mask is not None
 
         if getattr(self.draft_model, "late_conditioning", False):
-            # Sample a previous acceptance boundary without changing target
-            # labels. Only the old prefix is visible to the first four layers.
+            # Lag zero trains prompt bootstrap; lags 1..7 simulate verification
+            # boundaries. Only the old prefix is visible to the first four layers.
             if self.training:
-                lag = torch.randint(1, self.block_size + 1, anchor_positions.shape,
+                lag = torch.randint(0, self.block_size + 1, anchor_positions.shape,
                                     device=device)
             else:
                 lag = torch.full_like(anchor_positions, self.block_size)

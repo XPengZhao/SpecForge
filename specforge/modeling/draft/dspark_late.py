@@ -9,6 +9,12 @@ from transformers import DynamicCache
 from .dflash import extract_context_feature
 
 
+def bank_start_positions(old_cutoffs, *, bootstrap):
+    """Bootstrap has no verification gap; regular banks skip its anchor/bonus."""
+    bootstrap = torch.as_tensor(bootstrap, device=old_cutoffs.device, dtype=torch.bool)
+    return torch.where(bootstrap, old_cutoffs + 1, old_cutoffs + 2)
+
+
 def _stage(model, states, context, positions, cutoffs, keep, layers):
     # Reuse block isolation, but keep context visibility independent of RoPE
     # positions. A later-position MASK must still see only the OLD prefix.
@@ -55,8 +61,8 @@ def finish_block(model, bank, target_hidden, anchor_embeddings, anchors, bank_st
 
 
 def training_forward(model, target_hidden, anchor_embeddings, anchors, keep, old_cutoffs):
-    # Position zero is a bootstrap case without an earlier verification.
-    starts = torch.where(anchors == 0, torch.ones_like(anchors), old_cutoffs + 2)
+    # A full available prefix is bootstrap at ANY anchor, not just position zero.
+    starts = bank_start_positions(old_cutoffs, bootstrap=old_cutoffs == anchors)
     bank = prepare_bank(model, target_hidden, old_cutoffs, starts, keep)
     return finish_block(model, bank, target_hidden, anchor_embeddings, anchors, starts, keep)
 
@@ -96,7 +102,7 @@ def generate(model, target, input_ids, max_new_tokens, stop_token_ids, temperatu
     keep = torch.ones((1, 1), dtype=torch.bool, device=tokens.device)
     anchor = torch.full((1, 1), prompt_length, device=tokens.device, dtype=torch.long)
     # Bootstrap: all prompt features exist before the initial bonus is bound.
-    starts = anchor + 1
+    starts = bank_start_positions(anchor, bootstrap=True)
     bank = prepare_bank(model, context, anchor, starts, keep)
     stops = set(stop_token_ids or [])
     while tokens.shape[1] < limit:
@@ -116,7 +122,7 @@ def generate(model, target, input_ids, max_new_tokens, stop_token_ids, temperatu
                 temperature=0.0)
         block = torch.cat((bonus, proposals), dim=1)
         # No current-block features enter preparation of the next bank.
-        next_starts = anchor + 2
+        next_starts = bank_start_positions(anchor, bootstrap=False)
         next_bank = prepare_bank(model, context, anchor, next_starts, keep)
         out = target(block, past_key_values=cache, use_cache=True, output_hidden_states=True)
         posterior = out.logits.argmax(-1)

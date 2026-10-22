@@ -61,10 +61,13 @@ runtime.in_flight_high_watermark=1280 \
 runtime.in_flight_low_watermark=1024
 ```
 
-For every sampled final anchor b, training samples a lag uniformly from 1..7
-and sets the old context cutoff to max(b-lag,0). Near the sequence start this
-clamping changes the induced boundary distribution. Anchor zero is a bootstrap
-case with an empty context and bank slots 1..12. Evaluation uses lag 7, clamped
+For every sampled final anchor b, training samples a lag uniformly from 0..7
+and sets the old context cutoff to max(b-lag,0). Lag zero (1/8 probability)
+trains bootstrap: old cutoff equals b, and bank slots start at b+1, exactly as
+in prompt-prefill inference. Positive lags use bank start old_cutoff+2.
+Near the sequence start clamping changes the induced boundary distribution;
+anchor zero is always bootstrap with an empty context and bank slots 1..12.
+Evaluation uses lag 7, clamped
 at zero, for a deterministic conservative delayed-context diagnostic. These are
 teacher-forced boundary simulations, not sampled from live acceptance lengths.
 Real acceptance must be measured with generation.
@@ -79,6 +82,8 @@ memory/time. Start with the launcher's smoke mode before a full run.
 Start from scratch; a baseline/MoE checkpoint is not an exact resume of this
 architecture. Same-architecture resume retains the existing optimizer/LR/data
 cursor contract, with an additional late-conditioning semantics marker.
+The bootstrap fix changes that marker to v2; exact resume from a v1 run is
+intentionally rejected because its boundary sampling distribution differs.
 
 ## Export and synchronous inference
 

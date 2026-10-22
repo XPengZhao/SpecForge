@@ -273,3 +273,55 @@ def test_cuda_flex_training_smoke():
                          target_last_hidden_states=torch.randn(1, 18, 8, device='cuda', dtype=torch.bfloat16))
     loss.backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize('anchor', [0, 1, 8])
+@pytest.mark.parametrize('backend', ['eager', 'sdpa'])
+def test_bootstrap_training_matches_truncated_inference(anchor, backend):
+    from specforge.modeling.draft.dspark_late import bank_start_positions
+    c = config()
+    c._attn_implementation = backend
+    model = DSparkDraftModel(c).eval()
+    context = torch.randn(1, 18, 16)
+    embedding = torch.randn(1, 1, 8)
+    b = torch.tensor([[anchor]])
+    keep = torch.ones_like(b, dtype=torch.bool)
+    training = training_forward(model, context, embedding, b, keep, b)
+    start = bank_start_positions(b, bootstrap=True)
+    assert start.item() == anchor + 1
+    bank = prepare_bank(model, context[:, :anchor], b, start, keep)
+    inference = finish_block(model, bank, context[:, :anchor], embedding, b, start, keep)
+    torch.testing.assert_close(training, inference, atol=2e-6, rtol=2e-5)
+    # Neither stage may read the anchor's target hidden state or later features.
+    changed = context.clone()
+    changed[:, anchor:] += torch.randn_like(changed[:, anchor:]) * 100
+    torch.testing.assert_close(training, training_forward(model, changed, embedding, b, keep, b))
+    training.square().sum().backward()
+    assert model.future_mask.grad is not None and torch.isfinite(model.future_mask.grad).all()
+
+
+def test_training_samples_bootstrap_and_all_regular_boundaries():
+    from unittest.mock import patch
+    from specforge.modeling.draft.dspark_late import bank_start_positions
+    model = DSparkDraftModel(config())
+    wrapper = OnlineDSparkModel(model, nn.Linear(8, 32, bias=False), nn.Embedding(32, 8),
+                               mask_token_id=31, block_size=7, num_anchors=8,
+                               attention_backend='eager')
+    anchors = torch.full((1, 8), 10, dtype=torch.long)
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    seen = []
+    hook = model.register_forward_pre_hook(
+        lambda _, args, kwargs: seen.append(kwargs['late_inputs']), with_kwargs=True)
+    with patch('torch.randint', return_value=torch.arange(8).unsqueeze(0)) as rand:
+        _, _, output = wrapper._forward_draft_blocks(
+            torch.arange(20).unsqueeze(0), torch.randn(1, 20, 16), torch.ones(1, 20),
+            anchor_positions=anchors, block_keep_mask=keep)
+    hook.remove()
+    assert rand.call_args.args[:2] == (0, 8)
+    cutoffs = seen[0]['old_cutoffs']
+    torch.testing.assert_close(cutoffs, anchors - torch.arange(8))
+    starts = bank_start_positions(cutoffs, bootstrap=cutoffs == anchors)
+    # Bootstrap selects offset zero; regular lag L selects L-1.
+    assert (anchors + 1 - starts).tolist() == [[0, 0, 1, 2, 3, 4, 5, 6]]
+    output.square().mean().backward()
+    assert torch.isfinite(model.future_mask.grad).all()

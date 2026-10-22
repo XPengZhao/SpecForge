@@ -94,7 +94,7 @@ def resume_contract(_config, draft_model, training_model):
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
     if getattr(draft_model, "late_conditioning", False):
-        contract["dspark_late_conditioning"] = "4+1-shared-mask-uniform-lag-v1"
+        contract["dspark_late_conditioning"] = "4+1-shared-mask-uniform-lag0to7-v2"
     return contract
 
 

@@ -106,7 +106,7 @@ def test_managed_resume_launches_both_children_with_fresh_state(tmp_path):
         child = _config_for_role(cfg, 'consumer')
         assert child.training.resume_from == '/old/run-step1962'
 
-@pytest.mark.parametrize('failure', ['capture', 'reorder'])
+@pytest.mark.parametrize('failure', ['capture', 'reorder', 'omitted'])
 def test_ordered_capture_fails_instead_of_retrying_out_of_order(tmp_path, failure):
     from tests.test_runtime.test_disagg_multiserver import (
         _FakeMooncakeStore, _StubCaptureServer, MooncakeFeatureStore,
@@ -122,10 +122,19 @@ def test_ordered_capture_fails_instead_of_retrying_out_of_order(tmp_path, failur
     def broken(worker, **kwargs):
         if failure == 'capture':
             raise RuntimeError('capture unavailable')
-        return list(reversed(original(worker, **kwargs)))
+        refs = original(worker, **kwargs)
+        if failure == 'omitted':
+            worker._recent_failures.append('server_capture: simulated store write failure')
+            return refs[1:]
+        return list(reversed(refs))
     with mock.patch.object(RolloutWorker, 'run_once', broken):
-        with pytest.raises(RuntimeError, match='ordered capture failed|changed prompt order'):
+        with pytest.raises(RuntimeError, match='ordered capture failed|changed prompt order') as error:
             drive()
+    if failure == 'omitted':
+        assert 'server_capture: simulated store write failure' in str(error.value)
+        assert 'expected_task_id=' in str(error.value)
+        assert 'actual_task_id=' in str(error.value)
+        assert 'returned_refs=2' in str(error.value)
     assert _published_refs(channel.path) == []
 
 

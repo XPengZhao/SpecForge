@@ -1164,7 +1164,14 @@ def build_disagg_online_producer(
                         for ref in refs:
                             expected = next(expected_task_ids, None)
                             if expected is None or ref.source_task_id != expected:
-                                raise RuntimeError("capture changed prompt order or omitted a sample; refusing to publish")
+                                raise RuntimeError(
+                                    "capture changed prompt order or omitted a sample; "
+                                    "refusing to publish: "
+                                    f"expected_task_id={expected!r}, "
+                                    f"actual_task_id={ref.source_task_id!r}, "
+                                    f"returned_refs={len(refs)}, "
+                                    f"worker_health={w.health()}"
+                                )
                     with publish_lock:
                         current_bytes = reconcile_consumed_locked()
                         ref_sizes = [
