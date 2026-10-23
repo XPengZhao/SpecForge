@@ -12,15 +12,23 @@ HOST="${EVAL_HOST:-http://127.0.0.1}"
 PORT="${EVAL_PORT:-8000}"
 MODEL="${EVAL_MODEL:-qwen38-flash-next}"
 
-NUM_QUESTIONS="${EVAL_NUM_QUESTIONS:-1319}"
+# deepspec uses official JSONL rows and renders exact local tokenizer input IDs.
+PROTOCOL="${EVAL_PROTOCOL:-vllm}"
+case "$PROTOCOL" in
+  vllm) DEFAULT_QUESTIONS=1319; DEFAULT_MAX_TOKENS=4096; DEFAULT_SEED=42; DEFAULT_CONCURRENCY=256 ;;
+  deepspec) DEFAULT_QUESTIONS=500; DEFAULT_MAX_TOKENS=2048; DEFAULT_SEED=980406; DEFAULT_CONCURRENCY=1 ;;
+  *) echo "EVAL_PROTOCOL must be vllm or deepspec" >&2; exit 2 ;;
+esac
+
+NUM_QUESTIONS="${EVAL_NUM_QUESTIONS:-$DEFAULT_QUESTIONS}"
 NUM_SHOTS="${EVAL_NUM_SHOTS:-5}"
-MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
+MAX_TOKENS="${EVAL_MAX_TOKENS:-$DEFAULT_MAX_TOKENS}"
 TEMPERATURE="${EVAL_TEMPERATURE:-0.7}"
 TOP_P="${EVAL_TOP_P:-0.8}"
 TOP_K="${EVAL_TOP_K:-20}"
 MIN_P="${EVAL_MIN_P:-0}"
-SEED="${EVAL_SEED:-42}"
-MAX_CONCURRENCY="${EVAL_MAX_CONCURRENCY:-256}"
+SEED="${EVAL_SEED:-$DEFAULT_SEED}"
+MAX_CONCURRENCY="${EVAL_MAX_CONCURRENCY:-$DEFAULT_CONCURRENCY}"
 REQUEST_TIMEOUT_SECONDS="${EVAL_REQUEST_TIMEOUT_SECONDS:-600}"
 METRICS_WAIT_SECONDS="${EVAL_METRICS_WAIT_SECONDS:-10}"
 
@@ -40,16 +48,25 @@ OUT_ROOT="${EVAL_OUTPUT_DIR:-$ROOT/logs/eval-qwen38-flash-next}"
 # ==================== Evaluation workflow ====================
 STAT_SCRIPT="$SPEC_DIR/scripts/stat_vllm_acceptance.py"
 EVAL_SCRIPT="$VLLM_DIR/tests/evals/gsm8k/gsm8k_eval.py"
+if [[ "$PROTOCOL" == deepspec ]]; then
+  EVAL_SCRIPT="$SPEC_DIR/scripts/evaluate_deepspec_gsm8k.py"
+  DEEPSPEC_DATA="${EVAL_DEEPSPEC_DATA_PATH:-${DEEPSPEC_DIR:-$HOME/DeepSpec}/eval_datasets/gsm8k.jsonl}"
+  TOKENIZER_PATH="${EVAL_TOKENIZER_PATH:-/data1/models/Qwen3-4B}"
+  if [[ ! -f "$DEEPSPEC_DATA" ]]; then
+    echo "Official dataset missing: $DEEPSPEC_DATA (set EVAL_DEEPSPEC_DATA_PATH)" >&2
+    exit 1
+  fi
+fi
 
 if [[ $# -gt 1 || ! "$RUN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
   echo "Usage: bash $0 [run-name: letters, numbers, dots, underscores, hyphens]" >&2
   exit 2
 fi
-if [[ "$USE_CHAT_COMPLETIONS" != true && "$USE_CHAT_COMPLETIONS" != false ]]; then
+if [[ "$PROTOCOL" == vllm && "$USE_CHAT_COMPLETIONS" != true && "$USE_CHAT_COMPLETIONS" != false ]]; then
   echo "USE_CHAT_COMPLETIONS must be true or false" >&2
   exit 2
 fi
-if [[ "$USE_CHAT_COMPLETIONS" == false && ( -n "$CHAT_TEMPLATE_KWARGS" || -n "$REASONING_EFFORT" ) ]]; then
+if [[ "$PROTOCOL" == vllm && "$USE_CHAT_COMPLETIONS" == false && ( -n "$CHAT_TEMPLATE_KWARGS" || -n "$REASONING_EFFORT" ) ]]; then
   echo "CHAT_TEMPLATE_KWARGS and REASONING_EFFORT require USE_CHAT_COMPLETIONS=true" >&2
   exit 2
 fi
@@ -88,13 +105,26 @@ fi
 if [[ -n "$REASONING_EFFORT" ]]; then
   EVAL_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
 fi
+if [[ "$PROTOCOL" == deepspec ]]; then
+  EVAL_ARGS=(
+    --dataset-path "$DEEPSPEC_DATA"
+    --tokenizer "$TOKENIZER_PATH"
+    --host "$HOST" --port "$PORT" --model "$MODEL"
+    --num-questions "$NUM_QUESTIONS" --max-tokens "$MAX_TOKENS"
+    --seed "$SEED" --max-concurrency "$MAX_CONCURRENCY"
+    --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
+    --save-results "$RUN_DIR/gsm8k.json"
+  )
+  echo "DeepSpec protocol: 0-shot, non-thinking, temperature=1, top_p=1, top_k=-1, min_p=0."
+  echo "EVAL_NUM_SHOTS, EVAL_TEMPERATURE/TOP_P/TOP_K/MIN_P and chat options do not apply in this mode."
+fi
 
 "$PYTHON_BIN" "$STAT_SCRIPT" snapshot \
   --url "${HOST%/}:$PORT" \
   --output "$RUN_DIR/before.json" 2>&1 | tee "$RUN_DIR/before.log"
 
 (
-  cd "$VLLM_DIR"
+  if [[ "$PROTOCOL" == vllm ]]; then cd "$VLLM_DIR"; fi
   "$PYTHON_BIN" "$EVAL_SCRIPT" "${EVAL_ARGS[@]}"
 ) 2>&1 | tee "$RUN_DIR/gsm8k.log"
 
