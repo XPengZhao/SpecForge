@@ -93,6 +93,21 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    if getattr(draft_model.config, "draft_attention_type", "gqa") == "mla":
+        contract["dspark_backbone_mla"] = {
+            name: getattr(draft_model.config, name)
+            for name in ("mla_kv_lora_rank", "mla_qk_nope_head_dim",
+                         "mla_qk_rope_head_dim", "mla_v_head_dim")
+        }
+    if getattr(draft_model, "requires_markov_context", False):
+        head = draft_model.markov_head
+        contract["dspark_markov_mla"] = {
+            "version": 1,
+            "residual": False,
+            "context": "strictly_before_anchor",
+            **{name: getattr(head, name) for name in
+               ("markov_rank", "num_heads", "rank", "nope_dim", "rope_dim", "v_dim")},
+        }
     return contract
 
 

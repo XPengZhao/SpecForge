@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel
+from .dflash_kernels import DEFAULT_DFLASH_KERNELS
 from .registry import register_draft
 
 
@@ -259,6 +260,10 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
         return None
 
     markov_head_type = str(dspark_config.get("markov_head_type", "vanilla")).lower()
+    if markov_head_type == "mla":
+        from .markov_mla import MarkovMLAHead
+
+        return MarkovMLAHead(config, dspark_config, DEFAULT_DFLASH_KERNELS)
     if markov_head_type == "vanilla":
         return VanillaMarkovHead(
             vocab_size=config.vocab_size,
@@ -299,6 +304,9 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)
+        self.requires_markov_context = (
+            self.markov_head is not None and self.markov_head.markov_head_type == "mla"
+        )
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
             dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
@@ -325,12 +333,30 @@ class DSparkDraftModel(DFlashDraftModel):
         prev_token_ids: Optional[torch.Tensor] = None,
         prev_token_embeddings: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
+        target_context: Optional[torch.Tensor] = None,
+        query_position_ids: Optional[torch.Tensor] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        context_position_ids: Optional[torch.Tensor] = None,
+        context_valid_mask: Optional[torch.Tensor] = None,
+        attention_backend: Optional[str] = None,
     ) -> torch.Tensor:
         del prev_token_embeddings
         if self.markov_head is None:
             return base_logits
         if prev_token_ids is None:
             raise ValueError("DSparkDraftModel requires prev_token_ids")
+        if self.requires_markov_context:
+            if target_context is None or query_position_ids is None or anchor_positions is None:
+                raise ValueError("MLA Markov head requires target context, query positions and anchors")
+            context = self.markov_head.prepare_context(
+                target_context, context_position_ids, context_valid_mask
+            )
+            return self.markov_head.apply_block_logits(
+                base_logits, token_ids=prev_token_ids, context=context,
+                query_position_ids=query_position_ids, anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask, attention_backend=attention_backend,
+            )
         return self.markov_head.apply_block_logits(
             base_logits,
             token_ids=prev_token_ids,
@@ -354,6 +380,21 @@ class DSparkDraftModel(DFlashDraftModel):
             )
             hidden_states = torch.cat([hidden_states, prev_embeddings], dim=-1)
         return self.confidence_head(hidden_states).float()
+
+    def _sample_draft_tokens(self, target, draft_hidden, block_output_ids):
+        """DSpark slot i predicts anchor+i+1, including the vanilla control."""
+        if self.requires_markov_context:
+            raise ValueError("MLA Markov sampling requires the explicit context path")
+        hidden = draft_hidden[:, : self.block_size - 1]
+        logits = target.lm_head(hidden)
+        if self.markov_head is None:
+            return _sample(logits)
+        tokens, _ = self.markov_head.sample_block_tokens(
+            logits,
+            first_prev_token_ids=block_output_ids[:, 0],
+            hidden_states=hidden,
+        )
+        return tokens
 
 
 __all__ = [
