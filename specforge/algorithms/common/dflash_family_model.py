@@ -279,7 +279,10 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_context: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -327,7 +330,11 @@ class OnlineDFlashModel(nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            **({"return_context": True} if return_context else {}),
         )
+        if return_context:
+            output_hidden, target_context = output_hidden
+            return anchor_positions, block_keep_mask, output_hidden, target_context
         return anchor_positions, block_keep_mask, output_hidden
 
     def forward(
@@ -1163,11 +1170,25 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "flex_attention is not available on this device; use sdpa/eager."
             )
         bsz = input_ids.shape[0]
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
+        needs_context = getattr(self.draft_model, "requires_markov_context", False)
+        result = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            **({"return_context": True} if needs_context else {}),
         )
+        anchor_positions, block_keep_mask, output_hidden = result[:3]
+        head_kwargs = {}
+        if needs_context:
+            head_kwargs = {
+                "target_context": result[3],
+                "query_position_ids": self._create_position_ids(anchor_positions).reshape(
+                    bsz, -1, self.block_size
+                ),
+                "anchor_positions": anchor_positions,
+                "block_keep_mask": block_keep_mask,
+                "attention_backend": self.attention_backend,
+            }
 
         logits = self.lm_head(output_hidden)
         num_blocks = anchor_positions.size(1)
@@ -1192,6 +1213,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             base_logits,
             prev_token_ids=prev_token_ids,
             hidden_states=output_hidden_4d,
+            **head_kwargs,
         )
         confidence_pred = None
         if self.dspark_confidence_head_alpha > 0:

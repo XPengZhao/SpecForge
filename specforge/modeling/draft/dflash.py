@@ -4,7 +4,6 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
-from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     FlashAttentionKwargs,
@@ -378,8 +377,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        return_context: bool = False,
         **kwargs,
-    ) -> CausalLMOutputWithPast:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -394,7 +394,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if return_context:
+            return hidden_states, target_hidden
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(
@@ -422,6 +425,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
+        needs_markov_context = getattr(self, "requires_markov_context", False)
+        markov_context = None
 
         # Prefill stage
         output = target(
@@ -448,6 +453,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
+            context_start = past_key_values_draft.get_seq_length()
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
@@ -457,13 +463,43 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_values=past_key_values_draft,
                 use_cache=True,
                 is_causal=False,
+                **({"return_context": True} if needs_markov_context else {}),
             )
-            past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = self._sample_draft_tokens(
-                target,
-                draft_hidden,
-                block_output_ids,
-            )
+            draft_excess = past_key_values_draft.get_seq_length() - start
+            if draft_excess > 0:
+                past_key_values_draft.crop(-draft_excess)
+            if needs_markov_context:
+                from .markov_gqa import MarkovGQAContext
+
+                draft_hidden, projected_context = draft_hidden
+                new_context = self.markov_head.prepare_context(
+                    projected_context, position_ids[:, context_start:start]
+                )
+                if markov_context is None:
+                    markov_context = new_context
+                else:
+                    markov_context = MarkovGQAContext(
+                        torch.cat((markov_context.key, new_context.key), dim=-2),
+                        torch.cat((markov_context.value, new_context.value), dim=-2),
+                        torch.cat((markov_context.positions, new_context.positions), dim=-1),
+                        torch.cat((markov_context.valid, new_context.valid), dim=-1),
+                    )
+                # Training slot i predicts the token after anchor+i.
+                base_logits = target.lm_head(draft_hidden[:, :block_size - 1])
+                block_output_ids[:, 1:], _ = self.markov_head.sample_block_tokens(
+                    base_logits, first_prev_token_ids=block_output_ids[:, 0],
+                    context=markov_context,
+                    query_position_ids=block_position_ids[:, :block_size - 1],
+                    anchor_positions=block_position_ids[:, 0],
+                    temperature=temperature,
+                    attention_backend="sdpa",
+                )
+            else:
+                block_output_ids[:, 1:] = self._sample_draft_tokens(
+                    target,
+                    draft_hidden,
+                    block_output_ids,
+                )
 
             output = target(
                 block_output_ids,
@@ -487,7 +523,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 :, acceptance_length
             ]
             start += acceptance_length + 1
-            past_key_values_target.crop(start)
+            target_excess = past_key_values_target.get_seq_length() - start
+            if target_excess > 0:
+                past_key_values_target.crop(-target_excess)
             target_hidden = extract_context_feature(
                 output.hidden_states, self.target_layer_ids
             )[:, : acceptance_length + 1, :]
