@@ -93,9 +93,12 @@ def test_head_masks_future_invalid_and_padding_and_has_no_residual(backend):
 
 
 @pytest.mark.parametrize("backend", ["sdpa", "eager", "flex_attention"])
+@pytest.mark.parametrize("kv_heads", [1, 2])
 @torch.no_grad()
-def test_head_parallel_matches_sequential_and_sdpa(backend):
-    head = DSparkDraftModel(config()).markov_head.eval()
+def test_head_parallel_matches_sequential_and_sdpa(backend, kv_heads):
+    c = config()
+    c.dflash_config["markov_gqa"]["num_key_value_heads"] = kv_heads
+    head = DSparkDraftModel(c).markov_head.eval()
     features, anchors, keep, positions, tokens = inputs()
     context = head.prepare_context(features)
     kwargs = {
@@ -212,15 +215,17 @@ def test_production_parameter_count():
     c._attn_implementation = "sdpa"
     with torch.device("meta"):
         model = DSparkDraftModel(c)
-    assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 622_561_537
+    assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 620_988_673
     head = model.markov_head
+    assert head.num_heads == head.num_kv_heads == 8
+    assert c.num_attention_heads == 32 and c.num_key_value_heads == 8
     assert (
         sum(
             p.numel()
             for n, p in head.named_parameters()
             if not n.startswith("markov_w")
         )
-        == 7_340_288
+        == 5_767_424
     )
 
 

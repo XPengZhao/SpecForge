@@ -1,21 +1,24 @@
-# Qwen3-4B：GQA backbone + Markov GQA
+# Qwen3-4B：GQA backbone + Markov MHA
 
 Backbone 沿用 `qwen3-4b-dspark.json` 的 5 层 GQA。仅将 vanilla Markov
-head 改为 `W1 → GQA → W2`：Q 来自前驱 token 的 256 维 embedding，
+head 改为 `W1 → MHA → W2`：Q 来自前驱 token 的 256 维 embedding，
 K/V 来自已有的 target context `C = RMSNorm(FC(target features))`。
 
-Markov GQA 使用 32 个 Q heads、8 个 KV heads、head dimension 128，
+Markov head 使用 8 个 Q heads、8 个 KV heads、head dimension 128，
 带可训练的 per-head Q/K RMSNorm，并使用 backbone 相同的 RoPE 配置。
 输出投影回 256 维；无 residual、FFN 或额外 output norm。
 W1、W2 和 confidence head 的定义不变。
+
+复用 GQA 实现，Q/KV 头数相等时即为 MHA；分支、文件名及配置类型仍保留
+`markov-gqa` / `gqa` 命名。Backbone 仍为 32 Q / 8 KV。
 
 每个 block 的所有步骤只读取严格早于 anchor 的 target context。
 slot `i` 使用 query position `anchor+i`，预测 token `anchor+i+1`。
 K/V 不包含 anchor、MASK 或块内生成的 token。空历史时 Markov bias 为零。
 head 有独立的 K/V 投影；训练中每次 forward 只投影一次上下文，供所有 anchors 复用。
 
-相对 vanilla 新增 **7,340,288** 个参数（含 Q/K RMSNorm），BF16 约
-**14.68 MB**。推理以 BF16 存储 8 个 KV heads 时，每个历史 token 增加
+相对 vanilla 新增 **5,767,424** 个参数（含 Q/K RMSNorm），BF16 约
+**11.53 MB**。推理以 BF16 存储 8 个 KV heads 时，每个历史 token 增加
 **4 KiB** cache；这里不代表训练的峰值显存。
 
 ## 训练
