@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -488,14 +489,38 @@ class TrainerController:
         module.train()
         self.core.metric_window.reset()
         session_start = previous_log_time = time.monotonic()
+        previous_log_step = self.global_step
+        end_step = self.max_steps if self.max_steps is not None else self.total_steps
+        recent_windows = deque(maxlen=5)
+        have_logged_window = False
 
         def log_training(metrics):
-            nonlocal previous_log_time
+            nonlocal previous_log_time, previous_log_step, have_logged_window
             now = time.monotonic()
+            interval = now - previous_log_time
+            steps = self.global_step - previous_log_step
             metrics["elapsed_sec"] = now - session_start
-            metrics["log_interval_sec"] = now - previous_log_time
+            metrics["log_interval_sec"] = interval
+            # Exclude startup/compilation and use only this fit() session.
+            # Weight by completed steps, including partial logging windows.
+            if steps > 0:
+                if have_logged_window:
+                    recent_windows.append((interval, steps))
+                have_logged_window = True
+            if recent_windows:
+                seconds_per_step = sum(t for t, _ in recent_windows) / sum(
+                    n for _, n in recent_windows
+                )
+                metrics["seconds_per_step"] = seconds_per_step
+                if end_step is not None:
+                    metrics["eta_sec"] = max(0, end_step - self.global_step) * seconds_per_step
+            if end_step is not None:
+                metrics["end_step"] = end_step
+                if self.global_step >= end_step:
+                    metrics["eta_sec"] = 0.0
             self.logger(metrics, self.global_step)
             previous_log_time = now
+            previous_log_step = self.global_step
 
         # Rank0-broadcast once: rank-local assembly must not let ranks enter or
         # skip the evaluator's collectives independently.

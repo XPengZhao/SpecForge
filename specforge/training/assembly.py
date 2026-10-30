@@ -301,13 +301,26 @@ def _logger(metrics, step):
     for name, label, scale, unit in (
         ("elapsed_sec", "elapsed", 60, "min"),
         ("log_interval_sec", "interval", 1, "s"),
+        ("seconds_per_step", "sec/step", 1, "s"),
     ):
         for key in (f"train/{name}", name):
             if key in printable:
                 timing.append(f"{label}={printable.pop(key) / scale:.1f}{unit}")
                 break
+    for key in ("train/eta_sec", "eta_sec"):
+        if key in printable:
+            seconds = max(0, round(printable.pop(key)))
+            hours, seconds = divmod(seconds, 3600)
+            minutes, seconds = divmod(seconds, 60)
+            timing.append(f"remaining={hours}h{minutes:02d}m{seconds:02d}s")
+            break
+    step_label = str(step)
+    for key in ("train/end_step", "end_step"):
+        if key in printable:
+            step_label += f"/{int(printable.pop(key))}"
+            break
     suffix = " | " + " | ".join(timing) if timing else ""
-    print(f"step {step}: {printable}{suffix}", flush=True)
+    print(f"step {step_label}: {printable}{suffix}", flush=True)
 
 
 def _configured_logger(cfg: Config):

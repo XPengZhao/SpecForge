@@ -51,6 +51,23 @@ class _Tracker:
 
 
 class TrackingLoggerTest(unittest.TestCase):
+    def test_console_formats_eta_without_mutating_tracker_metrics(self):
+        from specforge.training.assembly import _logger
+        for prefix in ("", "train/"):
+            metrics = {prefix + key: value for key, value in {
+                "loss": 1.0, "elapsed_sec": 600, "log_interval_sec": 130,
+                "seconds_per_step": 13, "eta_sec": 32708, "end_step": 2616,
+            }.items()}
+            original = dict(metrics)
+            with mock.patch.dict("os.environ", {"RANK": "0"}), mock.patch("builtins.print") as output:
+                _logger(metrics, 100)
+            text = output.call_args.args[0]
+            self.assertIn("step 100/2616:", text)
+            self.assertIn("remaining=9h05m08s", text)
+            self.assertIn("sec/step=13.0s", text)
+            self.assertNotIn("eta_sec", text)
+            self.assertEqual(metrics, original)
+
     def test_configured_logger_limits_filter_to_dspark_tensorboard(self):
         from specforge.config import Config
         from specforge.training.assembly import _configured_logger

@@ -491,6 +491,16 @@ does not imply optimizer-state resharding.
 
 Training metrics are printed every `training.log_interval` steps and forwarded
 to the configured tracking backend.
+Console logs also show `sec/step` and estimated `remaining` time once two
+logging windows have completed. The estimate excludes the first window of each
+`fit()` session (startup/compilation), then uses elapsed time divided by completed
+steps across the most recent five windows. It includes data waits and any
+checkpoint/evaluation time inside those windows, without adding GPU synchronization.
+The target is `max_steps` when configured, otherwise `total_steps`; if neither is
+known, remaining time is omitted. `total_steps` is only a fallback estimate when
+it describes a learning-rate horizon rather than the actual data-stream length.
+Resume estimates use the restored global step and newly measured session speed.
+
 
 ## Export a trained draft
 

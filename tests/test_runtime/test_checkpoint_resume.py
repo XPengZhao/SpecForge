@@ -1146,6 +1146,71 @@ class TestFitReentry(unittest.TestCase):
             for i in range(n)
         ]
 
+    def test_eta_excludes_startup_and_uses_remaining_steps_after_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [0.0]
+            logs = []
+            ctrl, _ = self._controller(
+                [], 16, directory, start_step=10, total_steps=160,
+                log_interval=2, logger=lambda metrics, step: logs.append((step, dict(metrics))))
+            def batches():
+                for i, batch in enumerate(self._batches(6)):
+                    clock[0] += 50.0 if i < 2 else 10.0
+                    yield batch
+            with mock.patch("specforge.training.controller.time.monotonic", side_effect=lambda: clock[0]):
+                self.assertEqual(ctrl._fit(batches(), None), 16)
+            self.assertEqual([step for step, _ in logs], [12, 14, 16])
+            self.assertNotIn("eta_sec", logs[0][1])
+            self.assertEqual(logs[1][1]["seconds_per_step"], 10.0)
+            self.assertEqual(logs[1][1]["eta_sec"], 20.0)
+            self.assertEqual(logs[1][1]["end_step"], 16)
+            self.assertEqual(logs[2][1]["eta_sec"], 0.0)
+
+    def test_eta_weights_partial_windows_and_limits_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [0.0]
+            logs = []
+            ctrl, _ = self._controller(
+                [], 13, directory, log_interval=2,
+                logger=lambda metrics, step: logs.append((step, dict(metrics))))
+            # This fake strategy has no log_window payload; retain a pending
+            # window so the controller emits the partial final interval too.
+            ctrl.core.metric_window = mock.Mock(count=1)
+            ctrl.core.metric_window.summary.return_value = None
+            # Discard startup, then evict a slow window from the five-window
+            # history. The last window has one step instead of two.
+            def batches():
+                for i, batch in enumerate(self._batches(13)):
+                    clock[0] += 100.0 if i < 4 else (20.0 if i == 12 else 10.0)
+                    yield batch
+            with mock.patch("specforge.training.controller.time.monotonic", side_effect=lambda: clock[0]):
+                self.assertEqual(ctrl._fit(batches(), None), 13)
+            final = logs[-1][1]
+            self.assertAlmostEqual(final["seconds_per_step"], 100.0 / 9)
+            self.assertEqual(final["eta_sec"], 0.0)
+
+    def test_eta_fallback_and_unknown_total(self):
+        for target in (None, 100):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                clock = [0.0]
+                logs = []
+                ctrl, _ = self._controller(
+                    [], None, directory, total_steps=target, log_interval=2,
+                    logger=lambda metrics, step: logs.append(dict(metrics)))
+                def batches():
+                    for batch in self._batches(4):
+                        clock[0] += 10.0
+                        yield batch
+                with mock.patch("specforge.training.controller.time.monotonic", side_effect=lambda: clock[0]):
+                    ctrl._fit(batches(), None)
+                self.assertEqual(logs[-1]["seconds_per_step"], 10.0)
+                if target is None:
+                    self.assertNotIn("eta_sec", logs[-1])
+                    self.assertNotIn("end_step", logs[-1])
+                else:
+                    self.assertEqual(logs[-1]["end_step"], 100)
+                    self.assertEqual(logs[-1]["eta_sec"], 960.0)
+
     def test_resume_at_max_steps_returns_without_consuming(self):
         class Explode:
             def __iter__(self):
