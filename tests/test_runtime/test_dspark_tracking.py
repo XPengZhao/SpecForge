@@ -24,7 +24,7 @@ class DSparkTrackingTest(unittest.TestCase):
         metrics = {
             "loss": 1.2, "loss_weighted": 1.3, "ce_loss": 0.0,
             "l1_loss": 0.5, "kl_loss": 0.0, "mtp_1_loss": 0.1,
-            "accept_rate@0": 0.8, "tau_probabilistic": 3.0,
+            "accept_rate@0": 0.8, "mtp_1_accuracy": 0.0, "tau_probabilistic": 3.0,
             "confidence_mae": 0.12, "eval/confidence_mae": 0.0,
             "eval/avg_acc": 0.8, "eval/mtp_1_accuracy": 0.8,
             "eval/per_position_acc": [0.8], "eval/accept_rate@0": 0.9,
@@ -40,7 +40,8 @@ class DSparkTrackingTest(unittest.TestCase):
             "train/l1_loss": 0.5, "train/tau_probabilistic": 3.0,
             "train/confidence_mae": 0.12, "eval/confidence_mae": 0.0,
             "train/position_loss/01_ce": 0.1,
-            "eval/mtp_1_accuracy": 0.8, "eval/accept_rate@0": 0.9,
+            "train/accept_rate@0": 0.8, "train/top1_acc@0": 0.0,
+            "eval/top1_acc@0": 0.8, "eval/accept_rate@0": 0.9,
             "eval/simulated_acc_len": 2.0,
         }, 10))
         full = training_metric_names(scalar_metrics(metrics))
@@ -55,6 +56,23 @@ class DSparkTrackingTest(unittest.TestCase):
         self.assertEqual(kl["eval/confidence_mae"], 0.0)
         self.assertNotIn("train/ce_loss", kl)
         self.assertNotIn("train/l1_loss", kl)
+
+    def test_accuracy_tags_are_zero_based_in_both_modes(self):
+        metrics = {
+            f"{phase}/mtp_{i + 1}_accuracy": i / 10
+            for phase in ("train", "eval") for i in range(7)
+        }
+        metrics.update({f"{phase}/accept_rate@{i}": 0.9
+                        for phase in ("train", "eval") for i in range(7)})
+        for mode in ("original", "kl"):
+            for diagnostics in (False, True):
+                selected = dspark_tensorboard_metrics(
+                    metrics, loss_mode=mode, diagnostics=diagnostics)
+                self.assertEqual(len(selected), 28)
+                for phase in ("train", "eval"):
+                    for i in range(7):
+                        self.assertEqual(selected[f"{phase}/top1_acc@{i}"], i / 10)
+                        self.assertEqual(selected[f"{phase}/accept_rate@{i}"], 0.9)
 
     def test_all_positions_are_grouped_by_objective_without_duplicate_tags(self):
         for mode, component in [("original", "ce"), ("kl", "kl")]:

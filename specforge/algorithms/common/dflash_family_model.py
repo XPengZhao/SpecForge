@@ -1221,6 +1221,12 @@ class OnlineDSparkModel(OnlineDFlashModel):
             if self.training:
                 stats["sums"]["acc"] = correct.sum().float()
                 stats["denoms"]["acc"] = accuracy_denom
+                position_correct = correct_3d.sum(dim=(0, 1), dtype=torch.float32)
+                position_count = eval_mask.sum(dim=(0, 1), dtype=torch.float32)
+                for position in range(self.block_size):
+                    name = f"mtp_{position + 1}_accuracy"
+                    stats["sums"][name] = position_correct[position]
+                    stats["denoms"][name] = position_count[position]
                 metrics = {"log_window": stats}
             else:
                 metrics = {

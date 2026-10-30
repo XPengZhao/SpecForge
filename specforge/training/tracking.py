@@ -88,7 +88,7 @@ def dspark_tensorboard_metrics(
     selected = dict(metrics) if diagnostics else {
         key: value for key, value in metrics.items()
         if (key.startswith("train/") and (
-            key[6:] in train or re.fullmatch(r"mtp_\d+_loss", key[6:])
+            key[6:] in train or re.fullmatch(r"mtp_\d+_(loss|accuracy)|accept_rate@\d+", key[6:])
         ))
         or (key.startswith("eval/") and (
             key[5:] in evaluation
@@ -104,6 +104,10 @@ def dspark_tensorboard_metrics(
             phase, index, name = position.groups()
             name = component if name == "loss" else name
             key = f"{phase}/position_loss/{int(index):02d}_{name}"
+        accuracy = re.fullmatch(r"(train|eval)/mtp_(\d+)_accuracy", key)
+        if accuracy:
+            phase, index = accuracy.groups()
+            key = f"{phase}/top1_acc@{int(index) - 1}"
         grouped[key] = value
     return grouped
 

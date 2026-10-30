@@ -122,3 +122,13 @@ def test_forward_routes_through_unique_projection():
     project.assert_called_once()
     assert torch.isfinite(loss) and torch.isfinite(acc)
     assert 'tau_probabilistic' in metrics['log_window']['sums']
+    stats = metrics['log_window']
+    m.eval()
+    _, _, evaluation = m(ids, hidden, mask, target)
+    for i in range(m.block_size):
+        name = f'mtp_{i + 1}_accuracy'
+        torch.testing.assert_close(stats['sums'][name], evaluation['acc_corrects'][i].float())
+        torch.testing.assert_close(stats['denoms'][name], evaluation['acc_denoms'][i].float())
+    torch.testing.assert_close(
+        sum(stats['sums'][f'mtp_{i + 1}_accuracy'] for i in range(m.block_size)),
+        stats['sums']['acc'])

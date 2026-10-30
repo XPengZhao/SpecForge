@@ -369,12 +369,13 @@ names consistently.
 DSpark TensorBoard runs use a compact metric set by default. Training records
 `loss_weighted`, the objective's loss components (`ce_loss` and `l1_loss` for
 `original`, or `kl_loss` for `kl`), `confidence_loss` and `confidence_mae` when
-enabled, `acc`,
+enabled, `acc`, per-position top-1 `top1_acc@k` (zero-based) and
+probabilistic `accept_rate@k` (zero-based),
 `tau_probabilistic`, `grad_norm`, `lr`, `log_interval_sec`, and all per-position
 losses. Evaluation records
 `avg_loss`, the same objective components, `confidence_loss` and `confidence_mae` when enabled,
 `tau_probabilistic`, `simulated_acc_len`, and per-position `accept_rate@k` and
-`mtp_i_accuracy`, plus all per-position losses for the active objective.
+`top1_acc@k`, plus all per-position losses for the active objective.
 `confidence_mae` is the weighted mean absolute error between
 predicted confidence and distribution overlap; lower is better.
 
