@@ -122,8 +122,15 @@ class Qwen3DFlashAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         attn_fn: Callable = eager_attention_forward
+        eager_valid_rows = None
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        elif attention_mask is not None and attention_mask.dtype == torch.bool:
+            # HF eager adds its mask to scores; SDPA accepts True = visible.
+            eager_valid_rows = attention_mask.any(dim=-1).transpose(1, 2).unsqueeze(-1)
+            attention_mask = torch.zeros_like(attention_mask, dtype=q.dtype).masked_fill(
+                ~attention_mask, torch.finfo(q.dtype).min
+            )
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -135,6 +142,9 @@ class Qwen3DFlashAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
+        if eager_valid_rows is not None:
+            # Fully masked rows must be zero, matching SDPA, with finite gradients.
+            attn_output = torch.where(eager_valid_rows, attn_output, 0)
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
