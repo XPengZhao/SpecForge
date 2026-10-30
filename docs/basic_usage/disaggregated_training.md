@@ -372,6 +372,28 @@ High/low thresholds implement hysteresis. The optional hard resident cap rejects
 and cleans a new capture before publication. A partial quantum at EOF is settled
 without dispatch rather than training an incomplete optimizer step.
 
+Steady-state producer progress is summarized per worker (every 30 seconds by
+default, configurable with `DISAGG_PRODUCER_PROGRESS_INTERVAL`):
+
+```text
+[producer-timing] ... worker=rollout-0 throughput=24.3 samples/s in_flight=840 status=producing wait=20%
+```
+
+Throughput counts published samples over wall time since the previous report,
+including waits. `in_flight` counts published samples not yet acknowledged by
+training; it includes samples currently being trained. `status` is the current
+state: `producing`, `waiting_consumer` (reference or byte backpressure), or
+`waiting_peers` (remaining tasks are held by other workers). `wait` is the
+fraction of the reporting window spent sleeping under backpressure, so short
+waits remain visible even if publication has resumed. High `wait` means
+production is being throttled; low throughput alone does not establish a
+producer bottleneck. Correlate with sustained consumer queue waits.
+
+Reports are emitted at publication or wait-loop boundaries, not by a heartbeat
+thread: a synchronous teacher call cannot emit progress until it returns.
+Startup, epoch completion, and error diagnostics remain separate. An interval
+of zero or less disables periodic reports after the first report per worker.
+
 Consumer rank 0 is the only source-channel reader and SQLite writer. At an
 optimizer boundary, `DPAckController` commits sample ids and the durable marker,
 removes their feature objects, then advances the channel counters. A crash

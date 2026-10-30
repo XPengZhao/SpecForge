@@ -31,6 +31,39 @@ from specforge.runtime.data_plane import (
 
 logger = logging.getLogger(__name__)
 
+
+class _ProducerProgress:
+    """Per-worker publication throughput over wall time, including waits."""
+
+    def __init__(self, interval: float, now: float):
+        self.interval = interval
+        self.last_time = now
+        self.produced = 0
+        self.last_produced = 0
+        self.logged = False
+        self.wait_seconds = 0.0
+
+    def update(self, *, now: float, produced: int, in_flight: int, status: str):
+        self.produced += produced
+        if self.logged and (
+            self.interval <= 0 or now - self.last_time < self.interval
+        ):
+            return None
+        duration = now - self.last_time
+        if duration <= 0:
+            return None
+        throughput = (self.produced - self.last_produced) / duration
+        wait_fraction = min(1.0, self.wait_seconds / duration)
+        self.wait_seconds = 0.0
+        self.last_time = now
+        self.last_produced = self.produced
+        self.logged = True
+        return (
+            f"throughput={throughput:.1f} samples/s "
+            f"in_flight={in_flight} status={status} wait={wait_fraction:.0%}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Shared assemblers — strategy- and topology-agnostic.
 # ---------------------------------------------------------------------------
@@ -1047,12 +1080,10 @@ def build_disagg_online_producer(
         publish_lock = threading.Lock()
         state = {
             "produced": 0,
-            "first_ref_logged": False,
             "accounted_consumed": channel.consumed_remote(),
             "resident_bytes": 0,
         }
         published_sizes = deque()
-        last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
 
         def pool_drained() -> bool:
@@ -1084,7 +1115,18 @@ def build_disagg_online_producer(
 
         def run_worker(w) -> None:
             failures = 0
-            last_backpressure_log = 0.0
+            progress = _ProducerProgress(progress_interval, time.perf_counter())
+
+            def log_progress(status: str, produced: int = 0) -> None:
+                message = progress.update(
+                    now=time.perf_counter(),
+                    produced=produced,
+                    in_flight=channel.in_flight_remote(),
+                    status=status,
+                )
+                if message is not None:
+                    producer_timing(f"worker={w.worker_id} {message}")
+
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     return
@@ -1096,22 +1138,7 @@ def build_disagg_online_producer(
                     in_flight_refs=_infl,
                     resident_bytes=_resident,
                 ):
-                    now = time.perf_counter()
-                    if (
-                        progress_interval > 0
-                        and now - last_backpressure_log >= progress_interval
-                    ):
-                        st = controller.status()
-                        producer_timing(
-                            "backpressure wait "
-                            f"worker={w.worker_id} produced={state['produced']} "
-                            f"in_flight={channel.in_flight_remote()} "
-                            f"resident_bytes={resident_bytes()} "
-                            f"pending={st['prompts_pending']} "
-                            f"leased={st['prompts_leased']} "
-                            f"elapsed={elapsed(drive_start)}"
-                        )
-                        last_backpressure_log = now
+                    log_progress("waiting_consumer")
                     if should_stop is not None and should_stop():
                         return
                     if (
@@ -1124,11 +1151,12 @@ def build_disagg_online_producer(
                             f"{peer_wait_timeout_s:.0f}s waiting for consumer "
                             f"progress (in_flight={_infl})"
                         )
+                    wait_start = time.perf_counter()
                     sleep(backpressure_poll_s)
+                    progress.wait_seconds += time.perf_counter() - wait_start
                     _infl = channel.in_flight_remote()
                     _resident = resident_bytes()
                 try:
-                    run_once_start = time.perf_counter()
                     refs = w.run_once(max_tasks=worker_lease)
                 except Exception as exc:
                     if ordered_prompts:
@@ -1202,26 +1230,7 @@ def build_disagg_online_producer(
                         published_sizes.extend(ref_sizes)
                         state["resident_bytes"] = projected_bytes
                         state["produced"] += len(refs)
-                        now = time.perf_counter()
-                        should_log = not state["first_ref_logged"]
-                        should_log = should_log or (
-                            progress_interval > 0
-                            and now - last_publish_log["t"] >= progress_interval
-                        )
-                        if should_log:
-                            st = controller.status()
-                            producer_timing(
-                                "published refs "
-                                f"worker={w.worker_id} batch={len(refs)} "
-                                f"produced={state['produced']} "
-                                f"in_flight={channel.in_flight_remote()} "
-                                f"pending={st['prompts_pending']} "
-                                f"leased={st['prompts_leased']} "
-                                f"run_once_elapsed={elapsed(run_once_start)} "
-                                f"elapsed={elapsed(drive_start)}"
-                            )
-                            state["first_ref_logged"] = True
-                            last_publish_log["t"] = now
+                        log_progress("producing", produced=len(refs))
                 elif pool_drained():
                     producer_timing(
                         f"pool drained worker={w.worker_id} produced={state['produced']} "
@@ -1231,6 +1240,7 @@ def build_disagg_online_producer(
                 else:
                     # leased nothing: peers hold the remaining prompts (their
                     # leases may yet fail back into the pool) — wait, retry.
+                    log_progress("waiting_peers")
                     sleep(backpressure_poll_s)
 
         def ingest_epoch(epoch: int) -> None:
