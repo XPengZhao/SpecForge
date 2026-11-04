@@ -152,7 +152,8 @@ async def snapshot(session, url):
         return {"url": url, "series": parse_metrics(await response.text())}
 
 
-async def generate(session, url, args, tasks, raw_path):
+async def generate(session, url, args, tasks, raw_path, *, payload_fn=None):
+    payload_fn = payload_fn or request_payload
     semaphore = asyncio.Semaphore(args.max_concurrency)
 
     async def one(index, task):
@@ -166,7 +167,7 @@ async def generate(session, url, args, tasks, raw_path):
             try:
                 async with session.post(
                     url + "/v1/chat/completions",
-                    json=request_payload(args, task, index),
+                    json=payload_fn(args, task, index),
                     timeout=aiohttp.ClientTimeout(total=args.request_timeout_seconds),
                 ) as response:
                     text = await response.text()
