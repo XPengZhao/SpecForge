@@ -260,6 +260,10 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
         return None
 
     markov_head_type = str(dspark_config.get("markov_head_type", "vanilla")).lower()
+    if markov_head_type == "token_attention":
+        from .markov_token_attn import MarkovTokenAttentionHead
+
+        return MarkovTokenAttentionHead(config, dspark_config, DEFAULT_DFLASH_KERNELS)
     if markov_head_type == "gqa":
         from .markov_gqa import MarkovGQAHead
 
@@ -307,6 +311,10 @@ class DSparkDraftModel(DFlashDraftModel):
         self.requires_markov_context = (
             self.markov_head is not None and self.markov_head.markov_head_type == "gqa"
         )
+        self.requires_markov_token_history = (
+            self.markov_head is not None
+            and self.markov_head.markov_head_type == "token_attention"
+        )
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
             dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
@@ -334,6 +342,7 @@ class DSparkDraftModel(DFlashDraftModel):
         prev_token_embeddings: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
         target_context: Optional[torch.Tensor] = None,
+        history_token_ids: Optional[torch.Tensor] = None,
         query_position_ids: Optional[torch.Tensor] = None,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
@@ -346,17 +355,20 @@ class DSparkDraftModel(DFlashDraftModel):
             return base_logits
         if prev_token_ids is None:
             raise ValueError("DSparkDraftModel requires prev_token_ids")
-        if self.requires_markov_context:
+        if self.requires_markov_context or self.requires_markov_token_history:
+            context_input = (
+                history_token_ids if self.requires_markov_token_history else target_context
+            )
             if (
-                target_context is None
+                context_input is None
                 or query_position_ids is None
                 or anchor_positions is None
             ):
                 raise ValueError(
-                    "GQA Markov head requires target context, query positions and anchors"
+                    "Attention Markov head requires context, query positions and anchors"
                 )
             context = self.markov_head.prepare_context(
-                target_context, context_position_ids, context_valid_mask
+                context_input, context_position_ids, context_valid_mask
             )
             return self.markov_head.apply_block_logits(
                 base_logits,
@@ -393,8 +405,8 @@ class DSparkDraftModel(DFlashDraftModel):
 
     def _sample_draft_tokens(self, target, draft_hidden, block_output_ids):
         """DSpark slot i predicts anchor+i+1, including the vanilla control."""
-        if self.requires_markov_context:
-            raise ValueError("GQA Markov sampling requires the explicit context path")
+        if self.requires_markov_context or self.requires_markov_token_history:
+            raise ValueError("Attention Markov sampling requires the explicit context path")
         hidden = draft_hidden[:, : self.block_size - 1]
         logits = target.lm_head(hidden)
         if self.markov_head is None:

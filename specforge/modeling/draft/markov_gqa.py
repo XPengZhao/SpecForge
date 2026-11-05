@@ -75,6 +75,10 @@ class MarkovGQAHead(nn.Module):
     def get_prev_embeddings(self, token_ids):
         return self.markov_w1(token_ids.long())
 
+    def context_limits(self, query_position_ids, anchor_positions, steps):
+        """Exclusive upper position bound for each query's visible context."""
+        return anchor_positions.repeat_interleave(steps, dim=1)
+
     def prepare_context(
         self, target_context, context_position_ids=None, context_valid_mask=None
     ):
@@ -143,7 +147,9 @@ class MarkovGQAHead(nn.Module):
         q = self.q_norm(q)
         cos, sin = self.rotary_emb(z, query_position_ids.reshape(batch, blocks * steps))
         q = q * cos[:, None] + rotate_half(q) * sin[:, None]
-        anchors = anchor_positions.repeat_interleave(steps, dim=1)
+        kv_end_positions = self.context_limits(
+            query_position_ids, anchor_positions, steps
+        )
         keep = block_keep_mask.repeat_interleave(steps, dim=1)
         length = context.key.size(-2)
         backend = attention_backend or self.backend
@@ -169,7 +175,7 @@ class MarkovGQAHead(nn.Module):
                     & (ki < length)
                     & keep[b, sq]
                     & context.valid[b, sk]
-                    & (context.positions[b, sk] < anchors[b, sq])
+                    & (context.positions[b, sk] < kv_end_positions[b, sq])
                 )
 
             mask = create_block_mask(
@@ -190,7 +196,7 @@ class MarkovGQAHead(nn.Module):
                 enable_gqa=True,
             )
         else:
-            allowed = context.positions[:, None, :] < anchors[:, :, None]
+            allowed = context.positions[:, None, :] < kv_end_positions[:, :, None]
             allowed = allowed & context.valid[:, None, :] & keep[:, :, None]
             out = F.scaled_dot_product_attention(
                 q,
@@ -208,7 +214,7 @@ class MarkovGQAHead(nn.Module):
             if length
             else torch.full((batch,), torch.iinfo(torch.long).max, device=q.device)
         )
-        visible = keep & (anchors > first_valid[:, None])
+        visible = keep & (kv_end_positions > first_valid[:, None])
         out = torch.where(visible[:, None, :, None], out, 0)
         latent = self.o_proj(
             out.transpose(1, 2).reshape(

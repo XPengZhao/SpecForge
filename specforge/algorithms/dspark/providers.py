@@ -110,6 +110,24 @@ def resume_contract(_config, draft_model, training_model):
                 for name in ("markov_rank", "num_heads", "num_kv_heads", "head_dim")
             },
         }
+    if getattr(draft_model, "requires_markov_token_history", False):
+        head = draft_model.markov_head
+        contract["dspark_markov_token_attention"] = {
+            "version": 1,
+            "context": "token_history_through_query",
+            "query_position": "anchor_plus_slot",
+            "residual": True,
+            "output_norm": "rms_norm_with_bias",
+            "qk_norm": True,
+            "rms_norm_eps": draft_model.config.rms_norm_eps,
+            "rope_parameters": getattr(draft_model.config, "rope_parameters", None),
+            "rope_theta": getattr(draft_model.config, "rope_theta", None),
+            "rope_scaling": getattr(draft_model.config, "rope_scaling", None),
+            **{
+                name: getattr(head, name)
+                for name in ("markov_rank", "num_heads", "num_kv_heads", "head_dim")
+            },
+        }
     return contract
 
 

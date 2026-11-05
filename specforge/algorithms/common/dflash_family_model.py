@@ -1171,6 +1171,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
         bsz = input_ids.shape[0]
         needs_context = getattr(self.draft_model, "requires_markov_context", False)
+        needs_token_history = getattr(
+            self.draft_model, "requires_markov_token_history", False
+        )
         result = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
@@ -1179,9 +1182,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         anchor_positions, block_keep_mask, output_hidden = result[:3]
         head_kwargs = {}
-        if needs_context:
+        if needs_context or needs_token_history:
             head_kwargs = {
-                "target_context": result[3],
                 "query_position_ids": self._create_position_ids(anchor_positions).reshape(
                     bsz, -1, self.block_size
                 ),
@@ -1189,6 +1191,10 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "block_keep_mask": block_keep_mask,
                 "attention_backend": self.attention_backend,
             }
+            if needs_token_history:
+                head_kwargs["history_token_ids"] = input_ids
+            else:
+                head_kwargs["target_context"] = result[3]
 
         logits = self.lm_head(output_hidden)
         num_blocks = anchor_positions.size(1)

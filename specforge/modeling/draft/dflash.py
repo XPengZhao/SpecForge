@@ -426,6 +426,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
         needs_markov_context = getattr(self, "requires_markov_context", False)
+        needs_token_history = getattr(self, "requires_markov_token_history", False)
         markov_context = None
 
         # Prefill stage
@@ -493,6 +494,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     anchor_positions=block_position_ids[:, 0],
                     temperature=temperature,
                     attention_backend="sdpa",
+                )
+            elif needs_token_history:
+                # Rebuild only the committed prefix; rejected local KV must not survive.
+                token_context = self.markov_head.prepare_context(
+                    output_ids[:, :start], position_ids[:, :start]
+                )
+                base_logits = target.lm_head(draft_hidden[:, :block_size - 1])
+                block_output_ids[:, 1:], _ = self.markov_head.sample_block_tokens(
+                    base_logits, first_prev_token_ids=block_output_ids[:, 0],
+                    context=token_context,
+                    query_position_ids=block_position_ids[:, :block_size - 1],
+                    anchor_positions=block_position_ids[:, 0],
+                    temperature=temperature, attention_backend="sdpa",
                 )
             else:
                 block_output_ids[:, 1:] = self._sample_draft_tokens(
