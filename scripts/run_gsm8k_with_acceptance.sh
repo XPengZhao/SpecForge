@@ -13,7 +13,7 @@ PORT="${EVAL_PORT:-8000}"
 MODEL="${EVAL_MODEL:-qwen38-flash-next}"
 
 NUM_QUESTIONS="${EVAL_NUM_QUESTIONS:-1319}"
-NUM_SHOTS="${EVAL_NUM_SHOTS:-5}"
+NUM_SHOTS="${EVAL_NUM_SHOTS:-0}"
 MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
 TEMPERATURE="${EVAL_TEMPERATURE:-0.7}"
 TOP_P="${EVAL_TOP_P:-0.8}"
@@ -79,6 +79,9 @@ EVAL_ARGS=(
   --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
   --save-results "$RUN_DIR/gsm8k.json"
 )
+if [[ "${EVAL_GSM8K_SAVE_DETAILS:-false}" == true ]]; then
+  EVAL_ARGS+=(--save-details "$RUN_DIR/responses.jsonl")
+fi
 if [[ "$USE_CHAT_COMPLETIONS" == true ]]; then
   EVAL_ARGS+=(--use-chat-completions)
 fi
