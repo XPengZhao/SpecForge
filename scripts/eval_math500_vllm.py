@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate MATH-500 through a running vLLM chat endpoint.
+"""Evaluate MATH-500 or AIME 2024 through a running vLLM chat endpoint.
 
 Install client dependencies:
     pip install aiohttp datasets 'math-verify[antlr4_13_2]==0.9.0'
@@ -21,7 +21,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-DATASET = "HuggingFaceH4/MATH-500"
+DATASETS = {
+    "math500": ("HuggingFaceH4/MATH-500", "test", 500),
+    "aime": ("Maxwell-Jia/AIME_2024", "train", 30),
+}
 INSTRUCTION = (
     "Please reason step by step, and put your final answer within "
     "\\boxed{}."
@@ -30,6 +33,7 @@ INSTRUCTION = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=DATASETS, default="math500")
     parser.add_argument("--server-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="qwen38-flash-next")
     parser.add_argument("--data-path", type=Path, help="JSONL with problem and answer.")
@@ -71,13 +75,23 @@ def load_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
     else:
         from datasets import load_dataset
 
-        rows = list(load_dataset(DATASET, split="test"))
-        if len(rows) != 500:
-            raise ValueError(f"Expected 500 MATH-500 rows, found {len(rows)}")
+        name, split, size = DATASETS[args.dataset]
+        rows = list(load_dataset(name, split=split))
+        if len(rows) != size:
+            raise ValueError(f"Expected {size} {name} rows, found {len(rows)}")
     rows = rows[: args.limit]
     if not rows:
         raise ValueError("No questions to evaluate")
     for index, row in enumerate(rows):
+        if args.dataset == "aime":
+            answer = row.get("Answer", row.get("answer"))
+            if not re.fullmatch(r"[0-9]{1,3}", str(answer).strip()):
+                raise ValueError(f"Row {index} needs an AIME integer answer in [0, 999]")
+            row = rows[index] = {
+                "problem": row.get("Problem", row.get("problem")),
+                "answer": str(int(answer)),
+                "unique_id": row.get("ID", row.get("unique_id", index)),
+            }
         for field in ("problem", "answer"):
             if not isinstance(row.get(field), str) or not row[field].strip():
                 raise ValueError(f"Row {index} needs a nonempty {field!r} string")
@@ -270,7 +284,7 @@ def main() -> int:
             raise ValueError(f"Cannot parse gold answer at row {index}: {rows[index]['answer']}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     print(
-        f"Running MATH-500: {len(rows)} questions, 0-shot, thinking={args.thinking}, "
+        f"Running {args.dataset}: {len(rows)} questions, 0-shot, thinking={args.thinking}, "
         f"temperature={args.temperature}, max_tokens={args.max_tokens}", flush=True,
     )
     before = read_spec_metrics(args.server_url)
@@ -291,7 +305,7 @@ def main() -> int:
     grading_errors = sum("grading_error" in record for record in records)
     correct = sum(record["correct"] for record in records)
     summary = {
-        "dataset": DATASET if args.data_path is None else str(args.data_path),
+        "dataset": DATASETS[args.dataset][0] if args.data_path is None else str(args.data_path),
         "num_questions": total,
         "num_shots": 0,
         "model": args.model,
@@ -328,6 +342,8 @@ def main() -> int:
     print(f"Request errors: {errors}; grading errors: {grading_errors}")
     print(f"Latency: {latency:.3f} s; output tokens/s: {tokens / latency:.3f}")
     if spec is not None:
+        if spec["draft_token_acceptance_rate"] is not None:
+            print(f"Acceptance rate: {spec['draft_token_acceptance_rate']:.2%}")
         print(f"MAL: {spec['mal']:.4f}")
         print("Conditional acceptance:", ", ".join(
             f"{rate:.2%}" if rate is not None else "N/A"
@@ -336,7 +352,8 @@ def main() -> int:
     else:
         print(f"Speculative statistics unavailable{': ' + metrics_error if metrics_error else ''}")
     print(f"Results saved to {args.output}")
-    return 1 if errors or grading_errors else 0
+    missing_acceptance = args.dataset == "aime" and (not spec or spec["draft_token_acceptance_rate"] is None)
+    return 1 if errors or grading_errors or missing_acceptance else 0
 
 
 if __name__ == "__main__":

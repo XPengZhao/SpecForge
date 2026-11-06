@@ -79,6 +79,9 @@ EVAL_ARGS=(
   --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
   --save-results "$RUN_DIR/gsm8k.json"
 )
+if [[ "${EVAL_GSM8K_SAVE_DETAILS:-false}" == true ]]; then
+  EVAL_ARGS+=(--save-details "$RUN_DIR/responses.jsonl")
+fi
 if [[ "$USE_CHAT_COMPLETIONS" == true ]]; then
   EVAL_ARGS+=(--use-chat-completions)
 fi
