@@ -128,6 +128,8 @@ def resume_contract(_config, draft_model, training_model):
                 for name in ("markov_rank", "num_heads", "num_kv_heads", "head_dim")
             },
         }
+    if not getattr(draft_model, "sample_from_anchor", True):
+        contract["dspark_markov_token_attention"]["sample_from_anchor"] = False
     return contract
 
 

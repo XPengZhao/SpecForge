@@ -315,6 +315,9 @@ class DSparkDraftModel(DFlashDraftModel):
             self.markov_head is not None
             and self.markov_head.markov_head_type == "token_attention"
         )
+        self.sample_from_anchor = getattr(config, "sample_from_anchor", True)
+        if not self.sample_from_anchor and not self.requires_markov_token_history:
+            raise ValueError("Mask-position DSpark requires the token_attention head")
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
             dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)

@@ -229,14 +229,18 @@ def test_production_parameter_count():
     )
 
 
+@pytest.mark.parametrize("mask_layout", [False, True])
 @torch.no_grad()
-def test_reference_generation_uses_head_and_matches_target_greedy():
+def test_reference_generation_uses_head_and_matches_target_greedy(mask_layout):
     from unittest.mock import patch
 
     from transformers import Qwen3ForCausalLM
 
     torch.manual_seed(12)
-    draft = DSparkDraftModel(config()).eval()
+    c = config(head_type="token_attention" if mask_layout else "gqa")
+    if mask_layout:
+        c.sample_from_anchor = False
+    draft = DSparkDraftModel(c).eval()
     tc = Qwen3Config(
         hidden_size=16,
         intermediate_size=24,
@@ -268,6 +272,8 @@ def test_reference_generation_uses_head_and_matches_target_greedy():
             target, prompt, max_new_tokens=7, stop_token_ids=None, temperature=0.0
         )
     assert sample_head.call_count > 1
+    if mask_layout:
+        assert all(call.args[0].shape[1] == c.block_size for call in sample_head.call_args_list)
     torch.testing.assert_close(actual, expected)
 
 
@@ -490,21 +496,32 @@ def test_gqa_matches_explicit_attention_with_offset_positions():
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
 
 
-def test_hf_export_preserves_head_and_rejects_missing_weights(tmp_path):
+@pytest.mark.parametrize("mask_layout", [False, True])
+def test_hf_export_preserves_head_and_rejects_missing_weights(tmp_path, mask_layout):
     from specforge.export.checkpoint_io import materialize_draft
     from specforge.export.to_hf import export_to_hf
 
-    c = config()
+    c = config(head_type="token_attention" if mask_layout else "gqa")
+    if mask_layout:
+        c.sample_from_anchor = False
     c.architectures = ["DSparkDraftModel"]
     draft = DSparkDraftModel(c).bfloat16()
     config_path = tmp_path / "draft.json"
     c.to_json_file(config_path)
     state = {"draft_state_dict": draft.state_dict()}
+    if mask_layout:
+        state["dspark_markov_token_attention"] = {"sample_from_anchor": False}
+        old_config_path = tmp_path / "anchor.json"
+        c.sample_from_anchor = True
+        c.to_json_file(old_config_path)
+        with pytest.raises(ValueError, match="sample_from_anchor"):
+            materialize_draft(state, str(old_config_path))
     checkpoint = tmp_path / "training_state.pt"
     torch.save(state, checkpoint)
     dest = tmp_path / "hf"
     export_to_hf(str(checkpoint), str(config_path), str(dest))
     restored = DSparkDraftModel.from_pretrained(dest, attn_implementation="sdpa")
+    assert restored.sample_from_anchor == (not mask_layout)
     assert restored.markov_head.num_kv_heads == 1
     for name, weight in draft.state_dict().items():
         torch.testing.assert_close(restored.state_dict()[name].to(weight.dtype), weight)
@@ -536,3 +553,44 @@ def test_gqa_head_keeps_baseline_backbone_and_confidence_unchanged():
         candidate.predict_confidence(actual, prev_token_ids=tokens),
         baseline.predict_confidence(reference, prev_token_ids=tokens),
     )
+
+
+def test_mask_positions_predict_seven_tokens_without_future_history(monkeypatch):
+    from unittest.mock import patch
+
+    c = config(head_type="token_attention")
+    c.sample_from_anchor = False
+    c.block_size = 7
+    draft = DSparkDraftModel(c)
+    model = OnlineDSparkModel(
+        draft, torch.nn.Linear(16, 23, bias=False), torch.nn.Embedding(23, 16),
+        mask_token_id=22, block_size=7, attention_backend="sdpa", num_anchors=2,
+    )
+    ids = torch.arange(16)[None]
+    features = torch.randn(1, 16, 32)
+    final = torch.randn(1, 16, 16)
+    anchors = torch.tensor([[1, 5]])
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    monkeypatch.setattr(model, "_sample_anchor_positions", lambda *args: (anchors, keep))
+    backbone_outputs = []
+    draft.register_forward_hook(lambda m, args, out: backbone_outputs.append(out))
+    with patch.object(draft, "apply_logits_head", wraps=draft.apply_logits_head) as head:
+        loss, _, stats = model(ids, features, torch.ones_like(ids), final)
+        loss.backward()
+        kwargs = head.call_args.kwargs
+        expected = backbone_outputs[0].reshape(1, 2, 8, 16)[:, :, 1:]
+        torch.testing.assert_close(kwargs["hidden_states"], expected)
+        torch.testing.assert_close(head.call_args.args[0], model.lm_head(expected))
+        prev = anchors[..., None] + torch.arange(7)
+        torch.testing.assert_close(kwargs["prev_token_ids"], prev)
+        torch.testing.assert_close(kwargs["query_position_ids"], prev)
+        assert "mtp_7_accuracy" in stats["log_window"]["sums"]
+        assert "mtp_8_accuracy" not in stats["log_window"]["sums"]
+        before = draft.apply_logits_head(*head.call_args.args, **kwargs)
+        changed = ids.clone()
+        changed[:, 5:] = 21
+        after = draft.apply_logits_head(*head.call_args.args, **{
+            **kwargs, "history_token_ids": changed,
+        })
+        # For anchor 1, predictions at positions 2 through 5 read only IDs <= 4.
+        torch.testing.assert_close(before[:, 0, :4], after[:, 0, :4])

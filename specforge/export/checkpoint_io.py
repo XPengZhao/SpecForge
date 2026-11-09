@@ -88,6 +88,11 @@ def materialize_draft(
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
+    token_attention = state.get("dspark_markov_token_attention")
+    if token_attention is not None and token_attention.get(
+        "sample_from_anchor", True
+    ) != getattr(draft_config, "sample_from_anchor", True):
+        raise ValueError("Draft config sample_from_anchor differs from the training checkpoint")
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:

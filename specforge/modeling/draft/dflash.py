@@ -412,7 +412,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
-        block_size = self.block_size
+        sample_from_anchor = getattr(self, "sample_from_anchor", True)
+        block_size = self.block_size + int(not sample_from_anchor)
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,
@@ -500,7 +501,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 token_context = self.markov_head.prepare_context(
                     output_ids[:, :start], position_ids[:, :start]
                 )
-                base_logits = target.lm_head(draft_hidden[:, :block_size - 1])
+                sample_hidden = draft_hidden[:, :-1] if sample_from_anchor else draft_hidden[:, 1:]
+                base_logits = target.lm_head(sample_hidden)
                 block_output_ids[:, 1:], _ = self.markov_head.sample_block_tokens(
                     base_logits, first_prev_token_ids=block_output_ids[:, 0],
                     context=token_context,

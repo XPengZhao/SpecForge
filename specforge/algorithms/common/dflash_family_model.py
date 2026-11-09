@@ -162,6 +162,7 @@ class OnlineDFlashModel(nn.Module):
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
+        self.query_block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
@@ -211,14 +212,14 @@ class OnlineDFlashModel(nn.Module):
         """Create absolute position IDs for parallel draft blocks."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        offsets = torch.arange(self.query_block_size, device=device).view(1, 1, -1)
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        bs = self.block_size
+        bs = self.query_block_size
         device = input_ids.device
 
         noise_ids = torch.full(
@@ -311,7 +312,7 @@ class OnlineDFlashModel(nn.Module):
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 S=seq_len,
-                block_size=self.block_size,
+                block_size=self.query_block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
             )
@@ -320,7 +321,7 @@ class OnlineDFlashModel(nn.Module):
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 S=seq_len,
-                block_size=self.block_size,
+                block_size=self.query_block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
             )
@@ -762,6 +763,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
         )
+        self.sample_from_anchor = getattr(draft_model, "sample_from_anchor", True)
+        self.query_block_size = block_size + int(not self.sample_from_anchor)
         self.loss_type = "dspark"
         self.dspark_loss_mode = dspark_loss_mode
         self.dspark_ce_loss_alpha = dspark_ce_loss_alpha
@@ -1185,8 +1188,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if needs_context or needs_token_history:
             head_kwargs = {
                 "query_position_ids": self._create_position_ids(anchor_positions).reshape(
-                    bsz, -1, self.block_size
-                ),
+                    bsz, -1, self.query_block_size
+                )[..., : self.block_size],  # Markov Q is at the previous token.
                 "anchor_positions": anchor_positions,
                 "block_keep_mask": block_keep_mask,
                 "attention_backend": self.attention_backend,
@@ -1196,9 +1199,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
             else:
                 head_kwargs["target_context"] = result[3]
 
-        logits = self.lm_head(output_hidden)
         num_blocks = anchor_positions.size(1)
-        output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
+        output_hidden_4d = output_hidden.reshape(
+            bsz, num_blocks, self.query_block_size, -1
+        )
+        if not self.sample_from_anchor:
+            output_hidden_4d = output_hidden_4d[:, :, 1:, :]
+        logits = self.lm_head(output_hidden_4d.flatten(1, 2))
+        base_logits = logits.reshape(bsz, num_blocks, self.block_size, -1)
         (
             target_ids,
             eval_mask,
@@ -1214,7 +1222,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
         )
-        base_logits = logits.reshape(bsz, num_blocks, self.block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
             base_logits,
             prev_token_ids=prev_token_ids,
