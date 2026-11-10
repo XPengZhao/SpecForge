@@ -223,3 +223,52 @@ def test_engram_checkpoint_requires_all_memory_weights_and_same_hash(tmp_path):
     torch.save(record, path)
     with pytest.raises(ValueError, match="hash"):
         warm_start_draft_model(draft, str(path), draft_config=cfg, strategy="dspark")
+
+
+def test_scratch_build_matches_seeded_vanilla_and_anchor_sampling(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    from specforge.algorithms import model_providers
+
+    monkeypatch.setattr(model_providers, "_device", lambda: torch.device("cpu"))
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            draft_checkpoint_path=None,
+            torch_dtype="bfloat16",
+            cache_dir=None,
+            trust_remote_code=False,
+        ),
+        training=SimpleNamespace(attention_backend="sdpa", strategy="dspark"),
+    )
+    torch.manual_seed(42)
+    vanilla = model_providers.build_registered_draft(cfg, config("vanilla"))
+    rng = torch.get_rng_state()
+    torch.manual_seed(42)
+    draft = model_providers.build_registered_draft(cfg, config())
+    assert torch.equal(torch.get_rng_state(), rng)
+    for name, param in vanilla.named_parameters():
+        torch.testing.assert_close(draft.get_parameter(name), param, atol=0, rtol=0)
+    tokens = torch.tensor([[1, 3, 5, 7]])
+    h = torch.randn(1, 4, 16).bfloat16()
+    logits = torch.randn(1, 4, 23).bfloat16()
+    args = dict(prev_token_ids=tokens, hidden_states=h)
+    baseline = vanilla.apply_logits_head(logits, **args)
+
+    def check(model):
+        memory = model.markov_head.memory
+        assert memory.value.weight.count_nonzero() == 0
+        for table in memory.tables:
+            assert 0.01 < table.weight.float().std() < 0.03
+        for norm in (memory.query_norm, memory.key_norm):
+            assert (norm.weight == 1).all()
+        actual = model.apply_logits_head(
+            logits, engram_bucket_ids=memory.bucket_ids(tokens), **args
+        )
+        torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+
+    check(draft)
+    vanilla.save_pretrained(tmp_path)
+    cfg.model.draft_checkpoint_path = str(tmp_path)
+    check(model_providers.build_registered_draft(cfg, config()))

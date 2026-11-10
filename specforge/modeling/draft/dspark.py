@@ -119,10 +119,27 @@ class VanillaMarkovHead(nn.Module):
 
 
 class EngramMarkovHead(VanillaMarkovHead):
-    def __init__(self, config, options, rank):
+    def __init__(self, config, options, rank, initialize_memory=None):
         super().__init__(vocab_size=config.vocab_size, markov_rank=rank)
         self.markov_head_type = "engram"
-        self.memory = EngramMemory(options, config.hidden_size, rank, config.rms_norm_eps)
+        # Shared weights and the subsequent training RNG stream must start
+        # exactly as in vanilla. Training constructs the draft on CPU.
+        device = self.markov_w1.weight.device
+        devices = [] if device.type in ("cpu", "meta") else [device]
+        with torch.random.fork_rng(
+            devices=devices, device_type=device.type if devices else "cuda"
+        ):
+            seed = torch.initial_seed() ^ 0x454E4752414D
+            torch.random.default_generator.manual_seed(seed)
+            if devices:
+                with torch.get_device_module(device).device(device):
+                    torch.get_device_module(device).manual_seed(seed)
+            self.memory = EngramMemory(
+                options, config.hidden_size, rank, config.rms_norm_eps
+            )
+            if initialize_memory is not None:
+                # HF post_init will skip this already-initialized subtree.
+                self.memory.apply(initialize_memory)
 
     def compute_step_bias(self, token_ids, hidden_states, *, bucket_ids=None):
         if bucket_ids is None:
@@ -271,7 +288,9 @@ class RNNMarkovHead(VanillaMarkovHead):
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
 
 
-def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
+def build_markov_head(
+    config, dspark_config: dict, *, initialize_memory=None
+) -> Optional[nn.Module]:
     markov_rank = int(dspark_config.get("markov_rank", 0) or 0)
     if markov_rank < 0:
         raise ValueError(f"markov_rank must be >= 0, got {markov_rank}")
@@ -287,7 +306,9 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
             markov_rank=markov_rank,
         )
     if markov_head_type == "engram":
-        return EngramMarkovHead(config, dspark_config["engram"], markov_rank)
+        return EngramMarkovHead(
+            config, dspark_config["engram"], markov_rank, initialize_memory
+        )
     if markov_head_type == "gated":
         return GatedMarkovHead(
             vocab_size=config.vocab_size,
@@ -327,7 +348,9 @@ class DSparkDraftModel(DFlashDraftModel):
             nn.init.zeros_(module.weight)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
-        self.markov_head = build_markov_head(config, dflash_config)
+        self.markov_head = build_markov_head(
+            config, dflash_config, initialize_memory=self._initialize_weights
+        )
         self.requires_engram_history = isinstance(self.markov_head, EngramMarkovHead)
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(

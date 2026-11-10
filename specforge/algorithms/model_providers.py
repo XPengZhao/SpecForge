@@ -186,7 +186,10 @@ def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from transformers import initialization as hf_init
 
     draft_config._attn_implementation = cfg.training.attention_backend
-    if cfg.model.draft_checkpoint_path:
+    # Vanilla -> Engram warm starts load only the shared tensors. The new
+    # memory still needs real table/Q/K initialization and a zero value map.
+    head_type = (getattr(draft_config, "dflash_config", None) or {}).get("markov_head_type")
+    if cfg.model.draft_checkpoint_path and str(head_type).lower() != "engram":
         with hf_init.no_init_weights():
             draft_model = AutoDraftModel.from_config(
                 draft_config,
