@@ -93,6 +93,8 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    if getattr(draft_model, "requires_engram_history", False):
+        contract["dspark_engram"] = dict(draft_model.config.dflash_config["engram"])
     return contract
 
 

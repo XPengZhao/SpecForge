@@ -88,6 +88,14 @@ def materialize_draft(
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
+    options = getattr(draft_config, "dflash_config", None) or {}
+    engram = None
+    if str(options.get("markov_head_type")).lower() == "engram":
+        engram = options["engram"]
+    if state.get("dspark_engram") != engram:
+        raise ValueError(
+            "Engram checkpoint and export config disagree on hash or table layout"
+        )
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:

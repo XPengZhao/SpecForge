@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel
+from .markov_engram import EngramMemory, EngramValueProjection
 from .registry import register_draft
 
 
@@ -115,6 +116,25 @@ class VanillaMarkovHead(nn.Module):
             sampled_tokens.append(next_token_ids)
             prev_token_ids = next_token_ids
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
+
+
+class EngramMarkovHead(VanillaMarkovHead):
+    def __init__(self, config, options, rank):
+        super().__init__(vocab_size=config.vocab_size, markov_rank=rank)
+        self.markov_head_type = "engram"
+        self.memory = EngramMemory(options, config.hidden_size, rank, config.rms_norm_eps)
+
+    def compute_step_bias(self, token_ids, hidden_states, *, bucket_ids=None):
+        if bucket_ids is None:
+            raise ValueError("Engram requires causal bucket IDs for each prediction")
+        correction = self.memory(bucket_ids, hidden_states)
+        latent = self.get_prev_embeddings(token_ids) + correction
+        return self.project_bias(latent)
+
+    def apply_block_logits(self, base_logits, *, token_ids, hidden_states, bucket_ids):
+        return base_logits + self.compute_step_bias(
+            token_ids, hidden_states, bucket_ids=bucket_ids
+        )
 
 
 class GatedMarkovHead(VanillaMarkovHead):
@@ -255,15 +275,19 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
     markov_rank = int(dspark_config.get("markov_rank", 0) or 0)
     if markov_rank < 0:
         raise ValueError(f"markov_rank must be >= 0, got {markov_rank}")
+    markov_head_type = str(dspark_config.get("markov_head_type", "vanilla")).lower()
     if markov_rank == 0:
+        if markov_head_type == "engram":
+            raise ValueError("Engram requires markov_rank > 0")
         return None
 
-    markov_head_type = str(dspark_config.get("markov_head_type", "vanilla")).lower()
     if markov_head_type == "vanilla":
         return VanillaMarkovHead(
             vocab_size=config.vocab_size,
             markov_rank=markov_rank,
         )
+    if markov_head_type == "engram":
+        return EngramMarkovHead(config, dspark_config["engram"], markov_rank)
     if markov_head_type == "gated":
         return GatedMarkovHead(
             vocab_size=config.vocab_size,
@@ -297,8 +321,14 @@ class DSparkDraftModel(DFlashDraftModel):
             )
         super().__init__(config)
 
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, EngramValueProjection):
+            nn.init.zeros_(module.weight)
+
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.markov_head = build_markov_head(config, dflash_config)
+        self.requires_engram_history = isinstance(self.markov_head, EngramMarkovHead)
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
             dflash_config.get("enable_confidence_head", confidence_alpha > 0.0)
@@ -325,6 +355,7 @@ class DSparkDraftModel(DFlashDraftModel):
         prev_token_ids: Optional[torch.Tensor] = None,
         prev_token_embeddings: Optional[torch.Tensor] = None,
         hidden_states: torch.Tensor,
+        engram_bucket_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del prev_token_embeddings
         if self.markov_head is None:
@@ -335,7 +366,15 @@ class DSparkDraftModel(DFlashDraftModel):
             base_logits,
             token_ids=prev_token_ids,
             hidden_states=hidden_states,
+            **({"bucket_ids": engram_bucket_ids} if self.requires_engram_history else {}),
         )
+
+    def _sample_draft_tokens(self, target, draft_hidden, block_output_ids):
+        if self.requires_engram_history:
+            raise NotImplementedError(
+                "Engram generation requires pre-anchor token history"
+            )
+        return super()._sample_draft_tokens(target, draft_hidden, block_output_ids)
 
     def predict_confidence(
         self,

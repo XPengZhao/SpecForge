@@ -347,7 +347,7 @@ def _runtime_state_file(source: str) -> Optional[str]:
 
 def _load_specforge_draft_state(
     state_path: str, *, expected_strategy: str
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Optional[dict]]:
     import torch
 
     try:
@@ -370,7 +370,7 @@ def _load_specforge_draft_state(
             f"warm-start checkpoint {state_path} was written by strategy "
             f"{saved_strategy!r}; this run trains {expected_strategy!r}"
         )
-    return state["draft_state_dict"]
+    return state["draft_state_dict"], state.get("dspark_engram")
 
 
 def _load_pretrained_draft_state(
@@ -443,11 +443,29 @@ def warm_start_draft_model(
         )
         return report
 
+    engram_options = (
+        draft_config.dflash_config["engram"]
+        if getattr(model, "requires_engram_history", False)
+        else None
+    )
+    source_engram = None
     if runtime_state is not None:
         checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
-        state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
+        state, source_engram = _load_specforge_draft_state(
+            runtime_state, expected_strategy=strategy
+        )
     else:
         checkpoint_format = "pretrained"
+        if engram_options is not None:
+            from transformers import PretrainedConfig
+
+            source_cfg, _ = PretrainedConfig.get_config_dict(source, cache_dir=cache_dir)
+            source_head = source_cfg.get("dflash_config") or {}
+            source_type = str(source_head.get("markov_head_type", "vanilla")).lower()
+            if source_type not in ("vanilla", "engram"):
+                raise ValueError("Engram warm-start requires vanilla or Engram weights")
+            if source_type == "engram":
+                source_engram = source_head["engram"]
         state = _load_pretrained_draft_state(
             source,
             draft_config=draft_config,
@@ -455,6 +473,12 @@ def warm_start_draft_model(
             trust_remote_code=trust_remote_code,
         )
 
+    if source_engram is not None and source_engram != engram_options:
+        raise ValueError("Engram warm-start hash layout differs from checkpoint")
+    if engram_options is not None and source_engram is None and any(
+        "markov_head.memory." in key for key in state
+    ):
+        raise ValueError("Engram warm-start checkpoint lacks its hash layout")
     if not state:
         raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
     try:
@@ -474,6 +498,11 @@ def warm_start_draft_model(
     allowed_missing = set()
     if allow_missing_embedding:
         allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
+    if engram_options is not None and source_engram is None:
+        # A vanilla warm start initializes the complete residual branch locally.
+        allowed_missing.update(
+            k for k in result.missing_keys if k.startswith("markov_head.memory.")
+        )
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(

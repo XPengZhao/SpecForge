@@ -1188,10 +1188,20 @@ class OnlineDSparkModel(OnlineDFlashModel):
             dim=-1,
         )
         base_logits = logits.reshape(bsz, num_blocks, self.block_size, -1)
+        head_kwargs = {}
+        if getattr(self.draft_model, "requires_engram_history", False):
+            buckets = self.draft_model.markov_head.memory.bucket_ids(input_ids)
+            offsets = torch.arange(self.block_size, device=input_ids.device)
+            positions = (anchor_positions[..., None] + offsets).clamp_max(
+                input_ids.size(1) - 1
+            )
+            batch = torch.arange(bsz, device=input_ids.device)[:, None, None]
+            head_kwargs["engram_bucket_ids"] = buckets[batch, positions]
         draft_logits = self.draft_model.apply_logits_head(
             base_logits,
             prev_token_ids=prev_token_ids,
             hidden_states=output_hidden_4d,
+            **head_kwargs,
         )
         confidence_pred = None
         if self.dspark_confidence_head_alpha > 0:
