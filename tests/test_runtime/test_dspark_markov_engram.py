@@ -36,7 +36,24 @@ def config(head="engram"):
     options.update(
         markov_head_type=head, markov_rank=4, mask_token_id=22, target_layer_ids=[1, 2]
     )
-    options["engram"]["bucket_counts"] = [31, 37, 41, 43]
+    options["engram"]["bucket_counts"] = [
+        31,
+        37,
+        41,
+        43,
+        47,
+        53,
+        59,
+        61,
+        67,
+        71,
+        73,
+        79,
+        83,
+        89,
+        97,
+        101,
+    ]
     options["engram"]["head_dim"] = 2
     if head == "vanilla":
         del options["engram"]
@@ -48,7 +65,7 @@ def config(head="engram"):
 def bucket_reference(prefix, options):
     out = []
     for i, count in enumerate(options["bucket_counts"]):
-        n = 2 if i < 2 else 3
+        n = 2 if i < options.get("heads_per_order", 2) else 3
         if len(prefix) < n:
             out.append(-1)
             continue
