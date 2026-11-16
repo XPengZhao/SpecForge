@@ -28,6 +28,7 @@ def model(mode='original', confidence=True, recompute=False):
     if mode == 'ce':
         m.dspark_loss_mode = 'original'
     m.dspark_kl_loss_alpha = 1.0
+    m.dspark_tau_loss_alpha = 0.0
     m.dspark_confidence_head_alpha = float(confidence)
     m.recompute_loss = recompute
     return m

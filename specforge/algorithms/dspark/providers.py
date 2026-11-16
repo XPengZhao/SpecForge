@@ -95,6 +95,10 @@ def resume_contract(_config, draft_model, training_model):
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
     if getattr(draft_model, "requires_engram_history", False):
         contract["dspark_engram"] = dict(draft_model.config.dflash_config["engram"])
+    tau_alpha = float(getattr(training_model, "dspark_tau_loss_alpha", 0.0))
+    if tau_alpha > 0:
+        contract["dspark_tau_loss_alpha"] = tau_alpha
+        contract["dspark_tau_objective_version"] = "mean_valid_block_prefix_deficit_v1"
     return contract
 
 

@@ -62,6 +62,8 @@ class MetricWindow:
         result = dict(zip(names, exported[:size]))
         result['loss'] = exported[size]
         result['loss_weighted'] = sum(w * result[n] for n, w in self.weights.items())
+        if 'tau_loss' in result:
+            result['tau_loss_weighted'] = self.weights.get('tau_loss', 0.0) * result['tau_loss']
         result['log_micro_batches'] = self.count  # per rank, not global samples
         if 'acc' in result:
             result['accuracy_denom'] = exported[size + 1]

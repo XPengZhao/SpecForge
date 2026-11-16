@@ -513,6 +513,7 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = Field(default=0.1, ge=0.0)
     dspark_l1_loss_alpha: float = Field(default=0.9, ge=0.0)
     dspark_kl_loss_alpha: float = Field(default=1.0, ge=0.0)
+    dspark_tau_loss_alpha: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     dspark_confidence_head_alpha: float = Field(default=1.0, ge=0.0)
     #: Recompute the per-position DSpark loss (CE + L1 + confidence) under
     #: gradient checkpointing in backward to cut the loss-step memory peak.

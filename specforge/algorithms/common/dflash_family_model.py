@@ -1,6 +1,8 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import math
+
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -9,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.algorithms.common.dspark_metrics import acceptance_stats
+from specforge.algorithms.common.dspark_metrics import acceptance_stats, tau_loss_terms
 
 try:
     from torch.nn.attention.flex_attention import create_block_mask
@@ -742,6 +744,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_l1_loss_alpha: float = 0.9,
         dspark_kl_loss_alpha: float = 1.0,
         dspark_confidence_head_alpha: float = 1.0,
+        dspark_tau_loss_alpha: float = 0.0,
         recompute_loss: bool = False,
     ):
         super().__init__(
@@ -756,6 +759,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.loss_type = "dspark"
+        if not math.isfinite(dspark_tau_loss_alpha) or dspark_tau_loss_alpha < 0:
+            raise ValueError("dspark_tau_loss_alpha must be finite and >= 0")
+        self.dspark_tau_loss_alpha = float(dspark_tau_loss_alpha)
         self.dspark_loss_mode = dspark_loss_mode
         self.dspark_ce_loss_alpha = dspark_ce_loss_alpha
         self.dspark_l1_loss_alpha = dspark_l1_loss_alpha
@@ -938,6 +944,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             target_probs is not None
             and (
                 (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
+                or self.dspark_tau_loss_alpha > 0
                 or cconf_p is not None
                 or not self.training
             )
@@ -986,12 +993,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
         metric_sums = {}
         metric_denoms = {}
         accept_rates = []
+        tau_accept_rates = []
         use_confidence_loss = (
             confidence_pred is not None and self.dspark_confidence_head_alpha > 0
         )
         needs_target_distribution = (
             self.dspark_loss_mode == "kl"
             or self.dspark_l1_loss_alpha > 0
+            or self.dspark_tau_loss_alpha > 0
             or use_confidence_loss
             or not self.training
         )
@@ -1000,6 +1009,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             and (
                 self.dspark_loss_mode == "kl"
                 or self.dspark_l1_loss_alpha > 0
+                or self.dspark_tau_loss_alpha > 0
                 or use_confidence_loss
             )
         ):
@@ -1040,6 +1050,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     dl_p, tl_p, tids_p, cconf_p
                 )
 
+            if self.dspark_tau_loss_alpha > 0:
+                tau_accept_rates.append((1.0 - 0.5 * l1_p).clamp(0.0, 1.0))
+
             ce_position_sum = (ce_p * wmask_p).sum()
             position_denom = wmask_p.sum()
             ce_loss_sum = ce_loss_sum + ce_position_sum
@@ -1060,6 +1073,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     # still need actual distribution overlap for this metric.
                     if tl_p is not None and (
                         (self.dspark_loss_mode == "original" and self.dspark_l1_loss_alpha > 0)
+                        or self.dspark_tau_loss_alpha > 0
                         or cconf_p is not None
                         or not self.training
                     ):
@@ -1108,6 +1122,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 self.dspark_kl_loss_alpha * kl_loss_sum
                 + self.dspark_confidence_head_alpha * confidence_loss_sum
             )
+        if self.dspark_tau_loss_alpha > 0:
+            tau_num, tau_den = tau_loss_terms(torch.stack(tau_accept_rates, dim=-1), eval_mask)
+            metric_sums["tau_loss"] = tau_num.detach()
+            metric_denoms["tau_loss"] = tau_den.detach()
+            global_tau_denominator = tau_den.detach().clone()
         global_denominator = ce_loss_den.detach().clone()
         world_size = 1
         if (
@@ -1118,11 +1137,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             # Only the denominator belongs on the per-micro-batch collective
             # path. Logging statistics stay local until the window is emitted.
             torch.distributed.all_reduce(global_denominator)
+            if self.dspark_tau_loss_alpha > 0:
+                torch.distributed.all_reduce(global_tau_denominator)
             world_size = torch.distributed.get_world_size()
 
         # FSDP/DDP average gradients across ranks. Compensate so the gradient
         # remains sum(N_r) / sum(D_r), including unequal or empty local masks.
         loss = objective_sum * world_size / global_denominator.clamp_min(1e-6)
+        if self.dspark_tau_loss_alpha > 0:
+            loss = loss + self.dspark_tau_loss_alpha * tau_num * world_size / global_tau_denominator.clamp_min(1.0)
         metric_sums["ce_loss"] = ce_loss_sum.detach()
         metric_denoms["ce_loss"] = ce_loss_den.detach()
         if has_target and needs_target_distribution:
@@ -1140,6 +1163,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             if self.dspark_loss_mode == "original"
             else {"kl_loss": self.dspark_kl_loss_alpha}
         )
+        objective_weights["tau_loss"] = self.dspark_tau_loss_alpha
         objective_weights["confidence_loss"] = self.dspark_confidence_head_alpha
         return loss, {
             "sums": metric_sums,
