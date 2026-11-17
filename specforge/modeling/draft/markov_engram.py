@@ -11,6 +11,14 @@ class EngramValueProjection(nn.Linear):
     """Keep the initial Engram residual zero, including after HF post_init."""
 
 
+class EngramConcatProjection(nn.Linear):
+    """W2 with baseline initialization in its unigram columns only."""
+
+    def __init__(self, rank, memory_width, vocab_size):
+        self.unigram_width = rank
+        super().__init__(rank + memory_width, vocab_size, bias=False)
+
+
 class EngramMemory(nn.Module):
     def __init__(self, config, hidden_size, markov_rank, eps):
         super().__init__()
@@ -40,6 +48,11 @@ class EngramMemory(nn.Module):
         self.tables = nn.ModuleList(
             nn.Embedding(n, head_dim) for n in self.bucket_counts
         )
+        self.fusion = config.get("fusion", "gated")
+        if self.fusion not in ("gated", "concat"):
+            raise ValueError("Engram fusion must be gated or concat")
+        if self.fusion == "concat":
+            return
         self.query = nn.Linear(hidden_size, width, bias=False)
         self.key = nn.Linear(width, width, bias=False)
         self.value = EngramValueProjection(width, markov_rank, bias=False)
@@ -73,6 +86,8 @@ class EngramMemory(nn.Module):
             row = table(ids.clamp_min(0))
             chunks.append(row * (ids >= 0).unsqueeze(-1))
         memory = torch.cat(chunks, dim=-1)
+        if self.fusion == "concat":
+            return memory
         q = self.query_norm(self.query(hidden_states))
         k = self.key_norm(self.key(memory))
         gate = ((q.float() * k.float()).sum(-1, keepdim=True) * self.scale).sigmoid()

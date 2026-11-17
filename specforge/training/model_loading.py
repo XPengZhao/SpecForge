@@ -481,6 +481,19 @@ def warm_start_draft_model(
         raise ValueError("Engram warm-start checkpoint lacks its hash layout")
     if not state:
         raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
+    if engram_options is not None and engram_options.get("fusion") == "concat" and source_engram is None:
+        # Preserve the baseline logits when widening W2 for n-gram inputs.
+        key = "markov_head.markov_w2.weight"
+        if key in state:
+            source_w2 = state[key]
+            expected = model.state_dict()[key]
+            rank = int(draft_config.dflash_config["markov_rank"])
+            if source_w2.shape != (expected.shape[0], rank):
+                raise ValueError("Concat warm-start requires vanilla W2 dimensions")
+            expanded = source_w2.new_zeros(expected.shape)
+            expanded[:, :rank] = source_w2
+            state[key] = expanded
+
     try:
         result = model.load_state_dict(state, strict=False)
     except RuntimeError as exc:

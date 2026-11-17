@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel
-from .markov_engram import EngramMemory, EngramValueProjection
+from .markov_engram import EngramMemory, EngramValueProjection, EngramConcatProjection
 from .registry import register_draft
 
 
@@ -122,6 +122,7 @@ class EngramMarkovHead(VanillaMarkovHead):
     def __init__(self, config, options, rank, initialize_memory=None):
         super().__init__(vocab_size=config.vocab_size, markov_rank=rank)
         self.markov_head_type = "engram"
+        self.concat_memory = options.get("fusion", "gated") == "concat"
         # Shared weights and the subsequent training RNG stream must start
         # exactly as in vanilla. Training constructs the draft on CPU.
         device = self.markov_w1.weight.device
@@ -137,6 +138,14 @@ class EngramMarkovHead(VanillaMarkovHead):
             self.memory = EngramMemory(
                 options, config.hidden_size, rank, config.rms_norm_eps
             )
+            if self.concat_memory:
+                old_w2 = self.markov_w2
+                self.markov_w2 = EngramConcatProjection(
+                    rank, len(options["bucket_counts"]) * options["head_dim"], config.vocab_size
+                )
+                with torch.no_grad():
+                    self.markov_w2.weight.zero_()
+                    self.markov_w2.weight[:, :rank].copy_(old_w2.weight)
             if initialize_memory is not None:
                 # HF post_init will skip this already-initialized subtree.
                 self.memory.apply(initialize_memory)
@@ -145,7 +154,8 @@ class EngramMarkovHead(VanillaMarkovHead):
         if bucket_ids is None:
             raise ValueError("Engram requires causal bucket IDs for each prediction")
         correction = self.memory(bucket_ids, hidden_states)
-        latent = self.get_prev_embeddings(token_ids) + correction
+        unigram = self.get_prev_embeddings(token_ids)
+        latent = torch.cat((unigram, correction), dim=-1) if self.concat_memory else unigram + correction
         return self.project_bias(latent)
 
     def apply_block_logits(self, base_logits, *, token_ids, hidden_states, bucket_ids):
@@ -343,6 +353,15 @@ class DSparkDraftModel(DFlashDraftModel):
         super().__init__(config)
 
     def _init_weights(self, module):
+        if isinstance(module, EngramConcatProjection):
+            # Draw exactly the baseline W2 shape so the RNG stream and logits
+            # match vanilla at initialization, including HF post_init.
+            prefix = module.weight.new_empty(module.out_features, module.unigram_width)
+            nn.init.normal_(prefix, mean=0.0, std=self.config.initializer_range)
+            with torch.no_grad():
+                module.weight.zero_()
+                module.weight[:, :module.unigram_width].copy_(prefix)
+            return
         super()._init_weights(module)
         if isinstance(module, EngramValueProjection):
             nn.init.zeros_(module.weight)
