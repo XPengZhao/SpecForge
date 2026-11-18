@@ -473,8 +473,11 @@ def warm_start_draft_model(
             trust_remote_code=trust_remote_code,
         )
 
-    if source_engram is not None and source_engram != engram_options:
-        raise ValueError("Engram warm-start hash layout differs from checkpoint")
+    if source_engram is not None:
+        from specforge.modeling.draft.markov_engram import engram_weight_layout
+
+        if engram_weight_layout(source_engram) != engram_weight_layout(engram_options):
+            raise ValueError("Engram warm-start hash layout differs from checkpoint")
     if engram_options is not None and source_engram is None and any(
         "markov_head.memory." in key for key in state
     ):

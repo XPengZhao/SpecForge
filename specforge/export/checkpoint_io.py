@@ -86,13 +86,15 @@ def materialize_draft(
     supplied to restore them.
     """
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+    from specforge.modeling.draft.markov_engram import engram_weight_layout
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
     options = getattr(draft_config, "dflash_config", None) or {}
     engram = None
     if str(options.get("markov_head_type")).lower() == "engram":
         engram = options["engram"]
-    if state.get("dspark_engram") != engram:
+    checkpoint_layout = engram_weight_layout(state.get("dspark_engram"))
+    if checkpoint_layout != engram_weight_layout(engram):
         raise ValueError(
             "Engram checkpoint and export config disagree on hash or table layout"
         )

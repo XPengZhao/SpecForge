@@ -7,6 +7,13 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def engram_weight_layout(options):
+    """Return the options that must match when loading trained Engram weights."""
+    if options is None:
+        return None
+    return {key: value for key, value in options.items() if key != "value_init"}
+
+
 class EngramValueProjection(nn.Linear):
     """Keep the initial Engram residual zero, including after HF post_init."""
 
@@ -14,6 +21,9 @@ class EngramValueProjection(nn.Linear):
 class EngramMemory(nn.Module):
     def __init__(self, config, hidden_size, markov_rank, eps):
         super().__init__()
+        value_init = config.get("value_init", "zero")
+        if value_init not in ("zero", "random"):
+            raise ValueError("Engram value_init must be zero or random")
         if config.get("hash_version") != "xor_v1":
             raise ValueError("Unsupported Engram hash_version")
         self.heads_per_order = config.get("heads_per_order", 2)
@@ -42,8 +52,12 @@ class EngramMemory(nn.Module):
         )
         self.query = nn.Linear(hidden_size, width, bias=False)
         self.key = nn.Linear(width, width, bias=False)
-        self.value = EngramValueProjection(width, markov_rank, bias=False)
-        nn.init.zeros_(self.value.weight)
+        # The zero-initialized subclass is also preserved by HF post_init.
+        # A regular Linear follows the same initialization path as the key.
+        value_projection = EngramValueProjection if value_init == "zero" else nn.Linear
+        self.value = value_projection(width, markov_rank, bias=False)
+        if value_init == "zero":
+            nn.init.zeros_(self.value.weight)
         self.query_norm = nn.RMSNorm(width, eps=eps)
         self.key_norm = nn.RMSNorm(width, eps=eps)
         self.scale = 1 / math.sqrt(width)
