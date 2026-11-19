@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -7,10 +8,12 @@ import torch
 from transformers import Qwen3Config
 
 from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
-from specforge.algorithms.dspark.providers import resume_contract
+from specforge.algorithms.dspark.providers import build_draft, resume_contract
+from specforge.config.schema import TrainingConfig
 from specforge.export.checkpoint_io import materialize_draft
 from specforge.cli import main as specforge_cli
 from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.optimizer import BF16Optimizer
 from specforge.training.model_loading import warm_start_draft_model
 from specforge.training.strategies.base import DSparkTrainStrategy
 
@@ -151,6 +154,41 @@ def test_engram_training_alignment_gradient_and_no_future_leakage():
     torch.testing.assert_close(after[0, 0, 0], parallel[0, 0, 0], rtol=0, atol=0)
 
 
+def test_train_engram_only_from_vanilla_checkpoint(tmp_path):
+    src = DSparkDraftModel(config("vanilla"))
+    torch.save({"draft_state_dict": src.state_dict()}, tmp_path / "training_state.pt")
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            draft_checkpoint_path=str(tmp_path),
+            torch_dtype="float32",
+            cache_dir=None,
+            trust_remote_code=False,
+        ),
+        training=TrainingConfig(
+            strategy="dspark", dspark_train_engram_only=True, attention_backend="sdpa"
+        ),
+    )
+    with patch("specforge.algorithms.model_providers._device", return_value="cpu"):
+        draft = build_draft(cfg, config())
+    assert {n for n, p in draft.named_parameters() if p.requires_grad} == {
+        f"markov_head.memory.{n}"
+        for n, _ in draft.markov_head.memory.named_parameters()
+    }
+    model = training(draft)
+    assert resume_contract(cfg, draft, model)["dspark_train_engram_only"]
+    optimizer = BF16Optimizer(model, lr=0.01, total_steps=10, warmup_ratio=0.0)
+    assert set(optimizer.model_params) == set(draft.markov_head.memory.parameters())
+    ids = torch.randint(22, (2, 18))
+    loss, _, _ = model(
+        ids, torch.randn(2, 18, 32), torch.ones_like(ids), torch.randn(2, 18, 16)
+    )
+    loss.backward()
+    optimizer.step()
+    assert draft.markov_head.memory.value.weight.count_nonzero() > 0
+    for name, weight in src.state_dict().items():
+        torch.testing.assert_close(draft.state_dict()[name], weight, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("hf_source", [False, True])
 def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source):
     vanilla = DSparkDraftModel(config("vanilla")).bfloat16()
@@ -180,7 +218,7 @@ def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source):
         draft.markov_head.memory.value.weight.normal_()
     expected = draft.apply_logits_head(base, **kwargs, engram_bucket_ids=buckets)
     wrapped = training(draft)
-    contract = resume_contract(None, draft, wrapped)
+    contract = resume_contract(SimpleNamespace(training=TrainingConfig(strategy="dspark")), draft, wrapped)
     weights = DSparkTrainStrategy(wrapped).checkpoint_state_filter(wrapped.state_dict())
     state = {"draft_state_dict": weights, **contract}
     ckpt = tmp_path / "training_state.pt"

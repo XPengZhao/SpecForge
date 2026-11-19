@@ -36,7 +36,10 @@ from specforge.training.controller import TrainerController, TrainerCore
 _DATA_POSITION_RESET_KEYS = frozenset(
     {"dataset_size", "source_dataset_size", "sampler_shuffle"}
 )
-_LEGACY_RESUME_CONTRACT_DEFAULTS = {"sampler_shuffle": True}
+_LEGACY_RESUME_CONTRACT_DEFAULTS = {
+    "sampler_shuffle": True,
+    "dspark_train_engram_only": False,
+}
 
 logger = logging.getLogger(__name__)
 

@@ -509,6 +509,8 @@ class TrainingConfig(StrictConfigModel):
     dpace_alpha: float = 0.5
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+    #: Freeze the existing DSpark draft and optimize only markov_head.memory.
+    dspark_train_engram_only: bool = False
     dspark_loss_mode: Literal["original", "kl"] = "original"
     dspark_ce_loss_alpha: float = Field(default=0.1, ge=0.0)
     dspark_l1_loss_alpha: float = Field(default=0.9, ge=0.0)
@@ -564,6 +566,8 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.dspark_train_engram_only and self.strategy != "dspark":
+            raise ValueError("training.dspark_train_engram_only requires strategy=dspark")
         if self.resume_learning_rate is not None and self.resume_from is None:
             raise ValueError(
                 "training.resume_learning_rate requires training.resume_from"

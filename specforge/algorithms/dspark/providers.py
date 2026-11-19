@@ -58,7 +58,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     return DSparkTrainStrategy(wrapped_model)
 
 
-def resume_contract(_config, draft_model, training_model):
+def resume_contract(config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
     draft_layers = getattr(draft_model, "mtp", None)
@@ -94,6 +94,7 @@ def resume_contract(_config, draft_model, training_model):
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
     if getattr(draft_model, "requires_engram_history", False):
+        contract["dspark_train_engram_only"] = config.training.dspark_train_engram_only
         contract["dspark_engram"] = dict(draft_model.config.dflash_config["engram"])
     tau_alpha = float(getattr(training_model, "dspark_tau_loss_alpha", 0.0))
     if tau_alpha > 0:
@@ -105,7 +106,13 @@ def resume_contract(_config, draft_model, training_model):
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
-    return build_registered_draft(config, draft_config)
+    draft = build_registered_draft(config, draft_config)
+    if config.training.dspark_train_engram_only:
+        if not getattr(draft, "requires_engram_history", False):
+            raise ValueError("training.dspark_train_engram_only requires an Engram Markov head")
+        draft.requires_grad_(False)
+        draft.markov_head.memory.requires_grad_(True)
+    return draft
 
 
 def apply_draft_overrides(config, draft_config):
