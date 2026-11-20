@@ -511,6 +511,10 @@ class TrainingConfig(StrictConfigModel):
     lambda_base_decay_ratio: float = 0.5
     #: Freeze the existing DSpark draft and optimize only markov_head.memory.
     dspark_train_engram_only: bool = False
+    #: Use Muon for Qwen DSpark backbone linear weights (unsharded matrices).
+    dspark_backbone_muon: bool = False
+    #: Apply 5x learning rate and zero weight decay to the Engram lookup embeddings.
+    dspark_engram_table_5x_lr: bool = False
     dspark_loss_mode: Literal["original", "kl"] = "original"
     dspark_ce_loss_alpha: float = Field(default=0.1, ge=0.0)
     dspark_l1_loss_alpha: float = Field(default=0.9, ge=0.0)
@@ -566,6 +570,13 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.dspark_backbone_muon and (
+            self.strategy != "dspark" or self.dspark_train_engram_only
+            or self.fsdp_sharding != "NO_SHARD"
+        ):
+            raise ValueError("training.dspark_backbone_muon requires DSpark joint training with NO_SHARD")
+        if self.dspark_engram_table_5x_lr and self.strategy != "dspark":
+            raise ValueError("training.dspark_engram_table_5x_lr requires strategy=dspark")
         if self.dspark_train_engram_only and self.strategy != "dspark":
             raise ValueError("training.dspark_train_engram_only requires strategy=dspark")
         if self.resume_learning_rate is not None and self.resume_from is None:

@@ -189,6 +189,64 @@ def test_train_engram_only_from_vanilla_checkpoint(tmp_path):
         torch.testing.assert_close(draft.state_dict()[name], weight, atol=0, rtol=0)
 
 
+def test_backbone_muon_update_and_resume():
+    import copy
+
+    draft = DSparkDraftModel(config())
+    def make_optimizer(model):
+        return BF16Optimizer(model, lr=0.001, total_steps=10, engram_table_5x_lr=True,
+                             backbone_muon=True, warmup_ratio=0.2)
+
+    opt = make_optimizer(draft)
+    adam = {p for group in opt.optimizer.param_groups for p in group["params"]}
+    muon = set(opt.muon.param_groups[0]["params"])
+    assert not adam & muon and adam | muon == set(opt.fp32_params)
+    for (name, p), master in zip(draft.named_parameters(), opt.fp32_params):
+        assert (master in muon) == (name.startswith(("layers.", "fc.")) and p.ndim == 2)
+        p.grad = torch.randn_like(p)
+    before = draft.fc.weight.detach().clone()
+    opt.step()
+    assert not torch.equal(before, draft.fc.weight)
+    other = copy.deepcopy(draft)
+    restored = make_optimizer(other)
+    with patch("specforge.optimizer.print_on_rank0"):
+        restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+    for a, b in zip(draft.parameters(), other.parameters()):
+        a.grad = torch.randn_like(a)
+        b.grad = a.grad.clone()
+    opt.step()
+    restored.step()
+    for a, b in zip(draft.parameters(), other.parameters()):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_engram_table_lr_group_and_resume():
+    model = DSparkDraftModel(config())
+
+    def optimizer():
+        return BF16Optimizer(model, lr=0.001, weight_decay=0.1, total_steps=10,
+                             warmup_ratio=0.2, engram_table_5x_lr=True)
+
+    opt = optimizer()
+    regular, tables = opt.optimizer.param_groups
+    table_params = set(model.markov_head.memory.tables.parameters())
+    assert set(tables["params"]) == {
+        master for p, master in zip(opt.model_params, opt.fp32_params) if p in table_params
+    }
+    assert (regular["weight_decay"], tables["weight_decay"]) == (0.1, 0.0)
+    for _ in range(5):
+        assert tables["lr"] == pytest.approx(5 * regular["lr"])
+        opt.step()
+    restored = optimizer()
+    with patch("specforge.optimizer.print_on_rank0"):
+        restored.load_state_dict(opt.state_dict())
+        restored.rebase_learning_rate(0.002)
+    assert restored.scheduler.base_lrs == pytest.approx([0.002, 0.01])
+    restored.step()
+    regular, tables = restored.optimizer.param_groups
+    assert tables["lr"] == pytest.approx(5 * regular["lr"])
+
+
 @pytest.mark.parametrize("hf_source", [False, True])
 def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source):
     vanilla = DSparkDraftModel(config("vanilla")).bfloat16()

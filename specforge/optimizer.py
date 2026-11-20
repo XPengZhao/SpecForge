@@ -21,6 +21,8 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        engram_table_5x_lr=False,
+        backbone_muon=False,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -31,8 +33,49 @@ class BF16Optimizer:
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
+        adam_masters = self.fp32_params
+        self.muon = None
+        if backbone_muon:
+            from specforge.modeling.draft.dspark import DSparkDraftModel
+
+            draft = next((m for m in model.modules() if isinstance(m, DSparkDraftModel)), None)
+            if draft is None:
+                raise ValueError("dspark_backbone_muon requires a DSparkDraftModel backbone")
+            matrices = {id(m.weight) for root in (draft.fc, draft.layers)
+                        for m in root.modules() if isinstance(m, torch.nn.Linear)}
+            adam_masters, muon_masters = [], []
+            for p, master in zip(self.model_params, self.fp32_params):
+                if id(p) in matrices:
+                    muon_masters.append(master)
+                else:
+                    adam_masters.append(master)
+            if not muon_masters:
+                raise ValueError("Muon requires trainable backbone matrices")
+            self.muon = torch.optim.Muon(muon_masters, lr=lr, weight_decay=weight_decay,
+                                         adjust_lr_fn="match_rms_adamw")
+        groups = adam_masters
+        if engram_table_5x_lr:
+            from specforge.modeling.draft.markov_engram import EngramMemory
+
+            table_ids = {
+                id(p) for module in model.modules() if isinstance(module, EngramMemory)
+                for p in module.tables.parameters() if p.requires_grad
+            }
+            if not table_ids:
+                raise ValueError("training.dspark_engram_table_5x_lr requires trainable Engram tables")
+            adam_ids = {id(p) for p in adam_masters}
+            regular, tables = [], []
+            for parameter, master in zip(self.model_params, self.fp32_params):
+                if id(parameter) in table_ids:
+                    tables.append(master)
+                elif id(master) in adam_ids:
+                    regular.append(master)
+            groups = [
+                {"params": regular},
+                {"params": tables, "lr": 5 * lr, "weight_decay": 0.0},
+            ]
         self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
+            groups, lr=lr, weight_decay=weight_decay
         )
         self.last_grad_norm = None
         self._grad_norm_process_group = None
@@ -114,6 +157,10 @@ class BF16Optimizer:
                 )
         grad_norm = self._clip_grad_norm()
         self.last_grad_norm = grad_norm.detach()
+        if self.muon is not None:
+            self.muon.param_groups[0]["lr"] = self.get_learning_rate()
+            self.muon.step()
+            self.muon.zero_grad()
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
@@ -136,6 +183,10 @@ class BF16Optimizer:
                 f"{saved_max_grad_norm} but this run has "
                 f"max_grad_norm={self.max_grad_norm}"
             )
+        if ("muon_state_dict" in state_dict) != (self.muon is not None):
+            raise ValueError("Checkpoint and current optimizer disagree on backbone Muon")
+        if self.muon is not None:
+            self.muon.load_state_dict(state_dict["muon_state_dict"])
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
@@ -166,6 +217,7 @@ class BF16Optimizer:
 
     def state_dict(self):
         return {
+            **({"muon_state_dict": self.muon.state_dict()} if self.muon is not None else {}),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "max_grad_norm": self.max_grad_norm,
@@ -182,28 +234,29 @@ class BF16Optimizer:
         if not old_peaks or len(old_peaks) != len(self.optimizer.param_groups):
             raise RuntimeError("cannot rebase scheduler with incompatible LR groups")
 
-        ratios = [float(peak_lr) / float(old) for old in old_peaks]
-        for group, ratio in zip(self.optimizer.param_groups, ratios):
+        ratio = float(peak_lr) / float(old_peaks[0])
+        new_peaks = [old * ratio for old in old_peaks]
+        for group, new_peak in zip(self.optimizer.param_groups, new_peaks):
             group["lr"] = float(group["lr"]) * ratio
-            group["initial_lr"] = float(peak_lr)
+            group["initial_lr"] = new_peak
 
-        self.scheduler.base_lrs = [float(peak_lr)] * len(old_peaks)
+        self.scheduler.base_lrs = list(new_peaks)
         if getattr(self.scheduler, "_last_lr", None) is not None:
             self.scheduler._last_lr = [
                 float(lr) * ratio
-                for lr, ratio in zip(self.scheduler._last_lr, ratios)
+                for lr in self.scheduler._last_lr
             ]
 
         after = self.scheduler.after_scheduler
-        after.base_lrs = [float(peak_lr)] * len(old_peaks)
+        after.base_lrs = list(new_peaks)
         if getattr(after, "_last_lr", None) is not None:
             after._last_lr = [
                 float(lr) * ratio
-                for lr, ratio in zip(after._last_lr, ratios)
+                for lr in after._last_lr
             ]
         if hasattr(after, "eta_min"):
             # SpecForge currently uses one scalar eta_min for every group.
-            after.eta_min = float(after.eta_min) * ratios[0]
+            after.eta_min = float(after.eta_min) * ratio
 
         print_on_rank0(
             f"Rebased restored LR schedule from peak {old_peaks[0]:.8g} "
