@@ -65,6 +65,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--seed-offset", type=int, help="Sampling seed = offset + input line number"
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all rows")
@@ -114,13 +117,18 @@ def load_completed_rows(output_path: Path) -> set[int]:
     if not output_path.exists():
         return set()
     completed: set[int] = set()
-    with output_path.open(encoding="utf-8") as handle:
+    with output_path.open("rb+") as handle:
         for output_line, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
             try:
+                if not line.strip() and line.endswith(b"\n"):
+                    continue
                 row = json.loads(line)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                if not line.endswith(b"\n"):
+                    # A killed writer can leave part of its final UTF-8 record.
+                    handle.truncate(handle.tell() - len(line))
+                    logger.warning("Removed incomplete final record in %s", output_path)
+                    break
                 raise ValueError(
                     f"invalid existing output JSON at line {output_line}: {exc}"
                 ) from exc
@@ -130,6 +138,10 @@ def load_completed_rows(output_path: Path) -> set[int]:
                     f"existing output line {output_line} has no integer source_line_number"
                 )
             completed.add(source_line)
+            if not line.endswith(b"\n"):
+                handle.seek(0, 2)
+                handle.write(b"\n")
+                break
     return completed
 
 
@@ -164,7 +176,7 @@ def prompt_from_conversations(
         raise ValueError("conversation prompt must end on a user turn")
     kwargs: dict[str, Any] = {}
     if disable_thinking:
-        kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+        kwargs["enable_thinking"] = False
     prompt = tokenizer.apply_chat_template(
         prefix,
         tokenize=False,
@@ -186,6 +198,7 @@ def post_completion(
     top_p: float,
     end_marker: str,
     timeout: float,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Request one target rollout from the OpenAI-compatible completion API."""
     payload = {
@@ -196,6 +209,8 @@ def post_completion(
         "top_p": top_p,
         "stop": [end_marker],
     }
+    if seed is not None:
+        payload["seed"] = seed
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
@@ -251,6 +266,7 @@ def request_with_retries(
                 top_p=args.top_p,
                 end_marker=args.end_marker,
                 timeout=args.request_timeout,
+                seed=None if args.seed_offset is None else args.seed_offset + source_line,
             )
         except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
             if attempt == args.max_retries:
