@@ -211,8 +211,22 @@ class TestStreamingRefChannel(unittest.TestCase):
             w.publish(_ref(f"s{i}"))
         first = r.poll(max_n=2)
         self.assertEqual(len(first), 2)
+        self.assertLess(r._read_offset, os.path.getsize(self.path))
         rest = r.poll()
         self.assertEqual(len(rest), 3)
+
+    def test_same_reader_resumes_at_partial_record(self):
+        channel = StreamingRefChannel(self.path)
+        channel.publish(_ref("s0"))
+        with open(self.path, "rb+") as stream:
+            record = stream.read()
+            stream.write(record[:-1])
+        self.assertEqual([ref.sample_id for ref in channel.poll()], ["s0"])
+        self.assertEqual(channel.poll(), [])
+        with open(self.path, "ab") as stream:
+            stream.write(b"\n")
+        self.assertEqual([ref.sample_id for ref in channel.poll()], ["s0"])
+        self.assertEqual(channel.poll(), [])
 
     def test_stream_drains_then_stops_on_close(self):
         w = StreamingRefChannel(self.path)

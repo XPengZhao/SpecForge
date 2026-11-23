@@ -18,8 +18,8 @@ that control-plane channel.
   publish); the feature tensors go through the ``FeatureStore`` (Mooncake), so a
   shared *data* mount is never required -- only this small control file.
 * **Append-only JSONL.** ``publish()`` appends one ref per line and fsyncs;
-  ``poll()`` tail-reads complete lines from the last offset, buffering a partial
-  trailing line so a reader never parses a half-written record.
+  ``poll()`` advances past complete lines, leaving a partial trailing record
+  for the next poll.
 * **Consume-once friendly.** The reader marks how many refs it has consumed
   (``mark_consumed``) in a sidecar counter the writer reads back, so the producer
   can apply backpressure (``in_flight_remote``) without any shared in-process
@@ -114,7 +114,6 @@ class StreamingRefChannel:
         self._published = 0
         # consumer-side
         self._read_offset = 0
-        self._buf = ""
         self._consumed = 0
         # ``mark_consumed`` is called from both the trainer thread (batch acks)
         # and the prefetch worker (failure settlement), so the increment and
@@ -316,28 +315,25 @@ class StreamingRefChannel:
         """Return refs appended since the last poll (complete lines only).
 
         Non-blocking: returns whatever is available now (possibly empty). A
-        partially written trailing line is buffered until its newline arrives, so
+        partially written trailing line stays on disk until its newline arrives, so
         a ref is never parsed half-written.
         """
-        try:
-            with open(self.path, "r") as f:
-                f.seek(self._read_offset)
-                chunk = f.read()
-                self._read_offset = f.tell()
-        except FileNotFoundError:
-            chunk = ""
-        if chunk:
-            self._buf += chunk
-        # parse the buffer even when no new bytes arrived -- a previous max_n call
-        # may have left complete lines buffered.
         out: List[SampleRef] = []
-        while "\n" in self._buf:
-            if max_n is not None and len(out) >= max_n:
-                break
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.strip()
-            if line:
-                out.append(ref_from_dict(json.loads(line)))
+        try:
+            stream = open(self.path, "rb")
+        except FileNotFoundError:
+            return out
+        with stream:
+            stream.seek(self._read_offset)
+            # Poll only the bytes already published when this call began.
+            end = os.fstat(stream.fileno()).st_size
+            while self._read_offset < end and (max_n is None or len(out) < max_n):
+                line = stream.readline(end - self._read_offset)
+                if not line.endswith(b"\n"):
+                    break
+                self._read_offset += len(line)
+                if line.strip():
+                    out.append(ref_from_dict(json.loads(line)))
         return out
 
     def mark_consumed(self, n: int) -> None:
