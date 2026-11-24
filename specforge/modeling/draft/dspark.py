@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from .dflash import DFlashDraftModel
-from .markov_engram import EngramMemory, EngramValueProjection
+from .markov_engram import EngramMemory, EngramValueProjection, EngramVectorGateProjection
 from .registry import register_draft
 
 
@@ -343,6 +343,10 @@ class DSparkDraftModel(DFlashDraftModel):
         super().__init__(config)
 
     def _init_weights(self, module):
+        if isinstance(module, EngramVectorGateProjection):
+            nn.init.zeros_(module.weight)
+            nn.init.zeros_(module.bias)
+            return
         super()._init_weights(module)
         if isinstance(module, EngramValueProjection):
             nn.init.zeros_(module.weight)

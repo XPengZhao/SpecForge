@@ -261,10 +261,13 @@ def test_engram_table_lr_group_and_resume():
 
 @pytest.mark.parametrize("hf_source", [False, True])
 @pytest.mark.parametrize("sample_from_anchor", [True, False])
-def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source, sample_from_anchor):
+@pytest.mark.parametrize("vector_gate", [False, True])
+def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source, sample_from_anchor, vector_gate):
     vanilla = DSparkDraftModel(config("vanilla")).bfloat16()
     c = config()
     c.sample_from_anchor = sample_from_anchor
+    if vector_gate:
+        c.dflash_config["engram"]["vector_gate"] = True
     draft = DSparkDraftModel(c).bfloat16()
     src = tmp_path / "vanilla"
     src.mkdir()
@@ -288,6 +291,11 @@ def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source, sample_
     )
     with torch.no_grad():
         draft.markov_head.memory.value.weight.normal_()
+        if vector_gate:
+            assert draft.markov_head.memory.vector_gate_proj.weight.count_nonzero() == 0
+            assert draft.markov_head.memory.vector_gate_proj.bias.count_nonzero() == 0
+            draft.markov_head.memory.vector_gate_proj.weight.normal_(std=0.1)
+            draft.markov_head.memory.vector_gate_proj.bias.normal_(std=0.1)
     expected = draft.apply_logits_head(base, **kwargs, engram_bucket_ids=buckets)
     wrapped = training(draft)
     contract = resume_contract(SimpleNamespace(training=TrainingConfig(strategy="dspark")), draft, wrapped)

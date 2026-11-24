@@ -11,16 +11,27 @@ def engram_weight_layout(options):
     """Return the options that must match when loading trained Engram weights."""
     if options is None:
         return None
-    return {key: value for key, value in options.items() if key != "value_init"}
+    layout = {key: value for key, value in options.items() if key != "value_init"}
+    # Missing and explicitly disabled gates describe the same old architecture.
+    if layout.get("vector_gate") is False:
+        layout.pop("vector_gate")
+    return layout
 
 
 class EngramValueProjection(nn.Linear):
     """Keep the initial Engram residual zero, including after HF post_init."""
 
 
+class EngramVectorGateProjection(nn.Linear):
+    """Zero logits give an identity modulation, 2 * sigmoid(0) = 1."""
+
+
 class EngramMemory(nn.Module):
     def __init__(self, config, hidden_size, markov_rank, eps):
         super().__init__()
+        self.vector_gate = config.get("vector_gate", False)
+        if type(self.vector_gate) is not bool:
+            raise ValueError("Engram vector_gate must be a boolean")
         value_init = config.get("value_init", "zero")
         if value_init not in ("zero", "random"):
             raise ValueError("Engram value_init must be zero or random")
@@ -61,6 +72,17 @@ class EngramMemory(nn.Module):
         self.query_norm = nn.RMSNorm(width, eps=eps)
         self.key_norm = nn.RMSNorm(width, eps=eps)
         self.scale = 1 / math.sqrt(width)
+        if self.vector_gate:
+            # Preserve the RNG stream used by HF to initialize shared weights.
+            device = self.value.weight.device
+            devices = [] if device.type in ("cpu", "meta") else [device]
+            with torch.random.fork_rng(
+                devices=devices, device_type=device.type if devices else "cuda"
+            ):
+                self.vector_gate_norm = nn.RMSNorm(hidden_size, eps=eps)
+                self.vector_gate_proj = EngramVectorGateProjection(hidden_size, markov_rank)
+                nn.init.zeros_(self.vector_gate_proj.weight)
+                nn.init.zeros_(self.vector_gate_proj.bias)
 
     def bucket_ids(self, input_ids):
         """[batch, sequence, 2 * heads_per_order]; -1 denotes unavailable history for that order."""
@@ -91,4 +113,9 @@ class EngramMemory(nn.Module):
         k = self.key_norm(self.key(memory))
         gate = ((q.float() * k.float()).sum(-1, keepdim=True) * self.scale).sigmoid()
         value = self.value(memory)
+        if self.vector_gate:
+            modulation = 2.0 * self.vector_gate_proj(
+                self.vector_gate_norm(hidden_states)
+            ).float().sigmoid()
+            value = modulation.to(value.dtype) * value
         return gate.to(value.dtype) * value
