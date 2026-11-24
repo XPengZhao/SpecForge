@@ -93,6 +93,13 @@ def materialize_draft(
     engram = None
     if str(options.get("markov_head_type")).lower() == "engram":
         engram = options["engram"]
+    if "DSparkDraftModel" in (getattr(draft_config, "architectures", None) or ()):
+        if state.get("dspark_sample_from_anchor", True) != getattr(
+            draft_config, "sample_from_anchor", True
+        ):
+            raise ValueError(
+                "Draft config sample_from_anchor differs from the training checkpoint"
+            )
     checkpoint_layout = engram_weight_layout(state.get("dspark_engram"))
     if checkpoint_layout != engram_weight_layout(engram):
         raise ValueError(

@@ -38,6 +38,7 @@ _DATA_POSITION_RESET_KEYS = frozenset(
 )
 _LEGACY_RESUME_CONTRACT_DEFAULTS = {
     "sampler_shuffle": True,
+    "dspark_sample_from_anchor": True,
     "dspark_train_engram_only": False,
     "dspark_engram_table_5x_lr": False,
 }

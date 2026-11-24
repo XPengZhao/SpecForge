@@ -164,6 +164,7 @@ class OnlineDFlashModel(nn.Module):
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
+        self.query_block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
@@ -213,14 +214,14 @@ class OnlineDFlashModel(nn.Module):
         """Create absolute position IDs for parallel draft blocks."""
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
-        offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        offsets = torch.arange(self.query_block_size, device=device).view(1, 1, -1)
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        bs = self.block_size
+        bs = self.query_block_size
         device = input_ids.device
 
         noise_ids = torch.full(
@@ -310,7 +311,7 @@ class OnlineDFlashModel(nn.Module):
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 S=seq_len,
-                block_size=self.block_size,
+                block_size=self.query_block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
             )
@@ -319,7 +320,7 @@ class OnlineDFlashModel(nn.Module):
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 S=seq_len,
-                block_size=self.block_size,
+                block_size=self.query_block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
             )
@@ -330,6 +331,12 @@ class OnlineDFlashModel(nn.Module):
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
         )
+        if self.query_block_size != self.block_size:
+            # Drop each block's anchor after attention, before any prediction head.
+            blocks = output_hidden.unflatten(
+                1, (anchor_positions.size(1), self.query_block_size)
+            )
+            output_hidden = blocks[:, :, 1:].flatten(1, 2)
         return anchor_positions, block_keep_mask, output_hidden
 
     def forward(
@@ -758,6 +765,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
             loss_decay_gamma=loss_decay_gamma,
             loss_type="dflash",
         )
+        if not getattr(draft_model, "sample_from_anchor", True):
+            self.query_block_size = block_size + 1
         self.loss_type = "dspark"
         if not math.isfinite(dspark_tau_loss_alpha) or dspark_tau_loss_alpha < 0:
             raise ValueError("dspark_tau_loss_alpha must be finite and >= 0")

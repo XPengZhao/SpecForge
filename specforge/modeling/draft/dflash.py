@@ -366,8 +366,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         with an auxiliary logits head can override this boundary without
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
-        del block_output_ids
-        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        draft_logits = target.lm_head(draft_hidden[:, 1:, :])
         return sample(draft_logits)
 
     def forward(
@@ -409,7 +408,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
-        block_size = self.block_size
+        block_size = self.block_size + int(not getattr(self, "sample_from_anchor", True))
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,

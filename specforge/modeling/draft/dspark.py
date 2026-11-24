@@ -348,6 +348,9 @@ class DSparkDraftModel(DFlashDraftModel):
             nn.init.zeros_(module.weight)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
+        self.sample_from_anchor = getattr(config, "sample_from_anchor", True)
+        if not isinstance(self.sample_from_anchor, bool):
+            raise ValueError("sample_from_anchor must be a boolean")
         self.markov_head = build_markov_head(
             config, dflash_config, initialize_memory=self._initialize_weights
         )

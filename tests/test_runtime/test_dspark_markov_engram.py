@@ -93,9 +93,11 @@ def training(draft):
     )
 
 
-def test_engram_training_alignment_gradient_and_no_future_leakage():
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
+def test_engram_training_alignment_gradient_and_no_future_leakage(sample_from_anchor):
     torch.manual_seed(11)
     c = config()
+    c.sample_from_anchor = sample_from_anchor
     draft = DSparkDraftModel(c)
     model = training(draft)
     memory = draft.markov_head.memory
@@ -115,9 +117,11 @@ def test_engram_training_alignment_gradient_and_no_future_leakage():
     optimizer.step()
     optimizer.zero_grad()
 
-    with patch.object(
-        draft, "apply_logits_head", wraps=draft.apply_logits_head
-    ) as head:
+    with (
+        patch.object(draft, "apply_logits_head", wraps=draft.apply_logits_head) as head,
+        patch.object(model.embed_tokens, "forward", wraps=model.embed_tokens.forward) as embed,
+        patch.object(draft, "forward", wraps=draft.forward) as backbone,
+    ):
         loss, _, stats = model(ids, features, mask, final)
         loss.backward()
     for name, param in memory.named_parameters():
@@ -127,6 +131,14 @@ def test_engram_training_alignment_gradient_and_no_future_leakage():
 
     base = head.call_args.args[0]
     kw = head.call_args.kwargs
+    width = 7 if sample_from_anchor else 8
+    query_ids = embed.call_args.args[0].reshape(2, 2, width)
+    torch.testing.assert_close(query_ids[:, :, 0][keep], ids.gather(1, anchors)[keep])
+    assert (query_ids[:, :, 1:] == model.mask_token_id).all()
+    assert base.shape == (2, 2, 7, 23)
+    with torch.no_grad():
+        raw = draft(**backbone.call_args.kwargs).reshape(2, 2, width, 16)
+    torch.testing.assert_close(kw["hidden_states"], raw[:, :, -7:])
     parallel = draft.apply_logits_head(base, **kw)
     for b, n in keep.nonzero().tolist():
         a = anchors[b, n].item()
@@ -248,9 +260,11 @@ def test_engram_table_lr_group_and_resume():
 
 
 @pytest.mark.parametrize("hf_source", [False, True])
-def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source):
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
+def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source, sample_from_anchor):
     vanilla = DSparkDraftModel(config("vanilla")).bfloat16()
     c = config()
+    c.sample_from_anchor = sample_from_anchor
     draft = DSparkDraftModel(c).bfloat16()
     src = tmp_path / "vanilla"
     src.mkdir()
@@ -301,6 +315,8 @@ def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source):
         == 0
     )
     restored = DSparkDraftModel.from_pretrained(dest, dtype=torch.bfloat16)
+    assert restored.sample_from_anchor is sample_from_anchor
+    assert contract["dspark_sample_from_anchor"] is sample_from_anchor
     restored_ids = restored.markov_head.memory.bucket_ids(tokens)
     torch.testing.assert_close(restored_ids, buckets)
     torch.testing.assert_close(
@@ -309,6 +325,11 @@ def test_vanilla_warm_start_and_engram_hf_roundtrip(tmp_path, hf_source):
         atol=0,
         rtol=0,
     )
+    c.sample_from_anchor = not sample_from_anchor
+    c.to_json_file(cfg)
+    with pytest.raises(ValueError, match="sample_from_anchor"):
+        materialize_draft(state, str(cfg))
+    c.sample_from_anchor = sample_from_anchor
     c.dflash_config["engram"]["hash_multipliers"][0] += 2
     c.to_json_file(cfg)
     # Reload from disk: the checkpoint contract must not follow the config mutation.

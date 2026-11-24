@@ -72,6 +72,7 @@ def resume_contract(config, draft_model, training_model):
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
         ),
+        "dspark_sample_from_anchor": getattr(draft_model, "sample_from_anchor", True),
         "dspark_block_size": int(training_model.block_size),
         "dspark_mask_token_id": int(training_model.mask_token_id),
         "dspark_context_window": getattr(draft_model, "context_window", None),

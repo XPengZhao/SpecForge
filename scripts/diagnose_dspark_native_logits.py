@@ -372,7 +372,12 @@ def main():
         if read_json(Path(s["config"])) != s["config_values"]:
             raise ValueError(f"Training config changed for {name}")
         eng = s["config_values"]["dflash_config"]["engram"]
-        exported = read_json(export / "config.json")["dflash_config"]["engram"]
+        export_config = read_json(export / "config.json")
+        if export_config.get("sample_from_anchor", True) != s["config_values"].get(
+            "sample_from_anchor", True
+        ):
+            raise ValueError(f"{name}: export and training config sample_from_anchor differ")
+        exported = export_config["dflash_config"]["engram"]
         if exported["bucket_counts"] != eng["bucket_counts"]:
             raise ValueError(
                 f"{name}: export and checkpoint Engram bucket counts differ"
