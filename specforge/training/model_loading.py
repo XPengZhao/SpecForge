@@ -379,6 +379,7 @@ def _load_pretrained_draft_state(
     draft_config: "PretrainedConfig",
     cache_dir: Optional[str],
     trust_remote_code: bool,
+    reject_unexpected: bool = False,
 ) -> Dict[str, Any]:
     from specforge.modeling.auto import AutoDraftModel
 
@@ -389,6 +390,12 @@ def _load_pretrained_draft_state(
         trust_remote_code=trust_remote_code,
         output_loading_info=True,
     )
+    unexpected = loading_info.get("unexpected_keys") or []
+    if reject_unexpected and unexpected:
+        raise ValueError(
+            f"warm-start checkpoint {source!r} carries unexpected weights for "
+            f"its config: {sorted(unexpected)}"
+        )
     missing_from_source = set(loading_info.get("missing_keys") or [])
     state = {
         key: value.detach().cpu()
@@ -448,15 +455,33 @@ def warm_start_draft_model(
         state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
     else:
         checkpoint_format = "pretrained"
+        source_config = draft_config
+        if getattr(model, "context_projection_mode", "shared") == "per_layer":
+            # Read baseline HF weights using their original layout. Loading
+            # them directly with the destination config would discard fc.weight
+            # before the explicit warm-start conversion below can copy it.
+            source_config = load_draft_config_source(
+                source, cache_dir=cache_dir, trust_remote_code=trust_remote_code
+            )
+            if source_config.architectures != draft_config.architectures:
+                raise ValueError(
+                    "warm-start source and destination architectures differ"
+                )
         state = _load_pretrained_draft_state(
             source,
-            draft_config=draft_config,
+            draft_config=source_config,
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
+            reject_unexpected=(
+                getattr(model, "context_projection_mode", "shared") == "per_layer"
+            ),
         )
 
     if not state:
         raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
+    adapt_state = getattr(model, "adapt_warm_start_state_dict", None)
+    if adapt_state is not None:
+        state = adapt_state(state)
     try:
         result = model.load_state_dict(state, strict=False)
     except RuntimeError as exc:

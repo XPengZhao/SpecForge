@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Callable, Optional
 
 import torch
@@ -295,6 +296,14 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             ]
         )
         dflash_config = getattr(config, "dflash_config", {}) or {}
+        self.context_projection_mode = dflash_config.get(
+            "context_projection_mode", "shared"
+        )
+        if self.context_projection_mode not in {"shared", "per_layer"}:
+            raise ValueError(
+                "context_projection_mode must be 'shared' or 'per_layer', "
+                f"got {self.context_projection_mode!r}"
+            )
         self.target_layer_ids = dflash_config.get(
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
@@ -317,6 +326,33 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._init_draft_head(config, dflash_config)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+        if self.context_projection_mode == "per_layer":
+            # Clone only after baseline initialization: preserve both the other
+            # parameters and RNG state for a controlled same-seed comparison.
+            # These are independent parameters, not aliases of a shared weight.
+            self.context_projections = nn.ModuleList(
+                [self.fc]
+                + [deepcopy(self.fc) for _ in range(config.num_hidden_layers - 1)]
+            )
+            del self.fc
+
+    def adapt_warm_start_state_dict(self, state_dict):
+        """Expand a baseline projection for weights-only initialization.
+
+        Deliberately not a load hook: resume and export must reject missing or
+        mismatched projections instead of silently manufacturing trained weights.
+        """
+        if self.context_projection_mode != "per_layer" or "fc.weight" not in state_dict:
+            return state_dict
+        if any(key.startswith("context_projections.") for key in state_dict):
+            raise ValueError(
+                "checkpoint mixes shared and per-layer context projections"
+            )
+        state_dict = dict(state_dict)
+        weight = state_dict.pop("fc.weight")
+        for index in range(len(self.context_projections)):
+            state_dict[f"context_projections.{index}.weight"] = weight
+        return state_dict
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
@@ -381,12 +417,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+        if self.context_projection_mode == "shared":
+            target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
+            layer_context = (
+                self.hidden_norm(self.context_projections[layer_idx](target_hidden))
+                if self.context_projection_mode == "per_layer"
+                else target_hidden
+            )
             hidden_states = layer(
                 hidden_states=hidden_states,
-                target_hidden=target_hidden,
+                target_hidden=layer_context,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
