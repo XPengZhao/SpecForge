@@ -293,13 +293,19 @@ def test_hf_warm_start_rejects_mixed_projection_layouts(tmp_path, source_mode):
         )
 
 
-def test_bf16_optimizer_update_and_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backbone_muon", [False, True])
+@pytest.mark.parametrize("projection_mode", ["shared", "per_layer"])
+def test_bf16_optimizer_update_and_resume(
+    tmp_path, monkeypatch, backbone_muon, projection_mode
+):
     from specforge.optimizer import BF16Optimizer
 
     # This CPU unit test has no process group; suppress only rank-aware logging.
     monkeypatch.setattr("specforge.optimizer.print_on_rank0", lambda *args: None)
-    model = DSparkDraftModel(config("per_layer")).to(torch.bfloat16)
-    optimizer = BF16Optimizer(model, lr=0.01, warmup_ratio=0, total_steps=10)
+    model = DSparkDraftModel(config(projection_mode)).to(torch.bfloat16)
+    optimizer = BF16Optimizer(
+        model, lr=0.01, warmup_ratio=0, total_steps=10, backbone_muon=backbone_muon
+    )
     args = inputs(torch.bfloat16)
     probe = torch.randn(1, 6, 16)
 
@@ -307,19 +313,25 @@ def test_bf16_optimizer_update_and_resume(tmp_path, monkeypatch):
         (candidate(**args).float() * probe).sum().backward()
         opt.step()
 
-    before = [p.weight.detach().clone() for p in model.context_projections]
-    step(model, optimizer)
-    for old, projection in zip(before, model.context_projections):
-        assert not torch.equal(old, projection.weight)
-    assert not torch.equal(
-        model.context_projections[0].weight, model.context_projections[1].weight
+    projections = (
+        list(model.context_projections)
+        if projection_mode == "per_layer"
+        else [model.fc]
     )
+    before = [p.weight.detach().clone() for p in projections]
+    step(model, optimizer)
+    for old, projection in zip(before, projections):
+        assert not torch.equal(old, projection.weight)
+    if projection_mode == "per_layer":
+        assert not torch.equal(projections[0].weight, projections[1].weight)
     path = tmp_path / "resume.pt"
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, path)
     state = torch.load(path, weights_only=True)
-    restored = DSparkDraftModel(config("per_layer")).to(torch.bfloat16)
+    restored = DSparkDraftModel(config(projection_mode)).to(torch.bfloat16)
     restored.load_state_dict(state["model"], strict=True)
-    restored_opt = BF16Optimizer(restored, lr=0.01, warmup_ratio=0, total_steps=10)
+    restored_opt = BF16Optimizer(
+        restored, lr=0.01, warmup_ratio=0, total_steps=10, backbone_muon=backbone_muon
+    )
     restored_opt.load_state_dict(state["optimizer"])
     step(model, optimizer)
     step(restored, restored_opt)

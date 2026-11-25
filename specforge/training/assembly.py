@@ -270,6 +270,7 @@ class _ConfiguredOptimizerFactory:
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
+            backbone_muon=t.dspark_backbone_muon,
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
             total_steps=self.total_steps,

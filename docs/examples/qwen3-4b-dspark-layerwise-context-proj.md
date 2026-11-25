@@ -47,6 +47,27 @@ training run: optimizer, scheduler and counters start fresh. Do not use training
 resume to migrate a baseline checkpoint. Resume is supported for checkpoints
 already trained with the per-layer architecture.
 
+### Muon baseline comparison
+
+To use the existing Muon baseline recipe, add these overrides:
+
+```bash
+training.dspark_backbone_muon=true \
+training.fsdp_sharding=NO_SHARD
+```
+
+The flag defaults to `false` (AdamW). With it enabled, all five context
+projections and the backbone Q/K/V/O and FFN matrices use Muon, with the same
+`match_rms_adamw` learning-rate adjustment as the Muon baseline. RMSNorm,
+Markov W1/W2 and the confidence head use AdamW. Both optimizers share the global
+gradient clipping and learning-rate schedule. Keep the learning rate, data and
+training steps the same as the Muon baseline for the architecture comparison.
+
+Muon momentum, AdamW moments, the scheduler and FP32 master parameters are
+saved together. Full resume rejects switching between AdamW-only and Muon;
+weights-only initialization can start a new run with either optimizer. HF
+export uses the same command below regardless of the training optimizer.
+
 ## HF export
 
 ```bash
