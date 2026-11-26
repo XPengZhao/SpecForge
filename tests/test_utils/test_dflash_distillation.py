@@ -142,3 +142,43 @@ def test_factory_and_resume_contract_preserve_distillation_settings(monkeypatch)
     assert contract["dflash_loss_type"] == "dspark"
     assert contract["dflash_l1_loss_alpha"] == 0.8
     assert contract["dflash_distillation_mode"] == "original"
+
+
+@pytest.mark.parametrize("distillation", [False, True])
+def test_real_ddp_forwards_teacher_features(tmp_path, distillation):
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+    from tests.test_optimizer.test_dflash_family_muon import online_dflash
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path}/init", rank=0, world_size=1,
+    )
+    try:
+        model = online_dflash(distillation)
+        wrapped = DistributedDataParallel(model, broadcast_buffers=False)
+        assert not hasattr(wrapped, "loss_type")
+        strategy = DFlashTrainStrategy(wrapped)
+        assert ("target_last_hidden_states" in strategy.required_features) == distillation
+        assert strategy.trainable_module() is wrapped
+        tensors = {
+            "input_ids": torch.randint(0, 31, (1, 12)),
+            "hidden_states": torch.randn(1, 12, 32, dtype=torch.bfloat16),
+            "loss_mask": torch.ones(1, 12),
+        }
+        if distillation:
+            tensors["target_last_hidden_states"] = torch.randn(1, 12, 16, dtype=torch.bfloat16)
+        calls = []
+        handle = wrapped.register_forward_pre_hook(lambda *args: calls.append(True))
+        out = strategy.forward_loss(SimpleNamespace(tensors=tensors))
+        handle.remove()
+        assert calls == [True]
+        assert torch.isfinite(out.loss)
+        out.loss.backward()
+        assert model.draft_model.fc.weight.grad.abs().sum() > 0
+        if distillation:
+            assert "l1_loss" in out.metrics["log_window"]["sums"]
+            del tensors["target_last_hidden_states"]
+            with pytest.raises(ValueError, match="batch missing required features"):
+                strategy.forward_loss(SimpleNamespace(tensors=tensors))
+    finally:
+        dist.destroy_process_group()

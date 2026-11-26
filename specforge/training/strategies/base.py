@@ -420,7 +420,18 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def __init__(self, dflash_model: nn.Module) -> None:
         self.dflash_model = dflash_model
         self.required_features = set(type(self).required_features)
-        if getattr(dflash_model, "loss_type", None) == "dspark":
+        # NO_SHARD uses DDP, which does not forward custom model attributes.
+        # Inspect the inner model for metadata; keep forward on the wrapper so
+        # gradient synchronization is preserved.
+        objective_model = dflash_model
+        while getattr(objective_model, "loss_type", None) is None:
+            inner = getattr(objective_model, "module", None)
+            if inner is None:
+                inner = getattr(objective_model, "_orig_mod", None)
+            if inner is None or inner is objective_model:
+                break
+            objective_model = inner
+        if getattr(objective_model, "loss_type", None) == "dspark":
             self.required_features.add("target_last_hidden_states")
 
     def trainable_module(self) -> nn.Module:
