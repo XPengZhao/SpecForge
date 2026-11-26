@@ -191,7 +191,11 @@ async def evaluate(args, tasks):
     }
     config.update(
         prompt_policy="Drop final assistant; preserve preceding conversation",
-        sample_algorithm="reservoir sampling over eligible rows, then source-line order",
+        sample_algorithm=getattr(
+            args,
+            "sample_policy",
+            "reservoir sampling over eligible rows, then source-line order",
+        ),
         endpoint=url + "/v1/chat/completions",
         seed_policy="seed + task index",
         tasks=tasks,

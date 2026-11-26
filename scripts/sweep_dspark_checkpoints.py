@@ -93,7 +93,7 @@ def stop_group(process):
 
 
 @contextmanager
-def serving(a, checkpoint, mode, directory):
+def serving(a, checkpoint, mode, directory, *, extra_env=None):
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(("127.0.0.1", a.port))
@@ -105,8 +105,13 @@ def serving(a, checkpoint, mode, directory):
            "--dtype", "bfloat16", "--max-model-len", str(a.max_model_len),
            "--max-num-seqs", str(a.concurrency), "--speculative-config", json.dumps(spec)]
     env = dict(os.environ, VLLM_USE_V2_MODEL_RUNNER="1")
+    for key, value in (extra_env or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    (directory / "serve.json").write_text(json.dumps(dict(command=cmd, gpu=env["CUDA_VISIBLE_DEVICES"]), indent=2))
+    (directory / "serve.json").write_text(json.dumps(dict(command=cmd, gpu=env["CUDA_VISIBLE_DEVICES"], extra_env=extra_env or {}), indent=2))
     log = directory / "serve.log"
     with log.open("a") as stream:
         server = subprocess.Popen(cmd, env=env, stdout=stream, stderr=subprocess.STDOUT,
