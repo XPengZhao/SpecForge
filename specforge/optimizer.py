@@ -54,7 +54,8 @@ class BF16Optimizer:
             # Norms and all Markov/confidence parameters remain on AdamW.
             matrices = {
                 id(module.weight)
-                for root in (projection, draft.layers)
+                for root in (projection, draft.layers, getattr(draft, "pos0_adapter", None))
+                if root is not None
                 for module in root.modules()
                 if isinstance(module, torch.nn.Linear)
             }

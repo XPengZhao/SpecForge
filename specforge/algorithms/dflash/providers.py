@@ -70,6 +70,10 @@ def resume_contract(_config, draft_model, training_model):
             "dflash_l1_loss_alpha": float(training_model.dspark_l1_loss_alpha),
             "dflash_kl_loss_alpha": float(training_model.dspark_kl_loss_alpha),
         })
+    adapter = getattr(draft_model, "pos0_adapter", None)
+    if adapter is not None:
+        contract["pos0_adapter_intermediate_size"] = adapter.up_proj.out_features
+        contract["pos0_adapter_slot"] = draft_model.pos0_adapter_slot
     return contract
 
 

@@ -275,6 +275,23 @@ def normalize_draft_head_checkpoint_keys(
             break
 
 
+class Pos0Adapter(nn.Module):
+    """Small pre-norm SwiGLU residual, applied only to the first prediction."""
+
+    def __init__(self, config, width, kernels):
+        super().__init__()
+        self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
+        self.gate_proj = nn.Linear(config.hidden_size, width, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, width, bias=False)
+        self.down_proj = nn.Linear(width, config.hidden_size, bias=False)
+
+    def forward(self, hidden):
+        x = self.norm(hidden)
+        return hidden + self.down_proj(
+            torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
+        )
+
+
 @register_draft
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
@@ -315,8 +332,37 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
         self._init_draft_head(config, dflash_config)
+        width = dflash_config.get("pos0_adapter_intermediate_size", 0)
+        if isinstance(width, bool) or not isinstance(width, int) or width < 0:
+            raise ValueError("pos0_adapter_intermediate_size must be a nonnegative integer")
+        self.pos0_adapter = None
+        self.pos0_adapter_slot = 0 if self.projector_type == "dspark" else 1
+        if width:
+            if self.block_size <= self.pos0_adapter_slot:
+                raise ValueError("pos0 adapter requires a prediction slot in each block")
+            self.pos0_adapter = Pos0Adapter(config, width, kernels)
         self.register_load_state_dict_pre_hook(normalize_draft_head_checkpoint_keys)
         self.post_init()
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, Pos0Adapter):
+            # Applied after child Linear initialization, including HF loading.
+            nn.init.zeros_(module.down_proj.weight)
+
+    def _apply_pos0_adapter(self, hidden_states):
+        if self.pos0_adapter is None:
+            return hidden_states
+        if hidden_states.shape[1] % self.block_size:
+            raise ValueError("pos0 adapter expects complete draft blocks")
+        blocks = hidden_states.reshape(
+            hidden_states.shape[0], -1, self.block_size, hidden_states.shape[-1]
+        )
+        slot = self.pos0_adapter_slot
+        updated = self.pos0_adapter(blocks[:, :, slot, :]).unsqueeze(2)
+        return torch.cat(
+            (blocks[:, :, :slot, :], updated, blocks[:, :, slot + 1:, :]), dim=2
+        ).reshape_as(hidden_states)
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         del config, dflash_config
@@ -394,7 +440,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+        return self.norm(self._apply_pos0_adapter(hidden_states))
 
     @torch.inference_mode()
     def spec_generate(

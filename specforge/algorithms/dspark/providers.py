@@ -93,6 +93,10 @@ def resume_contract(_config, draft_model, training_model):
     if str(training_model.dspark_loss_mode) == "kl":
         contract["dspark_loss_mode"] = "kl"
         contract["dspark_kl_loss_alpha"] = float(training_model.dspark_kl_loss_alpha)
+    adapter = getattr(draft_model, "pos0_adapter", None)
+    if adapter is not None:
+        contract["pos0_adapter_intermediate_size"] = adapter.up_proj.out_features
+        contract["pos0_adapter_slot"] = draft_model.pos0_adapter_slot
     return contract
 
 
