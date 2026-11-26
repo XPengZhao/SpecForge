@@ -343,10 +343,14 @@ def _configured_logger(cfg: Config):
     options["mlflow_experiment_name"] = options["mlflow_experiment_name"] or "specforge"
     options["mlflow_run_name"] = options["mlflow_run_name"] or cfg.run_id
     metric_filter = None
-    if cfg.training.strategy == "dspark" and cfg.tracking.report_to == "tensorboard":
+    if (cfg.training.strategy in {"dspark", "dflash"}
+            and cfg.tracking.report_to == "tensorboard"):
         metric_filter = partial(
             dspark_tensorboard_metrics,
-            loss_mode=cfg.training.dspark_loss_mode,
+            loss_mode=(
+                cfg.training.dspark_loss_mode
+                if cfg.training.strategy == "dspark" else "original"
+            ),
             diagnostics=cfg.tracking.dspark_diagnostics,
         )
     return create_tracker_logger(

@@ -176,3 +176,21 @@ dataset in both paths. Increasing accumulation requires count watermarks large
 enough for a complete optimizer window:
 `trainer_world_size * batch_size * accumulation_steps`. A larger queue cannot
 compensate for a persistently slower teacher.
+
+
+### DFlash 与 DSpark 的训练指标
+
+两种策略都按日志窗口累计各个 microbatch 的指标，并跨 DP rank 汇总。
+`train/acc` 是窗口内正确 token 总数除以有效 token 总数，不是最后一个
+microbatch 的 accuracy，也不是各批次 accuracy 的简单平均。
+TensorBoard 中 `train/top1_acc@0` 对应第一个 draft token；DFlash 排除已知
+anchor，从第一个 mask 开始编号。`train/position_loss/01_ce` 是该位置的 CE。
+
+`train/ce_loss` 和 `train/loss_weighted` 使用窗口内全局分子、分母汇总，
+保留训练的位置衰减权重。诊断模式下的 `train/loss` 沿用 DSpark 的
+rank 0 局部 microbatch loss 均值；比较聚合 loss 请用 `train/loss_weighted`。
+`tracking.dspark_diagnostics=true` 也适用于 DFlash，可显示
+`train/log_micro_batches` 和 `train/accuracy_denom`。
+首步输出一次预览，常规日志窗口及最后不足一个窗口的部分遵循同一汇总路径。
+这些改动不改变训练目标。DFlash 尚未计算 target 概率分布，因此不输出
+`accept_rate@i` 和 `tau_probabilistic`，也不会以 top-1 accuracy 冒充接受率。

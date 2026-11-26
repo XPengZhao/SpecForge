@@ -78,7 +78,7 @@ def dspark_tensorboard_metrics(
     """
     components = {"ce_loss", "l1_loss"} if loss_mode == "original" else {"kl_loss"}
     train = components | {
-        "loss_weighted", "confidence_loss", "confidence_mae", "acc", "tau_probabilistic",
+        "loss_weighted", "objective_loss", "confidence_loss", "confidence_mae", "acc", "tau_probabilistic",
         "grad_norm", "lr", "log_interval_sec",
     }
     evaluation = components | {

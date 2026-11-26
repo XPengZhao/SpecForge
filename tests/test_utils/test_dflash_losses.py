@@ -340,6 +340,48 @@ class TestDFlashLosses(unittest.TestCase):
         self.assertTrue(torch.isfinite(accuracy))
         return loss
 
+    def test_logging_window_uses_all_tokens_and_excludes_anchor(self):
+        from specforge.training.metric_window import MetricWindow
+        from specforge.training.strategies.base import DFlashTrainStrategy
+        from specforge.training.tracking import (
+            dspark_tensorboard_metrics, training_metric_names,
+        )
+        from types import SimpleNamespace
+
+        model = _make_model(self.logits, self.anchors, self.keep_mask,
+                            loss_decay_gamma=7.0)
+        strategy = DFlashTrainStrategy(model)
+        window = MetricWindow()
+        correct = self.logits.argmax(-1) == self.targets
+        expected_num = expected_den = 0
+        for mask in (self.loss_mask, self.loss_mask * 0):
+            batch = SimpleNamespace(tensors=dict(
+                input_ids=self.input_ids, hidden_states=self.hidden_states,
+                loss_mask=mask))
+            out = strategy.forward_loss(batch)
+            window.update(out.metrics["log_window"])
+            _, valid = _targets_and_mask(self.input_ids, mask, self.anchors,
+                                        self.keep_mask, self.logits.shape[2])
+            expected_num += (correct * valid).sum().item()
+            expected_den += valid.sum().item()
+        summary = window.summary()
+        self.assertAlmostEqual(summary["acc"], expected_num / expected_den)
+        self.assertEqual(summary["accuracy_denom"], expected_den)
+        self.assertEqual(summary["log_micro_batches"], 2)
+        expected_ce = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=7.)
+        self.assertAlmostEqual(summary["ce_loss"], expected_ce.item(), places=5)
+        tags = dspark_tensorboard_metrics(training_metric_names(summary))
+        for slot in range(1, self.logits.shape[2]):
+            valid = self.binary_mask[..., slot]
+            expected = (correct[..., slot] * valid).sum() / valid.sum().clamp_min(1)
+            self.assertAlmostEqual(tags[f"train/top1_acc@{slot-1}"], expected.item())
+        self.assertNotIn("train/top1_acc@4", tags)
+        model.eval()
+        _, _, metrics = model(input_ids=self.input_ids,
+                              hidden_states=self.hidden_states, loss_mask=self.loss_mask)
+        self.assertIn("accuracy_denom", metrics)
+        self.assertNotIn("log_window", metrics)
+
     def test_dflash_default_matches_existing_weighted_mean(self):
         got = self._forward_loss()
         want = _naive_dflash_loss(self.neg_log_q, self.binary_mask, gamma=None)

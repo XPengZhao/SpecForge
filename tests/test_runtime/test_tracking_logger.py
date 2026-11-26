@@ -91,8 +91,11 @@ class TrackingLoggerTest(unittest.TestCase):
             self.assertIsNone(create.call_args.kwargs["metric_filter"])
             cfg.tracking.report_to = "tensorboard"
             cfg.training.strategy = "dflash"
+            cfg.tracking.dspark_diagnostics = False
             _configured_logger(cfg)
-            self.assertIsNone(create.call_args.kwargs["metric_filter"])
+            select = create.call_args.kwargs["metric_filter"]
+            self.assertEqual(select({**values, "train/mtp_1_accuracy": .8}),
+                             {"train/ce_loss": 0.0, "train/top1_acc@0": .8})
 
     @staticmethod
     def _trainer(*, fit_error=None):

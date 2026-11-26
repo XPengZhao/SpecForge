@@ -437,9 +437,9 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
         )
-        metrics = {"accuracy": accuracy.detach()}
-        if "accuracy_denom" in model_metrics:
-            metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        metrics = dict(model_metrics)
+        if "log_window" not in metrics:
+            metrics["accuracy"] = accuracy.detach()
         return StepOutput(loss=loss, metrics=metrics)
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

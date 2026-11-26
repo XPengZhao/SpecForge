@@ -424,7 +424,35 @@ class OnlineDFlashModel(nn.Module):
             accuracy_denom = binary_eval_mask.sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
 
-        return loss, accuracy, {"accuracy_denom": accuracy_denom.detach()}
+        metrics = {"accuracy_denom": accuracy_denom.detach()}
+        if self.training:
+            with torch.no_grad():
+                token_loss = loss_per_token.detach().view_as(weight_mask)
+                objective = "ce_loss" if self.loss_type == "dflash" else "objective_loss"
+                objective_denom = (
+                    loss_weights.sum() if self.loss_type == "dflash"
+                    else loss_weights.new_tensor(float(bsz))
+                )
+                sums = {
+                    objective: (token_loss * loss_weights).sum(),
+                    "acc": correct.sum().float(),
+                }
+                denoms = {objective: objective_denom, "acc": accuracy_denom}
+                correct_by_position = correct.view_as(weight_mask).sum((0, 1))
+                count_by_position = weight_mask.sum((0, 1))
+                ce_by_position = (token_loss * weight_mask).sum((0, 1))
+                # Slot 0 is the known anchor, not a draft prediction.
+                for position in range(1, self.block_size):
+                    for suffix, numerator in (
+                        ("accuracy", correct_by_position), ("loss", ce_by_position)
+                    ):
+                        name = f"mtp_{position}_{suffix}"
+                        sums[name] = numerator[position]
+                        denoms[name] = count_by_position[position]
+                metrics = {"log_window": {
+                    "sums": sums, "denoms": denoms, "weights": {objective: 1.0}
+                }}
+        return loss, accuracy, metrics
 
 
 class OnlineDominoModel(OnlineDFlashModel):

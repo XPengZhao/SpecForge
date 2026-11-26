@@ -1,4 +1,4 @@
-"""Bounded, detached DSpark logging-window statistics (not training losses)."""
+"""Bounded, detached DFlash/DSpark logging-window statistics (not training losses)."""
 
 import torch
 import torch.distributed as dist
