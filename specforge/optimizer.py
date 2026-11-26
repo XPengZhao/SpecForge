@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 class BF16Optimizer:
     """AdamW over FP32 master copies of the trainable params, with grad
-    clipping and cosine warmup scheduling."""
+    clipping and cosine warmup scheduling. Optionally use Muon for DFlash/DSpark
+    backbone matrices while retaining AdamW for norms and auxiliary heads."""
 
     def __init__(
         self,
@@ -21,6 +22,7 @@ class BF16Optimizer:
         max_grad_norm=0.5,
         total_steps=800_000,
         warmup_ratio=0.015,
+        backbone_muon=False,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -31,8 +33,47 @@ class BF16Optimizer:
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
+        adam_masters = self.fp32_params
+        self.muon = None
+        if backbone_muon:
+            from specforge.modeling.draft.dflash import DFlashDraftModel
+
+            draft = next(
+                (m for m in model.modules() if isinstance(m, DFlashDraftModel)), None
+            )
+            if draft is None:
+                raise ValueError(
+                    "dspark_backbone_muon requires a Qwen DFlash/DSpark backbone"
+                )
+            # Also accept the per-layer projection variant when this base
+            # feature is merged into an ablation branch.
+            projection = getattr(draft, "context_projections", None)
+            if projection is None:
+                projection = draft.fc
+            # Match the baseline Muon grouping, including every independent W_l.
+            # Norms and all Markov/confidence parameters remain on AdamW.
+            matrices = {
+                id(module.weight)
+                for root in (projection, draft.layers)
+                for module in root.modules()
+                if isinstance(module, torch.nn.Linear)
+            }
+            adam_masters, muon_masters = [], []
+            for parameter, master in zip(self.model_params, self.fp32_params):
+                if id(parameter) in matrices:
+                    muon_masters.append(master)
+                else:
+                    adam_masters.append(master)
+            if not muon_masters:
+                raise ValueError("Muon requires trainable backbone matrices")
+            self.muon = torch.optim.Muon(
+                muon_masters,
+                lr=lr,
+                weight_decay=weight_decay,
+                adjust_lr_fn="match_rms_adamw",
+            )
         self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
+            adam_masters, lr=lr, weight_decay=weight_decay
         )
         self.last_grad_norm = None
         self._grad_norm_process_group = None
@@ -114,6 +155,10 @@ class BF16Optimizer:
                 )
         grad_norm = self._clip_grad_norm()
         self.last_grad_norm = grad_norm.detach()
+        if self.muon is not None:
+            self.muon.param_groups[0]["lr"] = self.get_learning_rate()
+            self.muon.step()
+            self.muon.zero_grad()
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.scheduler.step()
@@ -136,6 +181,10 @@ class BF16Optimizer:
                 f"{saved_max_grad_norm} but this run has "
                 f"max_grad_norm={self.max_grad_norm}"
             )
+        if ("muon_state_dict" in state_dict) != (self.muon is not None):
+            raise ValueError("Checkpoint and current optimizer disagree on backbone Muon")
+        if self.muon is not None:
+            self.muon.load_state_dict(state_dict["muon_state_dict"])
         self.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
         print_on_rank0("Successfully loaded optimizer state_dict.")
         self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
@@ -166,6 +215,7 @@ class BF16Optimizer:
 
     def state_dict(self):
         return {
+            **({"muon_state_dict": self.muon.state_dict()} if self.muon is not None else {}),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "max_grad_norm": self.max_grad_norm,

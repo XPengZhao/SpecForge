@@ -124,6 +124,43 @@ deployment.trainer.nproc_per_node=1 \
 'deployment.disaggregated.managed_local.trainer_cuda_visible_devices=["1"]'
 ```
 
+## Muon for DFlash and DSpark
+
+Both Qwen DFlash and DSpark support optional backbone Muon:
+
+```bash
+training.dspark_backbone_muon=true \
+training.fsdp_sharding=NO_SHARD
+```
+
+The option retains its original DSpark name for script compatibility and
+defaults to `false`. The managed 1-server DP7 recipe already sets `NO_SHARD`;
+other recipes may need that override. Sharded training is not supported by this
+Muon path.
+
+The target-feature fusion projection and backbone Q/K/V/O and FFN matrices use
+Muon with `adjust_lr_fn="match_rms_adamw"`, matching the existing Muon baseline.
+Norms and DSpark's Markov/confidence heads remain on AdamW. Pure DFlash has no
+Markov or confidence head. Frozen target parameters are excluded from both
+optimizers. Both optimizers share gradient clipping and the learning-rate
+schedule.
+
+For pure DFlash, select the matching model and strategy:
+
+```bash
+model.draft_model_config=configs/qwen3-4b-dflash.json \
+training.strategy=dflash \
+training.dspark_backbone_muon=true
+```
+
+The DFlash JSON defaults to `block_size=16` (anchor plus 15 mask predictions).
+For seven draft predictions, also set `model.draft_block_size=8`. DFlash uses
+its own CE objective; DSpark CE/L1/confidence coefficients do not control it.
+
+Checkpoints retain Muon momentum, AdamW moments, the scheduler and FP32 master
+weights. Full resume must keep the same optimizer choice. Weights-only
+initialization can start a fresh run with either choice; HF export is unchanged.
+
 ## Online/offline comparison
 
 The recipe explicitly uses DSpark's original CE/L1/confidence objective,
