@@ -906,7 +906,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
     ) -> torch.Tensor:
         loss_weight_mask = eval_mask.to(torch.float32)
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            positions = torch.arange(self.block_size, device=eval_mask.device).view(
+            positions = torch.arange(eval_mask.shape[-1], device=eval_mask.device).view(
                 1, 1, -1
             )
             decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
@@ -1037,7 +1037,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "consumer receives target_last_hidden_states."
             )
 
-        for position in range(self.block_size):
+        for position in range(draft_logits.shape[2]):
             dl_p = draft_logits[:, :, position, :]
             # Pass teacher probabilities to the loss only when needed.
             # Acceptance metrics can still use them in CE-only training.
@@ -1227,6 +1227,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 output_hidden_4d,
                 prev_token_ids=prev_token_ids,
             )
+        return self._loss_and_metrics(
+            draft_logits, target_ids, eval_mask, safe_label_indices,
+            target_last_hidden_states, confidence_pred,
+        )
+
+    def _loss_and_metrics(
+        self, draft_logits, target_ids, eval_mask, safe_label_indices,
+        target_last_hidden_states, confidence_pred=None,
+    ):
         unique_target_probs = self._unique_target_probs(
             target_last_hidden_states, safe_label_indices,
         )
@@ -1251,7 +1260,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 stats["denoms"]["acc"] = accuracy_denom
                 position_correct = correct_3d.sum(dim=(0, 1), dtype=torch.float32)
                 position_count = eval_mask.sum(dim=(0, 1), dtype=torch.float32)
-                for position in range(self.block_size):
+                for position in range(eval_mask.shape[-1]):
                     name = f"mtp_{position + 1}_accuracy"
                     stats["sums"][name] = position_correct[position]
                     stats["denoms"][name] = position_count[position]
@@ -1265,11 +1274,49 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     "eval_objective_weights": stats["weights"],
                     "acc_corrects": [
                         correct_3d[..., position].sum()
-                        for position in range(self.block_size)
+                        for position in range(eval_mask.shape[-1])
                     ],
                     "acc_denoms": [
                         eval_mask[..., position].sum()
-                        for position in range(self.block_size)
+                        for position in range(eval_mask.shape[-1])
                     ],
                 }
         return loss, accuracy, metrics
+
+
+class OnlineDFlashDistillationModel(OnlineDSparkModel):
+    """Pure DFlash mask predictions with the shared DSpark objective.
+
+    Keep the DFlash sampler and attention layout. Only mask outputs participate
+    in distillation; target hidden at j-1 supervises token j.
+    """
+
+    _sample_anchor_positions = OnlineDFlashModel._sample_anchor_positions
+
+    def forward(
+        self, input_ids, hidden_states, loss_mask, target_last_hidden_states=None,
+    ):
+        if target_last_hidden_states is None:
+            raise ValueError("DFlash distillation requires target_last_hidden_states")
+        if self.block_size < 2:
+            raise ValueError("DFlash distillation requires anchor + at least one mask")
+        anchors, keep, output = self._forward_draft_blocks(
+            input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask,
+        )
+        batch, sequence = input_ids.shape
+        # Discard the known anchor before LM projection and loss computation.
+        mask_output = output.reshape(batch, anchors.size(1), self.block_size, -1)[
+            ..., 1:, :
+        ]
+        logits = self.lm_head(mask_output)
+        offsets = torch.arange(1, self.block_size, device=input_ids.device)
+        indices = anchors.unsqueeze(-1) + offsets
+        safe = indices.clamp(max=sequence - 1)
+        targets = input_ids[:, None, :].expand(-1, anchors.size(1), -1).gather(2, safe)
+        supervised = loss_mask[:, None, :].expand(-1, anchors.size(1), -1).gather(2, safe)
+        valid = (indices < sequence) & keep.unsqueeze(-1) & (supervised > 0.5)
+        # Same contiguous valid-prefix convention as DSpark acceptance/loss.
+        valid = valid.int().cumprod(-1).bool()
+        return self._loss_and_metrics(
+            logits, targets, valid, safe, target_last_hidden_states,
+        )

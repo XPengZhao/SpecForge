@@ -10,10 +10,12 @@ from specforge.algorithms.peagle.providers import create_registration as peagle
 from specforge.algorithms.registry import AlgorithmRegistry
 
 
-def builtin_algorithm_registry() -> AlgorithmRegistry:
+def builtin_algorithm_registry(*, dflash_distillation: bool = False) -> AlgorithmRegistry:
     """Return a fresh immutable catalog without module-level mutation."""
 
-    return AlgorithmRegistry((eagle3(), peagle(), dflash(), domino(), dspark()))
+    return AlgorithmRegistry(
+        (eagle3(), peagle(), dflash(distillation=dflash_distillation), domino(), dspark())
+    )
 
 
 __all__ = ["builtin_algorithm_registry"]

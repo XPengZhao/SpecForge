@@ -241,6 +241,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             loss_type="dpace",
             dpace_alpha=0.4,
             shift_label=True,
+            dspark_loss_mode="original",
             dspark_ce_loss_alpha=0.1,
             dspark_l1_loss_alpha=0.8,
             dspark_confidence_head_alpha=0.2,

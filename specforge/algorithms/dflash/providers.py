@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
@@ -48,7 +49,7 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
 
-    return {
+    contract = {
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -61,6 +62,15 @@ def resume_contract(_config, draft_model, training_model):
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
     }
+
+    if training_model.loss_type == "dspark":
+        contract.update({
+            "dflash_distillation_mode": training_model.dspark_loss_mode,
+            "dflash_ce_loss_alpha": float(training_model.dspark_ce_loss_alpha),
+            "dflash_l1_loss_alpha": float(training_model.dspark_l1_loss_alpha),
+            "dflash_kl_loss_alpha": float(training_model.dspark_kl_loss_alpha),
+        })
+    return contract
 
 
 def resolve_dflash_kernels(config):
@@ -218,8 +228,21 @@ def algorithm_providers() -> AlgorithmProviders:
     )
 
 
-def create_registration():
-    return make_registration(algorithm_spec(), algorithm_providers())
+def create_registration(*, distillation=False):
+    spec, providers = algorithm_spec(), algorithm_providers()
+    if distillation:
+        # Same target captures as DSpark, but retain the pure DFlash draft,
+        # export contract, and optimizer parameter grouping.
+        from specforge.algorithms.dspark.providers import (
+            algorithm_providers as dspark_providers,
+            algorithm_spec as dspark_spec,
+        )
+        teacher = dspark_providers()
+        spec = replace(spec, feature_contracts=dspark_spec().feature_contracts)
+        providers = replace(
+            providers, offline=teacher.offline, server_streaming=teacher.server_streaming,
+        )
+    return make_registration(spec, providers)
 
 
 __all__ = ["algorithm_providers", "algorithm_spec", "create_registration"]

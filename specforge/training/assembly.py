@@ -349,7 +349,8 @@ def _configured_logger(cfg: Config):
             dspark_tensorboard_metrics,
             loss_mode=(
                 cfg.training.dspark_loss_mode
-                if cfg.training.strategy == "dspark" else "original"
+                if (cfg.training.strategy == "dspark" or cfg.training.loss_type == "dspark")
+                else "original"
             ),
             diagnostics=cfg.tracking.dspark_diagnostics,
         )

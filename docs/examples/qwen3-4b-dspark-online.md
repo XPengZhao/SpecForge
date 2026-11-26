@@ -192,5 +192,39 @@ rank 0 局部 microbatch loss 均值；比较聚合 loss 请用 `train/loss_weig
 `tracking.dspark_diagnostics=true` 也适用于 DFlash，可显示
 `train/log_micro_batches` 和 `train/accuracy_denom`。
 首步输出一次预览，常规日志窗口及最后不足一个窗口的部分遵循同一汇总路径。
-这些改动不改变训练目标。DFlash 尚未计算 target 概率分布，因此不输出
+这些指标汇总改动不改变训练目标。默认 CE 模式的 DFlash 不计算 target 概率分布，因此不输出
 `accept_rate@i` 和 `tau_probabilistic`，也不会以 top-1 accuracy 冒充接受率。
+
+
+### 纯 DFlash 使用 DSpark 损失
+
+保持 DFlash 的模型配置与 `training.strategy=dflash`，增加：
+
+```yaml
+training:
+  strategy: dflash
+  loss_type: dspark
+  dspark_loss_mode: original
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+```
+
+该模式复用 DSpark 的 `0.1 * CE + 0.9 * L1`、位置衰减与跨 DP 有效权重归一化。
+L1 是 draft/target 词表概率之差的绝对值之和。纯 DFlash 不增加 Markov 或
+confidence head，`dspark_confidence_head_alpha` 不参与该模式。
+`training.recompute_loss=true` 可启用与 DSpark 相同的损失重计算。
+`loss_type=dflash` 仍为默认值，保持原有 hard-label CE；设置 `loss_type=dspark`
+后也可以通过 `dspark_loss_mode=kl` 选择共享 KL 实现。
+
+一个 block 仍为 anchor 加 `block_size-1` 个 mask；只有 mask 参与监督。
+第一个 mask 预测 anchor+1 的 token，以 target 在 anchor 的最终层 hidden
+投影出的分布为监督。有效位置采用 DSpark 的连续前缀规则。
+
+Online capture 会额外请求 target 的最终层 hidden。请用新的运行目录启动，
+避免复用旧 CE 任务缺少此特征的在途数据；离线训练需使用含最终层与辅助层 hidden
+的 DSpark 格式缓存。该模式会记录 `ce_loss`、`l1_loss`、分位置 top-1、
+`accept_rate@i` 和 `tau_probabilistic`，后两者是训练分布重叠统计，不是在线 MAL。
+
+导出仍使用纯 DFlash JSON，推理模型和参数量不变。完整 resume 会检查 loss 模式
+和系数，不能把旧 CE 训练状态当作相同目标直接续训；若要接着已有权重训练，
+使用 warm start 并开启新实验。

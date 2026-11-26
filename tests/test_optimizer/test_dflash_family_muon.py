@@ -4,7 +4,9 @@ import pytest
 import torch
 from transformers import Qwen3Config
 
-from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+from specforge.algorithms.common.dflash_family_model import (
+    OnlineDFlashModel, OnlineDFlashDistillationModel,
+)
 from specforge.config import Config, apply_overrides
 from specforge.config.schema import TrainingConfig
 from specforge.export.to_hf import export_to_hf
@@ -93,9 +95,10 @@ def test_cli_factory_and_parameter_partition(strategy):
         assert not hasattr(model, "confidence_head")
 
 
-def online_dflash():
+def online_dflash(distillation=False):
     model = draft("dflash").to(torch.bfloat16)
-    wrapper = OnlineDFlashModel(
+    cls = OnlineDFlashDistillationModel if distillation else OnlineDFlashModel
+    wrapper = cls(
         model,
         torch.nn.Linear(16, 32, bias=False).to(torch.bfloat16).requires_grad_(False),
         torch.nn.Embedding(32, 16).to(torch.bfloat16).requires_grad_(False),
@@ -107,10 +110,11 @@ def online_dflash():
     return wrapper
 
 
-def test_pure_dflash_loss_muon_resume_and_hf_export(tmp_path, monkeypatch):
+@pytest.mark.parametrize("distillation", [False, True])
+def test_pure_dflash_loss_muon_resume_and_hf_export(tmp_path, monkeypatch, distillation):
     monkeypatch.setattr("specforge.optimizer.print_on_rank0", lambda *args: None)
     torch.manual_seed(12)
-    model = online_dflash()
+    model = online_dflash(distillation)
     optimizer = BF16Optimizer(
         model, lr=0.01, warmup_ratio=0.2, total_steps=10, backbone_muon=True
     )
@@ -119,6 +123,9 @@ def test_pure_dflash_loss_muon_resume_and_hf_export(tmp_path, monkeypatch):
         "hidden_states": torch.randn(1, 12, 32, dtype=torch.bfloat16),
         "loss_mask": torch.ones(1, 12),
     }
+
+    if distillation:
+        batch["target_last_hidden_states"] = torch.randn(1, 12, 16, dtype=torch.bfloat16)
 
     def step(wrapper, opt):
         loss, _, _ = wrapper(**batch)
@@ -142,7 +149,7 @@ def test_pure_dflash_loss_muon_resume_and_hf_export(tmp_path, monkeypatch):
         },
         state_path,
     )
-    restored = online_dflash()
+    restored = online_dflash(distillation)
     saved = torch.load(state_path, weights_only=True)
     restored.load_state_dict(saved["model"], strict=True)
     restored_opt = BF16Optimizer(

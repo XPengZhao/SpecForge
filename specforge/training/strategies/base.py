@@ -409,8 +409,8 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     """DFlash block-parallel strategy wrapping the existing ``OnlineDFlashModel``.
 
     Shares the trainer/backend/loader/checkpoint spine with EAGLE3; only the
-    per-step forward/loss differs (single block-wise pass, scalar loss, hard
-    real-token labels — no target distribution, no vocab map). ``hidden_states``
+    per-step forward/loss differs (single block-wise pass, hard-token CE by
+    default, optional DSpark distribution loss). ``hidden_states``
     is DFlash's own schema name, distinct from EAGLE3's ``hidden_state``.
     """
 
@@ -419,6 +419,9 @@ class DFlashTrainStrategy(DraftTrainStrategy):
 
     def __init__(self, dflash_model: nn.Module) -> None:
         self.dflash_model = dflash_model
+        self.required_features = set(type(self).required_features)
+        if getattr(dflash_model, "loss_type", None) == "dspark":
+            self.required_features.add("target_last_hidden_states")
 
     def trainable_module(self) -> nn.Module:
         return self.dflash_model
@@ -432,7 +435,11 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         self.validate_batch(batch)
         t = batch.tensors
         device = self._device()
+        extra = {}
+        if "target_last_hidden_states" in self.required_features:
+            extra["target_last_hidden_states"] = t["target_last_hidden_states"].to(device)
         loss, accuracy, model_metrics = self.dflash_model(
+            **extra,
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),

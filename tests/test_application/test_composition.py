@@ -53,6 +53,29 @@ def _payload(
 
 
 class ApplicationCompositionTest(unittest.TestCase):
+    def test_dflash_distillation_resolves_teacher_capture_without_changing_draft(self):
+        payload = _payload("dflash")
+        payload["training"]["loss_type"] = "dspark"
+        resolved = resolve_run(Config.model_validate(payload))
+        algorithm = resolved.algorithm
+        self.assertEqual(algorithm.name, "dflash")
+        self.assertEqual(algorithm.spec.draft.default_architecture, "DFlashDraftModel")
+        capture = algorithm.providers.server_streaming_for("text")
+        self.assertEqual(capture.target_representation, "hidden_state")
+        self.assertEqual(capture.layout.last_hidden_feature, "target_last_hidden_states")
+        self.assertIn("target_last_hidden_states", algorithm.spec.feature_contract(
+            FeatureMode.STREAMING, "text").required_tensors)
+        # Each resolve owns its providers: enabling distillation must not
+        # contaminate a subsequent ordinary CE run.
+        offline = _payload("dflash", mode="offline")
+        offline["training"]["loss_type"] = "dspark"
+        offline_run = resolve_run(Config.model_validate(offline))
+        self.assertIn("target_last_hidden_states", offline_run.algorithm.spec.feature_contract(
+            FeatureMode.OFFLINE, "text").required_tensors)
+        plain = resolve_run(Config.model_validate(_payload("dflash")))
+        self.assertIsNone(plain.algorithm.providers.server_streaming_for(
+            "text").layout.last_hidden_feature)
+
     def test_resolve_run_pairs_config_with_one_registration(self):
         config = Config.model_validate(_payload())
 
@@ -84,7 +107,7 @@ class ApplicationCompositionTest(unittest.TestCase):
             resolve_run(config)
 
     def test_mode_constraints_are_derived_from_feature_contracts(self):
-        for algorithm in ("peagle", "dspark"):
+        for algorithm in ("peagle",):
             with self.subTest(algorithm=algorithm):
                 config = Config.model_validate(_payload(algorithm, mode="offline"))
                 with self.assertRaisesRegex(ValueError, "no offline feature contract"):

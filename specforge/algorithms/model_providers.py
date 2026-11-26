@@ -394,7 +394,27 @@ def build_dflash_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
-    from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+    from specforge.algorithms.common.dflash_family_model import (
+        OnlineDFlashDistillationModel,
+        OnlineDFlashModel,
+    )
+
+    if cfg.training.loss_type == "dspark":
+        if draft_model.block_size < 2:
+            raise ValueError("DFlash distillation requires anchor + at least one mask")
+        return _build_dflash_family_model(
+            cfg, draft_model, tokenizer,
+            lambda common: OnlineDFlashDistillationModel(
+                **common,
+                dspark_loss_mode=cfg.training.dspark_loss_mode,
+                dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
+                dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
+                dspark_kl_loss_alpha=cfg.training.dspark_kl_loss_alpha,
+                dspark_confidence_head_alpha=0.0,
+                recompute_loss=cfg.training.recompute_loss,
+            ),
+            target_config=_target_config,
+        )
 
     return _build_dflash_family_model(
         cfg,

@@ -34,7 +34,11 @@ def resolve_run(
     if registry is None:
         from specforge.algorithms.builtin import builtin_algorithm_registry
 
-        registry = builtin_algorithm_registry()
+        registry = builtin_algorithm_registry(
+            dflash_distillation=(
+                cfg.training.strategy == "dflash" and cfg.training.loss_type == "dspark"
+            )
+        )
     try:
         algorithm = registry.resolve(cfg.training.strategy)
     except KeyError as exc:

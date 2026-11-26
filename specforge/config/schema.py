@@ -500,8 +500,10 @@ class TrainingConfig(StrictConfigModel):
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
+    #: Pure DFlash: hard-label CE by default; "dspark" enables shared distillation.
     loss_type: Literal[
         "dflash",
+        "dspark",
         "dpace",
         "dpace-cumulative-confidence-only",
         "dpace-continuation-value-only",
