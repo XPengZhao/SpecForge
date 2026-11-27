@@ -24,14 +24,21 @@ Each output row stores the prefix plus the new assistant turn as
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
 import json
 import logging
+import os
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
+from queue import Empty, Queue
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         "--seed-offset", type=int, help="Sampling seed = offset + input line number"
     )
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="For multiple rounds, --output-path is a directory of round-NN.jsonl files")
+    parser.add_argument("--first-round", type=int, help="First global round number (1-based); write numbered files")
+    parser.add_argument("--seed-stride", type=int, help="Physical input line count for round seeds")
+    parser.add_argument("--dp-ranks", type=int, default=1)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all rows")
     parser.add_argument("--request-timeout", type=float, default=1200.0)
@@ -108,8 +120,57 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-retries must be greater than 0")
     if args.request_timeout <= 0 or args.retry_delay < 0:
         raise ValueError("--request-timeout must be positive and --retry-delay non-negative")
-    if args.output_path.exists() and not args.resume:
+    if args.rounds < 1 or args.dp_ranks < 1:
+        raise ValueError("rounds and dp-ranks must be positive")
+    if args.first_round is not None and args.first_round < 1:
+        raise ValueError("first-round must be positive")
+    if (args.rounds > 1 or args.first_round is not None) and args.seed_offset is None:
+        raise ValueError("numbered rounds require seed-offset")
+    if args.rounds == 1 and args.first_round is None and args.output_path.exists() and not args.resume:
         raise ValueError(f"{args.output_path} exists; pass --resume to append missing rows")
+
+
+def prepare_manifest(args, paths, numbered):
+    """Bind resumable output to the input bytes and generation settings."""
+    state_dir = (args.output_path / ".rollout-state" if numbered else
+                 args.output_path.with_name(f".{args.output_path.name}.rollout-state"))
+    manifest_path = state_dir / "manifest.json"
+    digest = hashlib.sha256()
+    selected_count = 0
+    physical_lines = 0
+    with args.data_path.open("rb") as source:
+        for line in source:
+            digest.update(line)
+            physical_lines += 1
+            if physical_lines > args.start_index and (not args.limit or selected_count < args.limit) and line.strip():
+                selected_count += 1
+    if numbered:
+        if args.seed_stride is None:
+            args.seed_stride = physical_lines
+        if args.seed_stride < physical_lines:
+            raise ValueError("seed-stride must cover all physical input lines")
+    manifest = {
+        "version": 1, "input_sha256": digest.hexdigest(), "input_lines": physical_lines,
+        **{key: getattr(args, key) for key in (
+            "model", "tokenizer_path", "seed_offset", "seed_stride", "temperature",
+            "top_p", "max_length", "max_tokens", "end_marker", "disable_thinking",
+            "drop_truncated", "start_index", "limit",
+        )},
+    }
+    if manifest_path.exists():
+        old = json.loads(manifest_path.read_text())
+        changed = [key for key in manifest if old.get(key) != manifest[key]]
+        if changed:
+            raise ValueError(f"rollout manifest mismatch ({', '.join(changed)}): {manifest_path}")
+    else:
+        previous = args.output_path.glob("round-*.jsonl") if numbered else paths
+        if any(p.exists() and p.stat().st_size for p in previous):
+            raise ValueError("existing rollout has no manifest; use a new output path")
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_dir, delete=False) as temp:
+            json.dump(manifest, temp, indent=2)
+        os.replace(temp.name, manifest_path)
+    return state_dir / "skipped-overlong.jsonl", selected_count
 
 
 def load_completed_rows(output_path: Path) -> set[int]:
@@ -137,6 +198,8 @@ def load_completed_rows(output_path: Path) -> set[int]:
                 raise ValueError(
                     f"existing output line {output_line} has no integer source_line_number"
                 )
+            if source_line in completed:
+                raise ValueError(f"duplicate source line {source_line} in {output_path}")
             completed.add(source_line)
             if not line.endswith(b"\n"):
                 handle.seek(0, 2)
@@ -188,6 +251,35 @@ def prompt_from_conversations(
     return prompt, tuple(prefix)
 
 
+def read_stream(response, on_ready):
+    pieces = []
+    usage = {}
+    finish = None
+    notified = False
+    for raw in response:
+        line = raw.decode("utf-8").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        event = json.loads(data)
+        if "error" in event:
+            raise RuntimeError(f"stream error: {event['error']}")
+        if event.get("usage"):
+            usage = event["usage"]
+        for choice in event.get("choices", []):
+            text = choice.get("text", "")
+            pieces.append(text)
+            finish = choice.get("finish_reason") or finish
+            if not notified and (text or finish):
+                notified = True
+                on_ready()
+    if finish is None or "completion_tokens" not in usage:
+        raise RuntimeError("incomplete rollout stream")
+    return {"choices": [{"text": "".join(pieces), "finish_reason": finish}], "usage": usage}
+
+
 def post_completion(
     endpoint: str,
     *,
@@ -199,6 +291,8 @@ def post_completion(
     end_marker: str,
     timeout: float,
     seed: int | None = None,
+    rank=None,
+    on_ready=None,
 ) -> dict[str, Any]:
     """Request one target rollout from the OpenAI-compatible completion API."""
     payload = {
@@ -211,15 +305,20 @@ def post_completion(
     }
     if seed is not None:
         payload["seed"] = seed
+    headers = {"Content-Type": "application/json"}
+    if rank is not None:
+        headers["X-data-parallel-rank"] = str(rank)
+    if on_ready is not None:
+        payload.update(stream=True, stream_options={"include_usage": True})
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            parsed = json.loads(response.read().decode("utf-8"))
+            parsed = read_stream(response, on_ready) if on_ready else json.load(response)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
@@ -253,6 +352,9 @@ def request_with_retries(
     prompt: str,
     max_tokens: int,
     source_line: int,
+    round_index=0,
+    rank=None,
+    on_ready=None,
 ) -> dict[str, Any]:
     """Request a rollout, retrying transient server or transport failures."""
     for attempt in range(1, args.max_retries + 1):
@@ -266,15 +368,18 @@ def request_with_retries(
                 top_p=args.top_p,
                 end_marker=args.end_marker,
                 timeout=args.request_timeout,
-                seed=None if args.seed_offset is None else args.seed_offset + source_line,
+                seed=None if args.seed_offset is None else args.seed_offset + source_line + round_index * (args.seed_stride or 0),
+                rank=rank, on_ready=on_ready,
             )
-        except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
+        except (RuntimeError, urllib.error.URLError, TimeoutError, ConnectionError,
+                http.client.IncompleteRead, json.JSONDecodeError) as exc:
             if attempt == args.max_retries:
                 raise RuntimeError(
-                    f"source line {source_line} failed after {attempt} attempts: {exc}"
+                    f"round {round_index + 1} source line {source_line} failed after {attempt} attempts: {exc}"
                 ) from exc
             logger.warning(
-                "source line %d attempt %d/%d failed: %s",
+                "round %d source line %d attempt %d/%d failed: %s",
+                round_index + 1,
                 source_line,
                 attempt,
                 args.max_retries,
@@ -291,8 +396,17 @@ def run(args: argparse.Namespace) -> None:
         args.tokenizer_path,
         trust_remote_code=args.trust_remote_code,
     )
-    completed_rows = load_completed_rows(args.output_path) if args.resume else set()
-    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    first_round = args.first_round or 1
+    paths = ([args.output_path] if args.rounds == 1 and args.first_round is None else
+             [args.output_path / f"round-{first_round+i:02d}.jsonl" for i in range(args.rounds)])
+    if not args.resume and any(p.exists() for p in paths):
+        raise ValueError("output exists; use --resume")
+    paths[0].parent.mkdir(parents=True, exist_ok=True)
+    skipped_path, selected_count = prepare_manifest(args, paths, args.rounds > 1 or args.first_round is not None)
+    overlong = load_completed_rows(skipped_path)
+    selected_lines = set()
+    dropped = [set() for _ in paths]
+    completed = [load_completed_rows(p) if args.resume else set() for p in paths]
     endpoint = args.server_url.rstrip("/") + "/v1/completions"
 
     selected = 0
@@ -303,15 +417,38 @@ def run(args: argparse.Namespace) -> None:
     started = time.perf_counter()
     mode = "a" if args.resume else "x"
 
+    resumed = sum(map(len, completed))
+
+    def log_progress():
+        processed = written + dropped_truncated
+        done = resumed + processed
+        total = (selected_count - len(overlong)) * args.rounds
+        elapsed = max(time.perf_counter() - started, 1e-6)
+        remaining = max(total - done, 0)
+        eta = "pending"
+        if remaining == 0:
+            eta = "0:00:00"
+        elif processed:
+            eta = str(timedelta(seconds=round(remaining * elapsed / processed)))
+        logger.info(
+            "progress=%d/%d (%.2f%%) resumed=%d written=%d skipped_completed=%d "
+            "skipped_overlong=%d dropped_truncated=%d rows/s=%.3f ETA=%s",
+            done, total, 100 * done / total if total else 100, resumed, written,
+            skipped_completed, skipped_overlong, dropped_truncated, written / elapsed, eta,
+        )
+
+    log_progress()
+
     def consume(
         future: Future[dict[str, Any]],
         job: RolloutJob,
-        output_handle,
+        index,
     ) -> None:
         nonlocal written, dropped_truncated
         result = future.result()
         finish_reason = result["finish_reason"]
         if finish_reason == "length" and args.drop_truncated:
+            dropped[index].add(job.source_line)
             dropped_truncated += 1
             return
 
@@ -332,36 +469,28 @@ def run(args: argparse.Namespace) -> None:
             "source_line_number": job.source_line,
             "target_rollout": target_rollout,
         }
+        output_handle = outputs[index]
         output_handle.write(
             json.dumps(payload, ensure_ascii=False) + "\n"
         )
         output_handle.flush()
+        completed[index].add(job.source_line)
         written += 1
-        if args.log_interval > 0 and written % args.log_interval == 0:
-            elapsed = max(time.perf_counter() - started, 1e-6)
-            logger.info(
-                "written=%d skipped_completed=%d skipped_overlong=%d "
-                "dropped_truncated=%d rows/s=%.3f",
-                written,
-                skipped_completed,
-                skipped_overlong,
-                dropped_truncated,
-                written / elapsed,
-            )
 
-    with (
-        args.data_path.open(encoding="utf-8") as input_handle,
-        args.output_path.open(mode, encoding="utf-8") as output_handle,
-        ThreadPoolExecutor(max_workers=args.concurrency) as executor,
-    ):
-        pending: deque[tuple[Future[dict[str, Any]], RolloutJob]] = deque()
+    def jobs(input_handle):
+        nonlocal selected, skipped_completed, skipped_overlong
         for source_line, line in enumerate(input_handle, 1):
             if source_line <= args.start_index or not line.strip():
                 continue
             if args.limit and selected >= args.limit:
                 break
             selected += 1
-            if source_line in completed_rows:
+            selected_lines.add(source_line)
+            if source_line in overlong:
+                skipped_overlong += 1
+                continue
+            missing = [i for i, rows in enumerate(completed) if source_line not in rows]
+            if not missing:
                 skipped_completed += 1
                 continue
 
@@ -379,6 +508,10 @@ def run(args: argparse.Namespace) -> None:
             prompt_token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
             available_tokens = args.max_length - prompt_token_count
             if available_tokens <= 0:
+                skipped_file.write(json.dumps({"source_line_number": source_line,
+                                               "prompt_tokens": prompt_token_count}) + "\n")
+                skipped_file.flush()
+                overlong.add(source_line)
                 skipped_overlong += 1
                 logger.warning(
                     "skip source line %d: prompt has %d tokens, "
@@ -395,23 +528,84 @@ def run(args: argparse.Namespace) -> None:
                 max_tokens=request_max_tokens,
                 conversations_prefix=conversations_prefix,
             )
+            yield job, missing
+
+    with ExitStack() as stack:
+        inputs = stack.enter_context(args.data_path.open(encoding="utf-8"))
+        skipped_file = stack.enter_context(skipped_path.open("a", encoding="utf-8"))
+        outputs = [stack.enter_context(p.open(mode, encoding="utf-8")) for p in paths]
+        executor = stack.enter_context(ThreadPoolExecutor(max_workers=args.concurrency))
+        events = Queue()
+        ready = deque()
+        pending = {}
+        loads = [0] * args.dp_ranks
+        source = iter(jobs(inputs))
+        exhausted = False
+
+        def submit(job, index, rank, followers=()):
+            # Retries may deliver a second first-token notification.
+            def warmed():
+                events.put(("ready", (job, rank, followers)))
+
             future = executor.submit(
-                request_with_retries,
-                endpoint,
-                args=args,
-                prompt=job.prompt,
-                max_tokens=job.max_tokens,
-                source_line=job.source_line,
+                request_with_retries, endpoint, args=args, prompt=job.prompt,
+                max_tokens=job.max_tokens, source_line=job.source_line,
+                round_index=first_round - 1 + index, rank=rank if args.dp_ranks > 1 else None,
+                on_ready=warmed if followers else None,
             )
-            pending.append((future, job))
-            if len(pending) >= args.concurrency:
-                oldest_future, oldest_job = pending.popleft()
-                consume(oldest_future, oldest_job, output_handle)
+            pending[future] = (job, index, rank)
+            future.add_done_callback(lambda f: events.put(("done", f)))
 
-        while pending:
-            future, job = pending.popleft()
-            consume(future, job, output_handle)
+        # Charge a prompt's remaining rounds to its rank when assigning it.
+        # HTTP requests, including open streams, count against one global cap.
+        warming = set()
+        while pending or ready or not exhausted:
+            try:
+                event, value = events.get_nowait()
+            except Empty:
+                if len(pending) < args.concurrency:
+                    if ready:
+                        job, index, rank = ready.popleft()
+                        submit(job, index, rank)
+                        continue
+                    if not exhausted:
+                        item = next(source, None)
+                        if item is not None:
+                            job, missing = item
+                            rank = min(range(args.dp_ranks), key=loads.__getitem__)
+                            loads[rank] += len(missing)
+                            if len(missing) > 1:
+                                warming.add(job.source_line)
+                            submit(job, missing[0], rank, missing[1:])
+                            continue
+                        exhausted = True
+                if not pending:
+                    break
+                event, value = events.get()
+            if event == "ready":
+                job, rank, followers = value
+                if job.source_line in warming:
+                    warming.remove(job.source_line)
+                    ready.extend((job, i, rank) for i in followers)
+            else:
+                job, index, rank = pending.pop(value)
+                consume(value, job, index)
+                loads[rank] -= 1
+                if args.log_interval > 0 and (written + dropped_truncated) % args.log_interval == 0:
+                    log_progress()
 
+    if not selected_lines:
+        raise ValueError("input selection has no nonempty rows")
+    if not overlong.issubset(selected_lines):
+        raise ValueError("skipped-overlong contains source lines outside the input selection")
+    eligible = selected_lines - overlong
+    for index, rows in enumerate(completed):
+        expected = eligible - dropped[index] if dropped[index] else eligible
+        if rows != expected:
+            raise ValueError(f"{paths[index]}: {len(expected - rows)} missing and "
+                             f"{len(rows - expected)} unexpected source lines")
+        logger.info("%s: verified %d eligible responses", paths[index].name, len(rows))
+    log_progress()
     logger.info("Selected source rows: %d", selected)
     logger.info("Written rollouts: %d", written)
     logger.info("Already completed: %d", skipped_completed)
