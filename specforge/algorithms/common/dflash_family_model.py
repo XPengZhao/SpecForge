@@ -1308,7 +1308,14 @@ class OnlineDFlashDistillationModel(OnlineDSparkModel):
         mask_output = output.reshape(batch, anchors.size(1), self.block_size, -1)[
             ..., 1:, :
         ]
-        logits = self.lm_head(mask_output)
+        # Removing the anchor leaves gaps between blocks. Feeding that 4D
+        # strided view to a frozen Linear dispatches many small batched GEMMs.
+        # Pack the much smaller hidden tensor once and project all mask rows
+        # together, as in the DSpark LM-head path.
+        flat_output = mask_output.reshape(-1, output.shape[-1])
+        logits = self.lm_head(flat_output).reshape(
+            batch, anchors.size(1), self.block_size - 1, -1
+        )
         offsets = torch.arange(1, self.block_size, device=input_ids.device)
         indices = anchors.unsqueeze(-1) + offsets
         safe = indices.clamp(max=sequence - 1)

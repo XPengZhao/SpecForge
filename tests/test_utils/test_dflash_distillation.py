@@ -19,9 +19,18 @@ def test_distillation_matches_reference_and_has_no_anchor_gradient(mode, recompu
     batch, blocks, block_size, vocab, sequence = 2, 2, 4, 6, 7
     draft = nn.Module()
     draft.outputs = nn.Parameter(torch.randn(batch, blocks * block_size, vocab))
+    head = nn.Linear(vocab, vocab, bias=False).requires_grad_(False)
+    with torch.no_grad():
+        head.weight.copy_(torch.eye(vocab))
+    head_inputs = []
+    head.register_forward_pre_hook(
+        lambda _module, args: head_inputs.append(
+            (tuple(args[0].shape), args[0].is_contiguous())
+        )
+    )
     model = _dflash_module.OnlineDFlashDistillationModel(
         draft,
-        nn.Identity(),
+        head,
         nn.Embedding(vocab, vocab),
         0,
         block_size=block_size,
@@ -52,6 +61,8 @@ def test_distillation_matches_reference_and_has_no_anchor_gradient(mode, recompu
     )
     strategy = DFlashTrainStrategy(model)
     out = strategy.forward_loss(data)
+    # One dense projection over all mask rows, not one GEMM per anchor.
+    assert head_inputs[0] == ((batch * blocks * (block_size - 1), vocab), True)
 
     logits = draft.outputs.view(batch, blocks, block_size, vocab)[..., 1:, :]
     indices = anchors[..., None] + torch.arange(1, block_size)
