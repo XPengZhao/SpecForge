@@ -19,16 +19,18 @@ import aiohttp
 
 if __package__:
     from .eval_humaneval_vllm import snapshot, summarize, write_json
+    from .mtbench_sources import MTBENCH_URLS
     from .stat_vllm_acceptance import subtract
 else:
     from eval_humaneval_vllm import snapshot, summarize, write_json
+    from mtbench_sources import MTBENCH_URLS
     from stat_vllm_acceptance import subtract
 
-DATA_URL = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", choices=MTBENCH_URLS, default="mtbench")
     parser.add_argument("--host", default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model", default="qwen3-4b")
@@ -89,7 +91,7 @@ def load_tasks(args):
     if args.data_path:
         text = args.data_path.read_text(encoding="utf-8")
     else:
-        with urllib.request.urlopen(DATA_URL, timeout=60) as response:
+        with urllib.request.urlopen(MTBENCH_URLS[args.dataset], timeout=60) as response:
             text = response.read().decode("utf-8")
     rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     tasks, ids = [], set()
@@ -192,7 +194,7 @@ async def evaluate(args, tasks):
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=False)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    config.update(tasks=tasks, data_url=DATA_URL if not args.data_path else None,
+    config.update(tasks=tasks, data_url=MTBENCH_URLS[args.dataset] if not args.data_path else None,
                   seed_policy="seed + 2 * question index + turn - 1",
                   history_mode="fixed" if history is not None else "generated")
     write_json(out / "config.json", config)

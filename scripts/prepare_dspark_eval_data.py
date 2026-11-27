@@ -8,6 +8,12 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 
+if __package__:
+    from .mtbench_sources import MTBENCH_URLS
+else:
+    from mtbench_sources import MTBENCH_URLS
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data_dir", type=Path)
@@ -41,8 +47,8 @@ def main():
     url = "https://github.com/evalplus/humanevalplus_release/releases/download/v0.1.10/HumanEvalPlus.jsonl.gz"
     rows = gzip.decompress(fetch(url)).splitlines()
     save("humaneval", [json.loads(r) for r in rows if r.strip()], 164, ("task_id", "prompt", "entry_point"))
-    url = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
-    save("mtbench", [json.loads(r) for r in fetch(url).splitlines() if r.strip()], 80, ("question_id", "turns"))
+    for name, url in MTBENCH_URLS.items():
+        save(name, [json.loads(r) for r in fetch(url).splitlines() if r.strip()], 80, ("question_id", "turns"))
 
     for name, repo, split, count, fields in (
         ("math500", "HuggingFaceH4/MATH-500", "test", 500, ("problem", "answer")),

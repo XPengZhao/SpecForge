@@ -10,7 +10,8 @@ if [[ $# -gt 1 || ! "$RUN_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
 fi
 SPEC_DIR="${SPECFORGE_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-$SPEC_DIR/.venv/bin/python}"
-OUT_ROOT="${EVAL_OUTPUT_DIR:-$HOME/logs/qwen3-4b/eval/mtbench}"
+DATASET="${EVAL_MTBENCH_DATASET:-mtbench}"
+OUT_ROOT="${EVAL_OUTPUT_DIR:-$HOME/logs/qwen3-4b/eval/$DATASET}"
 
 HOST="${EVAL_HOST:-http://127.0.0.1}"
 PORT="${EVAL_PORT:-8000}"
@@ -35,6 +36,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 ARGS=(
+  --dataset "$DATASET"
   --host "$HOST" --port "$PORT" --model "$MODEL"
   --num-questions "$NUM_QUESTIONS" --max-concurrency "$MAX_CONCURRENCY"
   --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE"

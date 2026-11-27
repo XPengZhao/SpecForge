@@ -20,7 +20,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-DEFAULT_DATASETS = ("gsm8k", "humaneval", "mtbench", "math500", "aime")
+DEFAULT_DATASETS = ("gsm8k", "humaneval", "mtbench", "mtbench-zh", "math500", "aime")
 DATASETS = (*DEFAULT_DATASETS, "regen")
 TOP_P = 1.0
 TOP_K = -1
@@ -144,7 +144,11 @@ def run_dataset(a, mode, dataset, out):
             env["TMPDIR"] = str(a.data_dir / "gsm8k")
         else:
             env["EVAL_DATA_PATH"] = str(a.data_dir / f"{dataset}.jsonl")
-    cmd = ["bash", str(REPO / f"scripts/run_{dataset}_with_acceptance.sh"), mode]
+    runner = dataset
+    if dataset in ("mtbench", "mtbench-zh"):
+        runner = "mtbench"
+        env["EVAL_MTBENCH_DATASET"] = dataset
+    cmd = ["bash", str(REPO / f"scripts/run_{runner}_with_acceptance.sh"), mode]
     with (out / "eval.log").open("w") as log:
         client = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                                   start_new_session=True)
@@ -163,7 +167,7 @@ def mean_token_lengths(dataset, directory):
         "mtbench": ("turn1.responses.jsonl", "turn2.responses.jsonl"),
         "math500": ("math500.responses.jsonl",),
         "aime": ("aime.responses.jsonl",),
-    }.get(dataset, ("responses.jsonl",))
+    }.get("mtbench" if dataset == "mtbench-zh" else dataset, ("responses.jsonl",))
     totals = {"prompt_tokens": 0, "completion_tokens": 0}
     requests = 0
     for filename in filenames:
